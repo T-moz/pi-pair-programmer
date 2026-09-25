@@ -64,5 +64,14 @@ export default defineConfig(
       "import-x/no-cycle": "error",
     },
   },
+  {
+    files: [
+      "src/index.ts",
+      "src/reviewers.ts",
+      "test/reviewers.test.ts",
+      "test/extension.test.ts",
+    ],
+    rules: { "security/detect-non-literal-fs-filename": "off" },
+  },
   prettier,
 );
