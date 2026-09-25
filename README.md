@@ -1,39 +1,53 @@
 # Pi Pair Programmer
 
-A TypeScript extension for [Pi](https://pi.dev/docs/extensions) and [OMP](https://omp.sh/docs/extension-authoring).
+Background code review for [Pi](https://pi.dev/docs/extensions) and [OMP](https://omp.sh/docs/extension-authoring).
 
-![Pi Pair Programmer workflow: coding agent writes code, focused reviewers filter findings, then the agent accepts or rejects feedback before continuing](assets/pair-programmer-overview.png)
+## Why
+
+Coding with AI adds entropy to a codebase.
+Agents optimize for local correctness instead of thinking about the global system. They repeat code and reinvent the wheel.
+
+Turn-by-turn static analysis is necessary but not sufficient.
+Code review happens too late in the code production pipeline.
+
+This extension lets you run multiple highly specialized reviewers, each focused on a specific concern, to catch issues static analysis cannot detect as soon as code is generated. Without bloating the context window, thanks to a Jev-based filter that removes duplicate findings.
 
 ## Install
 
-Install with Pi:
+With Pi:
 
 ```sh
 pi install git:github.com/T-moz/pi-pair-programmer
 ```
 
-Or with OMP:
+With OMP:
 
 ```sh
 omp plugin install github:T-moz/pi-pair-programmer
 ```
 
-Reviews start **on** by default. After a successful `write` or `edit`, matching reviewers run in the background. Findings are delivered privately to the agent at the next turn/tool gate, not while you are editing; accept or reject each delivered finding with a reason using `pair_programmer_decide` before other tools. Only accepted findings are shown in the transcript, as readable reviews with their location, evidence, and acceptance reason. Rejected findings are not published. Review findings and decisions persist in the session branch. The gate allows direct `pair_programmer_decide` calls and OMP `write` calls targeting exactly `xd://pair_programmer_decide`; other calls, including ordinary writes, remain blocked while findings are outstanding. Each decision and its nonempty reason are persisted before the finding is cleared. Once no findings remain outstanding, verification, todo updates, and coding can resume.
+For the Jev filter, set your TypeSafe API key before starting Pi or OMP:
 
-Run `/pair-programmer` to toggle reviews. Turning off cancels queued and running reviews, discards undelivered findings, and removes pending finding messages; existing decisions remain saved. Turning back on reviews future writes, but does not resend old findings.
+```sh
+export TYPESAFE_API_KEY="your-api-key"
+```
 
-## Reviewers
+Without it, reviews still run, but only exact duplicate findings are filtered.
 
-Each reviewer's `prompt` defines its entire task. Nothing more. Findings must directly connect a criterion violation to concrete code evidence and a consequence relevant to that criterion. Surrounding code provides context. An empty result is a successful review when the criterion is satisfied or evidence is insufficient.
+## Use
 
-Without a config file, one reviewer uses the current model with the prompt “Does it add entropy ?”. To override it, create `pair-programmer.reviewers.json` in your working directory:
+Reviews are on by default. After each successful `write` or `edit`, reviewers run in the background. The coding agent must accept or reject each finding with a reason before continuing with other tools. Only accepted findings appear in your transcript.
+
+Run `/pair-programmer` to toggle reviews.
+
+The default reviewer uses your current model and asks: “Does it add entropy?” To change the prompt, model, or files reviewed, create `pair-programmer.reviewers.json` in your working directory:
 
 ```json
 {
   "reviewers": [
     {
       "model": "current",
-      "prompt": "Does it add entropy ?",
+      "prompt": "Does it add entropy?",
       "include": ["src/**/*.ts"],
       "exclude": ["**/*.test.ts"]
     }
@@ -41,19 +55,4 @@ Without a config file, one reviewer uses the current model with the prompt “Do
 }
 ```
 
-Only `model`, `prompt`, `include`, and `exclude` are supported for each reviewer. `model` may be `current` or a provider/model identifier. Include and exclude are project-relative POSIX globs; exclusions take precedence. An empty `reviewers` array disables automatic reviews. Semantic deduplication uses the TypeSafe SDK's `jev-latest` model and requires `TYPESAFE_API_KEY` in the extension's environment. Do not put credentials in the JSON file.
-
-Extensions run with your account's permissions; review the source before installing.
-
-## Develop locally
-
-Requires Node.js 22.19 or newer:
-
-```sh
-npm ci
-./node_modules/.bin/pi --extension ./src/index.ts
-```
-
-For OMP, run `omp --extension ./src/index.ts` instead.
-
-For checks and contribution steps, see [CONTRIBUTING.md](CONTRIBUTING.md).
+Use `current` or a `provider/model` identifier. File patterns are relative to your working directory; exclusions take precedence. Add entries for more reviewers.
