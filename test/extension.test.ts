@@ -329,81 +329,135 @@ it("runs one built-in reviewer for a write without project configuration", async
   await environment.emit("session_shutdown");
 });
 
-it("runs reviewers off the tool result path and gates coding until each finding has a reasoned decision", async () => {
-  const environment = await setup();
-  const file = path.join(environment.cwd, "change.ts");
-  await fsPromises.writeFile(
-    file,
-    "const user = null;\nconsole.log(user.name);\n",
-  );
-  const { promise, resolve } = Promise.withResolvers<ProposedFinding[]>();
-  vi.mocked(reviewFile).mockReturnValueOnce(promise).mockResolvedValue([]);
+it.each(["pi", "omp"] as const)(
+  "%s gates coding until a direct or routed decision is persisted with a reason",
+  async (host) => {
+    const environment = await setup(host);
+    const file = path.join(environment.cwd, "change.ts");
+    await fsPromises.writeFile(
+      file,
+      "const user = null;\nconsole.log(user.name);\n",
+    );
+    const { promise, resolve } = Promise.withResolvers<ProposedFinding[]>();
+    vi.mocked(reviewFile).mockReturnValueOnce(promise).mockResolvedValue([]);
 
-  expect(
-    await environment.emit("tool_result", {
-      toolName: "write",
-      input: { path: file },
-      isError: false,
-    }),
-  ).toBeUndefined();
-  expect(
-    await environment.emit("tool_call", { toolName: "edit" }),
-  ).toBeUndefined();
-  await advanceReviews(() => {
-    expect(reviewFile).toHaveBeenCalledTimes(2);
-  });
-  resolve([
-    {
-      line: 2,
-      title: "Null dereference",
-      quote: "user.name",
-      evidence: "A missing user throws",
-    },
-  ]);
-  await advanceReviews(() => {
-    expect(findings(environment.entries)).toHaveLength(1);
-  });
-  await environment.emit("turn_end");
-  expect(environment.sendMessage).toHaveBeenCalledOnce();
-  const blocked = await environment.emit("tool_call", { toolName: "edit" });
-  if (
-    typeof blocked !== "object" ||
-    blocked === null ||
-    !("reason" in blocked)
-  ) {
-    throw new Error("Expected a blocked tool");
-  }
-  expect(blocked).toMatchObject({ block: true });
-  expect(blocked.reason).toContain("Null dereference");
-  const identifier = findings(environment.entries)[0]?.id;
-  if (identifier === undefined || identifier.length === 0)
-    throw new Error("Missing recorded finding");
-  expect(
-    (
-      await environment.decide("decision", {
-        findingId: identifier,
-        decision: "accept",
-        reason: "",
-      })
-    ).details.saved,
-  ).toBe(false);
-  expect(
-    (
-      await environment.decide("decision", {
-        findingId: identifier,
-        decision: "reject",
-        reason: "The input is always present",
-      })
-    ).details.saved,
-  ).toBe(true);
-  expect(
-    await environment.emit("tool_call", { toolName: "edit" }),
-  ).toBeUndefined();
-  expect(
-    environment.entries.some((entry) => entry.data.action === "decide"),
-  ).toBe(true);
-  await environment.emit("session_shutdown");
-});
+    expect(
+      await environment.emit("tool_result", {
+        toolName: "write",
+        input: { path: file },
+        isError: false,
+      }),
+    ).toBeUndefined();
+    expect(
+      await environment.emit("tool_call", { toolName: "edit" }),
+    ).toBeUndefined();
+    await advanceReviews(() => {
+      expect(reviewFile).toHaveBeenCalledTimes(2);
+    });
+    resolve([
+      {
+        line: 2,
+        title: "Null dereference",
+        quote: "user.name",
+        evidence: "A missing user throws",
+      },
+    ]);
+    await advanceReviews(() => {
+      expect(findings(environment.entries)).toHaveLength(1);
+    });
+    await environment.emit("turn_end");
+    expect(environment.sendMessage).toHaveBeenCalledOnce();
+    const blocked = await environment.emit("tool_call", { toolName: "edit" });
+    if (
+      typeof blocked !== "object" ||
+      blocked === null ||
+      !("reason" in blocked)
+    ) {
+      throw new Error("Expected a blocked tool");
+    }
+    expect(blocked).toMatchObject({ block: true });
+    expect(blocked.reason).toContain("Null dereference");
+    const identifier = findings(environment.entries)[0]?.id;
+    if (identifier === undefined || identifier.length === 0)
+      throw new Error("Missing recorded finding");
+    const params = {
+      findingId: identifier,
+      decision: "reject" as const,
+      reason: "The input is always present",
+    };
+    const decisionCall =
+      host === "pi"
+        ? { toolName: "pair_programmer_decide", input: params }
+        : {
+            toolName: "write",
+            input: {
+              path: "xd://pair_programmer_decide",
+              content: JSON.stringify(params),
+            },
+          };
+    const gatedCalls = [
+      { toolName: "bash", input: { command: "npm run check" } },
+      { toolName: "todo", input: { op: "done", task: "Verify" } },
+      { toolName: "edit", input: { path: "xd://pair_programmer_decide" } },
+      { toolName: "write", input: {} },
+      ...[
+        file,
+        "xd://another_tool",
+        "xd://pair_programmer_decide/",
+        "xd://pair_programmer_decide?extra=true",
+        "xd://pair_programmer_decide_extra",
+        " xd://pair_programmer_decide",
+      ].map((target) => ({
+        toolName: "write",
+        input: { path: target, content: JSON.stringify(params) },
+      })),
+    ];
+    for (const call of gatedCalls) {
+      expect(await environment.emit("tool_call", call)).toMatchObject({
+        block: true,
+      });
+    }
+    expect(await environment.emit("tool_call", decisionCall)).toBeUndefined();
+    expect(
+      (await environment.decide("decision", { ...params, reason: " \n " }))
+        .details.saved,
+    ).toBe(false);
+    expect(
+      environment.entries.some((entry) => entry.data.action === "decide"),
+    ).toBe(false);
+    expect(await environment.emit("tool_call", gatedCalls[0])).toMatchObject({
+      block: true,
+    });
+
+    environment.failEntry(new Error("Session storage unavailable"));
+    await expect(async () => {
+      await environment.decide("decision", params);
+    }).rejects.toThrow("Session storage unavailable");
+    expect(await environment.emit("tool_call", gatedCalls[0])).toMatchObject({
+      block: true,
+    });
+    environment.failEntry();
+
+    expect(await environment.emit("tool_call", decisionCall)).toBeUndefined();
+    expect((await environment.decide("decision", params)).details.saved).toBe(
+      true,
+    );
+    expect(environment.entries.at(-1)?.data).toEqual({
+      action: "decide",
+      id: identifier,
+      verdict: "reject",
+      reason: params.reason,
+    });
+    for (const call of gatedCalls) {
+      expect(await environment.emit("tool_call", call)).toBeUndefined();
+    }
+    await environment.emit("session_start");
+    for (const call of gatedCalls) {
+      expect(await environment.emit("tool_call", call)).toBeUndefined();
+    }
+    await environment.emit("session_shutdown");
+  },
+);
 
 it("turns activity off and back on without changing reviewer configuration", async () => {
   const environment = await setup();
@@ -734,7 +788,7 @@ it("aborts in-flight work when switched off and suppresses queued finding messag
   });
   expect(environment.sendMessage).not.toHaveBeenCalled();
   expect(
-    await environment.emit("tool_call", { toolName: "write" }),
+    await environment.emit("tool_call", { toolName: "write", input: {} }),
   ).toBeUndefined();
   const suppressed = await environment.emit("context", {
     messages: [
@@ -795,7 +849,7 @@ it("starts fresh reviews after on even when an aborted reviewer never settles", 
     expect(findings(environment.entries)).toHaveLength(0);
   });
   expect(
-    await environment.emit("tool_call", { toolName: "write" }),
+    await environment.emit("tool_call", { toolName: "write", input: {} }),
   ).toBeUndefined();
   await environment.emit("session_shutdown");
 });
@@ -843,7 +897,7 @@ it("restores delivered decisions after session start and removes decided finding
   expect(JSON.stringify(context)).not.toContain(first.id);
   await environment.emit("session_start");
   expect(
-    await environment.emit("tool_call", { toolName: "write" }),
+    await environment.emit("tool_call", { toolName: "write", input: {} }),
   ).toMatchObject({ block: true });
   expect(
     (
@@ -866,7 +920,7 @@ it("restores delivered decisions after session start and removes decided finding
     ).toBe(true);
   }
   expect(
-    await environment.emit("tool_call", { toolName: "write" }),
+    await environment.emit("tool_call", { toolName: "write", input: {} }),
   ).toBeUndefined();
   await environment.emit("session_shutdown");
 });
@@ -936,7 +990,7 @@ it("bounds concurrent reviews and sends the next finding batch only after decisi
       .ids,
   ).toHaveLength(4);
   expect(
-    await environment.emit("tool_call", { toolName: "write" }),
+    await environment.emit("tool_call", { toolName: "write", input: {} }),
   ).toMatchObject({ block: true });
   for (const finding of findings(environment.entries).slice(0, 4)) {
     expect(
@@ -950,7 +1004,7 @@ it("bounds concurrent reviews and sends the next finding batch only after decisi
     ).toBe(true);
   }
   expect(
-    await environment.emit("tool_call", { toolName: "write" }),
+    await environment.emit("tool_call", { toolName: "write", input: {} }),
   ).toMatchObject({ block: true });
   expect(environment.sendMessage).toHaveBeenCalledTimes(2);
   const last = findings(environment.entries)[4];
@@ -965,7 +1019,7 @@ it("bounds concurrent reviews and sends the next finding batch only after decisi
     ).details.saved,
   ).toBe(true);
   expect(
-    await environment.emit("tool_call", { toolName: "write" }),
+    await environment.emit("tool_call", { toolName: "write", input: {} }),
   ).toBeUndefined();
   await environment.emit("session_shutdown");
 });
@@ -1084,7 +1138,7 @@ it("deduplicates old evidence after edits even if the Jev call fails", async () 
   });
   expect(findings(environment.entries)).toHaveLength(2);
   expect(
-    await environment.emit("tool_call", { toolName: "write" }),
+    await environment.emit("tool_call", { toolName: "write", input: {} }),
   ).toBeUndefined();
   await environment.emit("session_shutdown");
 });
@@ -1584,7 +1638,7 @@ it("stops before dispatch when review is disabled during a source read", async (
   await Promise.resolve();
   expect(reviewFile).not.toHaveBeenCalled();
   expect(
-    await environment.emit("tool_call", { toolName: "write" }),
+    await environment.emit("tool_call", { toolName: "write", input: {} }),
   ).toBeUndefined();
   await environment.emit("session_shutdown");
 });
