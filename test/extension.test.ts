@@ -1304,6 +1304,8 @@ it("discards a reviewer result when its source disappears before completion", as
   await advanceReviews(() => {
     expect(reviewFile).toHaveBeenCalledTimes(2);
   });
+  const canonicalFile = await fsPromises.realpath(file);
+  const previousChecks = realpathFinished.get(canonicalFile) ?? 0;
   await fsPromises.rm(file);
   oldReview.resolve([
     {
@@ -1313,6 +1315,9 @@ it("discards a reviewer result when its source disappears before completion", as
       evidence: "No longer present",
     },
   ]);
+  await vi.waitFor(() => {
+    expect(realpathFinished.get(canonicalFile)).toBeGreaterThan(previousChecks);
+  });
   await fsPromises.writeFile(file, "export const next = true;\n");
   vi.mocked(reviewFile).mockResolvedValue([
     {
