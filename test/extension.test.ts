@@ -6,7 +6,7 @@ import type {
   ExtensionCommandContext,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi, type Mock } from "vitest";
 import pairProgrammer from "../src/index.js";
 import {
   deduplicate,
@@ -179,7 +179,7 @@ async function setup(
   emit: (name: string, event?: unknown) => Promise<unknown>;
   command: (name: string) => Promise<void>;
   decide: DecisionTool["execute"];
-  sendMessage: ReturnType<typeof vi.fn>;
+  sendMessage: Mock<ExtensionAPI["sendMessage"]>;
   notify: ReturnType<typeof vi.fn>;
   entries: JournalEntry[];
   failEntry: (error?: Error) => void;
@@ -221,7 +221,7 @@ async function setup(
   let entryError: Error | undefined;
   let entryAttempts = 0;
   const notify = vi.fn();
-  const sendMessage = vi.fn();
+  const sendMessage = vi.fn<ExtensionAPI["sendMessage"]>();
   let decide: DecisionTool["execute"] | undefined;
   pairProgrammer({
     on(name: string, handler: Handler) {
@@ -448,6 +448,9 @@ it.each(["pi", "omp"] as const)(
       verdict: "reject",
       reason: params.reason,
     });
+    expect(
+      environment.sendMessage.mock.calls.filter(([message]) => message.display),
+    ).toHaveLength(0);
     for (const call of gatedCalls) {
       expect(await environment.emit("tool_call", call)).toBeUndefined();
     }
@@ -874,6 +877,13 @@ it("restores delivered decisions after session start and removes decided finding
   const first = findings(environment.entries)[0];
   const second = findings(environment.entries)[1];
   if (!first || !second) throw new Error("Missing findings");
+  expect(environment.sendMessage).toHaveBeenCalledWith(
+    expect.objectContaining({
+      customType: "pair-programmer-findings",
+      display: false,
+    }),
+    expect.anything(),
+  );
   expect(
     (
       await environment.decide("decision", {
@@ -883,6 +893,32 @@ it("restores delivered decisions after session start and removes decided finding
       })
     ).details.saved,
   ).toBe(true);
+  expect(environment.sendMessage).toHaveBeenCalledWith(
+    expect.objectContaining({
+      customType: "pair-programmer-accepted",
+      display: true,
+    }),
+    expect.objectContaining({ triggerTurn: false }),
+  );
+  const published = environment.sendMessage.mock.calls.filter(
+    ([message]) => message.display,
+  );
+  expect(published).toHaveLength(1);
+  expect(published[0]?.[0].content).toContain("Confirmed by caller");
+  expect(published[0]?.[0].content).toContain("First issue");
+  expect(published[0]?.[0].content).toContain("change.ts:1");
+  expect(
+    (
+      await environment.decide("decision", {
+        findingId: first.id,
+        decision: "accept",
+        reason: "Tried twice",
+      })
+    ).details.saved,
+  ).toBe(false);
+  expect(
+    environment.sendMessage.mock.calls.filter(([message]) => message.display),
+  ).toHaveLength(1);
   const context = await environment.emit("context", {
     messages: [
       {
@@ -1006,7 +1042,9 @@ it("bounds concurrent reviews and sends the next finding batch only after decisi
   expect(
     await environment.emit("tool_call", { toolName: "write", input: {} }),
   ).toMatchObject({ block: true });
-  expect(environment.sendMessage).toHaveBeenCalledTimes(2);
+  expect(
+    environment.entries.filter((entry) => entry.data.action === "deliver"),
+  ).toHaveLength(2);
   const last = findings(environment.entries)[4];
   if (!last) throw new Error("Missing final finding");
   expect(
