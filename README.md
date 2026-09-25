@@ -12,7 +12,7 @@ Agents optimize for local correctness instead of thinking about the global syste
 Turn-by-turn static analysis is necessary but not sufficient.
 Code review happens too late in the code production pipeline.
 
-This extension lets you run multiple highly specialized reviewers, each focused on a specific concern, to catch issues static analysis cannot detect as soon as code is generated. Without bloating the context window, thanks to a Jev-based filter that removes duplicate findings.
+This extension lets you run multiple highly specialized reviewers, each focused on a specific concern, to catch issues static analysis cannot detect as soon as code is generated. Without bloating the context window, thanks to a Jev-based filter that removes inherited and duplicate findings.
 
 ## Install
 
