@@ -22,7 +22,8 @@ jobs:
           node-version: 22.x
           package-manager-cache: false
       - run: npm ci --ignore-scripts --no-audit --no-fund
-      - run: npm run check
+      - name: Typecheck, lint, format, and test with coverage
+        run: npm run check
 
   dependency-review:
     if: github.event_name == 'pull_request'
