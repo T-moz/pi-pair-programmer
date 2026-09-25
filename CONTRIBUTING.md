@@ -1,5 +1,7 @@
 # Contributing
 
+Fork the repo and open a pull request. For vulnerabilities, use [private reporting](SECURITY.md), not an issue.
+
 Code should work in Pi, not just pass checks.
 
 1. Install dependencies: `npm install` (Node.js 22.19+).
