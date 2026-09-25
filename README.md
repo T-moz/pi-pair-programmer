@@ -22,6 +22,8 @@ Run `/pair-programmer` to toggle reviews. Turning off cancels queued and running
 
 ## Reviewers
 
+Each reviewer's `prompt` defines its entire task. Nothing more. Findings must directly connect a criterion violation to concrete code evidence and a consequence relevant to that criterion. Surrounding code provides context. An empty result is a successful review when the criterion is satisfied or evidence is insufficient.
+
 Without a config file, one reviewer uses the current model with the prompt “Does it add entropy ?”. To override it, create `pair-programmer.reviewers.json` in your working directory:
 
 ```json
