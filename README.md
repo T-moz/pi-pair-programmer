@@ -2,6 +2,8 @@
 
 Background code review for [Pi](https://pi.dev/docs/extensions) and [OMP](https://omp.sh/docs/extension-authoring).
 
+![Pi Pair Programmer workflow: coding agent writes code, focused reviewers filter findings, then the agent accepts or rejects feedback before continuing](assets/pair-programmer-overview.png)
+
 ## Why
 
 Coding with AI adds entropy to a codebase.
