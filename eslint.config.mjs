@@ -67,7 +67,9 @@ export default defineConfig(
   {
     files: [
       "src/index.ts",
+      "src/change-evidence.ts",
       "src/reviewers.ts",
+      "test/change-evidence.test.ts",
       "test/reviewers.test.ts",
       "test/extension.test.ts",
     ],
