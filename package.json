@@ -1,7 +1,7 @@
 {
   "name": "pi-pair-programmer",
   "version": "0.1.0",
-  "description": "A TypeScript Pi extension project for pair programming",
+  "description": "A TypeScript extension for Pi and OMP",
   "type": "module",
   "license": "MIT",
   "keywords": [
@@ -15,6 +15,11 @@
       "./src/index.ts"
     ]
   },
+  "omp": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
   "scripts": {
     "check": "tsc --noEmit && eslint . --max-warnings 0 && prettier --check .",
     "typecheck": "tsc --noEmit",
@@ -24,6 +29,11 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.87.1",
