@@ -53,6 +53,10 @@ function describe(findings: readonly Finding[]): string {
   return `Review findings:\n${lines.join("\n")}\nAccept or reject every finding with pair_programmer_decide(findingId, decision, reason) before using another tool. Give a concrete reason for each decision.`;
 }
 
+function acceptedReview(finding: Finding, reason: string): string {
+  return `### Accepted review: ${finding.title}\n\n**${finding.file}:${String(finding.line)}**\n\n${finding.evidence}\n\n**Reason:** ${reason}`;
+}
+
 export default function pairProgrammer(pi: ExtensionAPI): void {
   const appendReviewEntry = (data: unknown): void => {
     pi.appendEntry("pair-programmer", data);
@@ -95,7 +99,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       {
         customType: "pair-programmer-findings",
         content: describe(batch),
-        display: true,
+        display: false,
       },
       { deliverAs: "nextTurn", triggerTurn: false },
     );
@@ -442,11 +446,25 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
           details: { saved: false },
         });
       }
+      const finding =
+        params.decision === "accept"
+          ? store.deliveredFinding(params.findingId)
+          : undefined;
       const saved = store.decide(
         params.findingId,
         params.decision,
         params.reason,
       );
+      if (saved && params.decision === "accept" && finding !== undefined) {
+        pi.sendMessage(
+          {
+            customType: "pair-programmer-accepted",
+            content: acceptedReview(finding, params.reason),
+            display: true,
+          },
+          { triggerTurn: false },
+        );
+      }
       return Promise.resolve({
         content: [
           {

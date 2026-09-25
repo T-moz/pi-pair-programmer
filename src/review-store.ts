@@ -129,6 +129,13 @@ export class ReviewStore {
     return result;
   }
 
+  deliveredFinding(id: string): Finding | undefined {
+    const state = this.findings.get(id);
+    return state?.delivered === true && state.verdict === undefined
+      ? { ...state.finding }
+      : undefined;
+  }
+
   decide(id: string, verdict: Verdict, reason: string): boolean {
     const state = this.findings.get(id);
     if (
