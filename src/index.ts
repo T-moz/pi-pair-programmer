@@ -415,7 +415,13 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   });
 
   pi.on("tool_call", (event) => {
-    if (!store.enabled || event.toolName === "pair_programmer_decide") return;
+    if (
+      !store.enabled ||
+      event.toolName === "pair_programmer_decide" ||
+      (event.toolName === "write" &&
+        event.input.path === "xd://pair_programmer_decide")
+    )
+      return;
     deliver();
     const outstanding = store.outstanding();
     if (outstanding.length > 0) {
