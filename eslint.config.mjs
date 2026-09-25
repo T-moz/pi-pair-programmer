@@ -12,7 +12,12 @@ import tseslint from "typescript-eslint";
 
 export default defineConfig(
   {
-    files: ["src/**/*.ts", "eslint.config.mjs"],
+    files: [
+      "src/**/*.ts",
+      "test/**/*.ts",
+      "vitest.config.ts",
+      "eslint.config.mjs",
+    ],
     extends: [
       js.configs.recommended,
       unicorn.configs.unopinionated,
@@ -35,7 +40,7 @@ export default defineConfig(
     },
   },
   {
-    files: ["src/**/*.ts"],
+    files: ["src/**/*.ts", "test/**/*.ts", "vitest.config.ts"],
     extends: [
       tseslint.configs.strictTypeChecked,
       tseslint.configs.stylisticTypeChecked,
