@@ -68,12 +68,18 @@ export default defineConfig(
     files: [
       "src/index.ts",
       "src/change-evidence.ts",
+      "src/logger.ts",
       "src/reviewers.ts",
       "test/change-evidence.test.ts",
+      "test/logger.test.ts",
       "test/reviewers.test.ts",
       "test/extension.test.ts",
     ],
     rules: { "security/detect-non-literal-fs-filename": "off" },
+  },
+  {
+    files: ["src/logger.ts", "src/model-usage.ts"],
+    rules: { "no-empty": ["error", { allowEmptyCatch: true }] },
   },
   prettier,
 );

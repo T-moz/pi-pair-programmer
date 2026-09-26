@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { noul, TypeSafeClient } from "@typesafe-ai/sdk";
+import { observeJudgment, type ModelCallObserver } from "./model-usage.js";
 import type { ProposedFinding } from "./review-runner.js";
 import type { ReviewStore, Finding, StoredFinding } from "./review-store.js";
 
@@ -9,6 +10,7 @@ interface AdmissionRequest {
   revision: string;
   findings: readonly ProposedFinding[];
   signal: AbortSignal;
+  onModelCall?: ModelCallObserver;
   isCurrent: () => Promise<boolean>;
 }
 
@@ -55,6 +57,7 @@ async function isNovel(
   history: readonly StoredFinding[],
   earlier: readonly Candidate[],
   signal: AbortSignal,
+  onModelCall: ModelCallObserver | undefined,
 ): Promise<boolean> {
   const matches = (finding: Finding): boolean =>
     sameProblem(candidate, finding);
@@ -68,30 +71,33 @@ async function isNovel(
   if (history.length === 0 && earlier.length === 0) return true;
   try {
     jevClient ??= new TypeSafeClient({ logLevel: "off" });
-    const response = await jevClient.systemOne(
-      {
-        model: "jev-latest",
-        state: {
-          candidate: { ...candidate },
-          history: history.map(({ finding, verdict, reason }) => ({
-            ...finding,
-            duplicateKey: finding.duplicateKey ?? finding.id,
-            verdict: verdict ?? null,
-            reason: reason ?? null,
-          })),
-          earlierCandidates: earlier.map((finding) => ({ ...finding })),
+    const client = jevClient;
+    const response = await observeJudgment("dedup", signal, onModelCall, () =>
+      client.systemOne(
+        {
+          model: "jev-latest",
+          state: {
+            candidate: { ...candidate },
+            history: history.map(({ finding, verdict, reason }) => ({
+              ...finding,
+              duplicateKey: finding.duplicateKey ?? finding.id,
+              verdict: verdict ?? null,
+              reason: reason ?? null,
+            })),
+            earlierCandidates: earlier.map((finding) => ({ ...finding })),
+          },
+          questions: {
+            duplicate: noul(
+              "Is the candidate the same underlying problem with unchanged evidence as any history finding or earlier candidate? Previously accepted or rejected history findings count as duplicates. A material change to the evidence after a fix is not a duplicate.",
+              {
+                true: "Same root problem with unchanged evidence, even if wording or line number differs",
+                false: "Distinct root problem or materially changed evidence",
+              },
+            ),
+          },
         },
-        questions: {
-          duplicate: noul(
-            "Is the candidate the same underlying problem with unchanged evidence as any history finding or earlier candidate? Previously accepted or rejected history findings count as duplicates. A material change to the evidence after a fix is not a duplicate.",
-            {
-              true: "Same root problem with unchanged evidence, even if wording or line number differs",
-              false: "Distinct root problem or materially changed evidence",
-            },
-          ),
-        },
-      },
-      { signal, timeout: 30_000, retry: { maxRetries: 0 } },
+        { signal, timeout: 30_000, retry: { maxRetries: 0 } },
+      ),
     );
     return response.answers.duplicate.noul < 0.5;
   } catch {
@@ -107,12 +113,13 @@ async function novelFindings(
   history: readonly StoredFinding[],
   compareCandidates: boolean,
   signal: AbortSignal,
+  onModelCall: ModelCallObserver | undefined,
 ): Promise<Candidate[]> {
   const novel: Candidate[] = [];
   for (const [index, candidate] of candidates.entries()) {
     if (signal.aborted) break;
     const earlier = compareCandidates ? candidates.slice(0, index) : [];
-    if (await isNovel(candidate, history, earlier, signal))
+    if (await isNovel(candidate, history, earlier, signal, onModelCall))
       novel.push(candidate);
   }
   return novel;
@@ -135,6 +142,7 @@ export class FindingAdmission {
       history,
       true,
       signal,
+      request.onModelCall,
     );
     for (;;) {
       if (!(await request.isCurrent()) || signal.aborted) return "obsolete";
@@ -142,7 +150,13 @@ export class FindingAdmission {
       const added = latest.slice(history.length);
       if (novel.length === 0 || added.length === 0) break;
       history = latest;
-      novel = await novelFindings(novel, added, false, signal);
+      novel = await novelFindings(
+        novel,
+        added,
+        false,
+        signal,
+        request.onModelCall,
+      );
     }
     let result: "unchanged" | "added" = "unchanged";
     for (const finding of novel) {

@@ -336,6 +336,123 @@ it("leaves the queue unchanged when no findings survive review", async () => {
   expect(entries).toEqual([]);
 });
 
+it("accounts only real dedup calls and keeps deterministic duplicate fast paths silent", async () => {
+  const { admission, store } = session();
+  const onModelCall = vi.fn();
+  await expect(admission.admit({ ...request(), onModelCall })).resolves.toBe(
+    "added",
+  );
+  await expect(admission.admit({ ...request(), onModelCall })).resolves.toBe(
+    "unchanged",
+  );
+  expect(onModelCall).not.toHaveBeenCalled();
+  systemOne.mockResolvedValueOnce({
+    ...novel,
+    model: "jev-actual",
+    usage: { input_tokens: 200, output_tokens: 0 },
+  });
+  await expect(
+    admission.admit({
+      ...request([{ ...proposal, title: "Other defect" }]),
+      onModelCall,
+    }),
+  ).resolves.toBe("added");
+  expect(store.ready().map(({ title }) => title)).toEqual([
+    proposal.title,
+    "Other defect",
+  ]);
+  expect(onModelCall).toHaveBeenCalledExactlyOnceWith({
+    stage: "dedup",
+    requestedModel: "jev-latest",
+    model: "jev-actual",
+    outcome: "success",
+    durationMs: expect.any(Number) as unknown,
+    usage: { inputTokens: 200, outputTokens: 0 },
+  });
+});
+
+it("preserves deterministic fail-open decisions while recording unavailable judge usage", async () => {
+  const { admission, store } = session();
+  await admission.admit(request());
+  const onModelCall = vi.fn();
+  systemOne.mockRejectedValue(new Error("private provider outage"));
+  await expect(
+    admission.admit({
+      ...request([{ ...proposal, evidence: "Changed wording" }]),
+      onModelCall,
+    }),
+  ).resolves.toBe("unchanged");
+  await expect(
+    admission.admit({
+      ...request([{ ...proposal, title: "Distinct defect" }]),
+      onModelCall,
+    }),
+  ).resolves.toBe("added");
+  expect(store.ready().map(({ title }) => title)).toEqual([
+    proposal.title,
+    "Distinct defect",
+  ]);
+  expect(onModelCall.mock.calls).toEqual(
+    Array.from({ length: 2 }, () => [
+      {
+        stage: "dedup",
+        requestedModel: "jev-latest",
+        outcome: "failed",
+        durationMs: expect.any(Number) as unknown,
+      },
+    ]),
+  );
+});
+
+it("does not let an accounting exception alter a semantic duplicate decision", async () => {
+  const { admission, store } = session();
+  await admission.admit(request());
+  const original = readyFinding(store);
+  systemOne.mockResolvedValueOnce(duplicate);
+  await expect(
+    admission.admit({
+      ...request([{ ...proposal, title: "Reworded defect" }]),
+      onModelCall: () => {
+        throw new Error("journal offline");
+      },
+    }),
+  ).resolves.toBe("unchanged");
+  expect(store.ready()).toEqual([original]);
+});
+
+it("records one cancelled dedup call without admitting its findings", async () => {
+  const { admission, store } = session();
+  await admission.admit(request());
+  const original = readyFinding(store);
+  const controller = new AbortController();
+  const onModelCall = vi.fn();
+  systemOne.mockImplementationOnce((_input, { signal }) => {
+    const { promise, reject } = Promise.withResolvers<unknown>();
+    signal.addEventListener(
+      "abort",
+      () => {
+        reject(new Error("cancelled"));
+      },
+      { once: true },
+    );
+    return promise;
+  });
+  const pending = admission.admit({
+    ...request([{ ...proposal, title: "Distinct defect" }]),
+    signal: controller.signal,
+    onModelCall,
+  });
+  controller.abort();
+  await expect(pending).resolves.toBe("obsolete");
+  expect(store.ready()).toEqual([original]);
+  expect(onModelCall).toHaveBeenCalledExactlyOnceWith({
+    stage: "dedup",
+    requestedModel: "jev-latest",
+    outcome: "cancelled",
+    durationMs: expect.any(Number) as unknown,
+  });
+});
+
 it("propagates journal failure without making an unrecorded finding deliverable", async () => {
   const store = new ReviewStore(() => {
     throw new Error("Journal unavailable");

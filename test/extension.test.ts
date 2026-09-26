@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -11,13 +12,24 @@ import type {
 import { afterEach, beforeEach, expect, it, vi, type Mock } from "vitest";
 import * as changeEvidence from "../src/change-evidence.js";
 import pairProgrammer from "../src/index.js";
+import { PairStats, type StatsSnapshot } from "../src/pair-stats.js";
 import {
   isInherited,
   reviewFile,
+  ReviewTimeoutError,
   type ProposedFinding,
 } from "../src/review-runner.js";
 import type { Finding } from "../src/review-store.js";
 import * as reviewerModule from "../src/reviewers.js";
+
+const lifecycleLog = vi.hoisted(() => vi.fn());
+vi.mock("../src/logger.js", () => ({
+  createPairLogger: () =>
+    Promise.resolve({
+      log: lifecycleLog,
+      close: () => Promise.resolve(),
+    }),
+}));
 
 const realpathPauses = vi.hoisted(() => new Map<string, Promise<null>[]>());
 const matchingCalls = vi.hoisted(() => new Map<string, number>());
@@ -86,7 +98,8 @@ vi.mock("../src/reviewers.js", async (importOriginal) => {
   };
 });
 
-vi.mock("../src/review-runner.js", () => ({
+vi.mock("../src/review-runner.js", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
   reviewFile: vi.fn(),
   isInherited: vi.fn(),
 }));
@@ -179,12 +192,17 @@ async function pausePreparation(
 }
 
 const directories: string[] = [];
+let testSession = "";
 
 async function setup(
   host: "pi" | "omp" = "pi",
   aliasedCwd = false,
   useDefaults = false,
-  beforeStart?: (cwd: string, ctx: ExtensionContext) => Promise<void>,
+  beforeStart?: (
+    cwd: string,
+    ctx: ExtensionContext,
+    emit: (name: string, event?: unknown) => Promise<unknown>,
+  ) => Promise<void>,
 ): Promise<{
   cwd: string;
   ctx: ExtensionContext;
@@ -195,6 +213,9 @@ async function setup(
   isIdle: Mock<() => boolean>;
   notify: ReturnType<typeof vi.fn>;
   entries: JournalEntry[];
+  statsEntries: unknown[];
+  activateStatsJournal: (sessionId: string) => unknown[];
+  custom: Mock<ExtensionContext["ui"]["custom"]>;
   failEntry: (error?: Error) => void;
   entryAttempts: () => number;
 }> {
@@ -231,6 +252,12 @@ async function setup(
     Parameters<ExtensionAPI["registerCommand"]>[1]
   >();
   const entries: JournalEntry[] = [];
+  const statsEntries: unknown[] = [];
+  let activeStatsEntries = statsEntries;
+  const statsJournals = new Map<string, unknown[]>([
+    [testSession, statsEntries],
+  ]);
+  const custom = vi.fn<ExtensionContext["ui"]["custom"]>();
   const transcript: unknown[] = [];
   let entryError: Error | undefined;
   let entryAttempts = 0;
@@ -253,6 +280,13 @@ async function setup(
     },
     sendMessage,
     appendEntry(customType: string, data: unknown) {
+      if (customType === "pair-programmer-stats") {
+        if (entryError !== undefined) throw entryError;
+        const entry = { type: "custom", customType, data };
+        activeStatsEntries.push(entry);
+        transcript.push(entry);
+        return;
+      }
       entryAttempts += 1;
       if (entryError !== undefined) throw entryError;
       if (customType !== "pair-programmer")
@@ -274,17 +308,19 @@ async function setup(
     isIdle,
     sessionManager: {
       getBranch: () => entries,
-      getHeader: vi.fn(() => ({ id: "fresh-session" })),
+      getHeader: vi.fn(() => ({ id: testSession })),
       getEntries: vi.fn(() => transcript),
     },
-    ui: { notify },
+    hasUI: true,
+    mode: host === "pi" ? "tui" : undefined,
+    ui: { notify, custom },
   } as unknown as ExtensionContext;
   const emit = async (name: string, event: unknown = {}): Promise<unknown> => {
     const handler = hooks.get(name);
     if (!handler) throw new Error(`Missing ${name} hook`);
     return await handler(event, ctx);
   };
-  await beforeStart?.(cwd, ctx);
+  await beforeStart?.(cwd, ctx, emit);
   await emit("session_start", host === "pi" ? { reason: "startup" } : {});
   return {
     cwd,
@@ -300,6 +336,21 @@ async function setup(
     isIdle,
     notify,
     entries,
+    statsEntries,
+    activateStatsJournal: (sessionId: string) => {
+      let journal = statsJournals.get(sessionId);
+      if (journal === undefined) {
+        journal = [];
+        statsJournals.set(sessionId, journal);
+      }
+      activeStatsEntries = journal;
+      Object.assign(ctx.sessionManager, {
+        getHeader: () => ({ id: sessionId }),
+        getEntries: () => activeStatsEntries,
+      });
+      return journal;
+    },
+    custom,
     failEntry: (error?: Error) => {
       entryError = error;
     },
@@ -307,7 +358,46 @@ async function setup(
   };
 }
 
+function persistedStats(
+  entries: readonly unknown[],
+  sessionId = testSession,
+): StatsSnapshot {
+  const stats = new PairStats(
+    createHash("sha256").update(sessionId).digest("hex"),
+    vi.fn(),
+  );
+  stats.restore(entries);
+  return stats.snapshot();
+}
+
+type StatsFactory = Parameters<ExtensionContext["ui"]["custom"]>[0];
+async function openStatistics(environment: {
+  custom: Mock<ExtensionContext["ui"]["custom"]>;
+  command: (name: string) => Promise<void>;
+}): Promise<string[]> {
+  let lines: string[] = [];
+  environment.custom.mockImplementation(
+    async (factory: StatsFactory): Promise<void> => {
+      const component = await factory(
+        {
+          terminal: { rows: 100 },
+          requestRender: vi.fn(),
+        } as unknown as Parameters<StatsFactory>[0],
+        {} as Parameters<StatsFactory>[1],
+        {} as Parameters<StatsFactory>[2],
+        vi.fn(),
+      );
+      lines = component.render(240);
+      component.dispose?.();
+    },
+  );
+  await environment.command("pair-stats");
+  return lines;
+}
+
 beforeEach(() => {
+  testSession = randomUUID();
+  lifecycleLog.mockClear();
   realpathPauses.clear();
   matchingCalls.clear();
   statCalls.clear();
@@ -334,6 +424,510 @@ afterEach(async () => {
         fsPromises.rm(directory, { recursive: true, force: true }),
       ),
   );
+});
+
+it.each(["success", "failed", "timeout", "cancelled"] as const)(
+  "accounts for %s reviewer calls without background terminal output",
+  async (outcome) => {
+    const environment = await setup("pi", false, true);
+    vi.mocked(reviewFile).mockImplementation((request) => {
+      request.onModelCall?.({
+        stage: "review",
+        requestedModel: request.model,
+        model: "observed-model",
+        provider: "observed-provider",
+        outcome,
+        durationMs: 15,
+        usage: { inputTokens: 11, outputTokens: 2, costUsd: 0.003 },
+      });
+      return Promise.resolve([]);
+    });
+    await fsPromises.writeFile(
+      path.join(environment.cwd, "private-file.ts"),
+      "const privateSource = 'must not log';\n",
+    );
+    await environment.emit("tool_result", {
+      toolName: "write",
+      input: { path: "private-file.ts" },
+      isError: false,
+    });
+    await advanceReviews(() => {
+      expect(persistedStats(environment.statsEntries).finished).toBe(1);
+    });
+    const snapshot = persistedStats(environment.statsEntries);
+    expect(snapshot.reviews).toMatchObject({ [outcome]: 1 });
+    expect(snapshot.usage[0]).toMatchObject({
+      model: "observed-model",
+      provider: "observed-provider",
+      inputTokens: { value: 11, measured: 1 },
+      costUsd: { value: 0.003, measured: 1 },
+    });
+    expect(environment.notify).not.toHaveBeenCalled();
+    expect(environment.custom).not.toHaveBeenCalled();
+    expect(environment.sendMessage).not.toHaveBeenCalled();
+    expect(JSON.stringify(lifecycleLog.mock.calls)).not.toContain(
+      "private-file",
+    );
+    expect(JSON.stringify(lifecycleLog.mock.calls)).not.toContain(
+      "must not log",
+    );
+    expect(JSON.stringify(lifecycleLog.mock.calls)).not.toContain(
+      "observed-model",
+    );
+    const lines = await openStatistics(environment);
+    expect(lines.join("\n")).toContain("observed-provider/observed-model");
+    await environment.emit("session_shutdown");
+  },
+);
+
+it("does not acquire baseline or resume activity when shutdown races with journal restoration", async () => {
+  const capture = vi.spyOn(changeEvidence, "captureBaseline");
+  const environment = await setup("pi", false, true, (_cwd, ctx, emit) => {
+    Object.assign(ctx.sessionManager, {
+      getBranch: () => {
+        void emit("session_shutdown");
+        return [];
+      },
+    });
+    return Promise.resolve();
+  });
+  expect(capture).not.toHaveBeenCalled();
+  expect(environment.notify).not.toHaveBeenCalled();
+  expect(environment.sendMessage).not.toHaveBeenCalled();
+  expect(
+    lifecycleLog.mock.calls.some(([event]) => event === "session.start"),
+  ).toBe(false);
+  capture.mockRestore();
+});
+
+it("keeps attribution fail-open while recording its failed call separately from the completed review", async () => {
+  const environment = await setup("pi", false, true);
+  vi.mocked(reviewFile).mockResolvedValue([
+    {
+      line: 1,
+      title: "Broken call",
+      quote: "broken()",
+      evidence: "Throws on invocation",
+    },
+  ]);
+  vi.mocked(isInherited).mockImplementation((request) => {
+    request.onModelCall?.({
+      stage: "attribution",
+      requestedModel: "jev-latest",
+      outcome: "failed",
+      durationMs: 4,
+    });
+    return Promise.resolve(false);
+  });
+  await fsPromises.writeFile(
+    path.join(environment.cwd, "change.ts"),
+    "broken();\n",
+  );
+  await environment.emit("tool_result", {
+    toolName: "write",
+    input: { path: "change.ts" },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(persistedStats(environment.statsEntries).reviews.success).toBe(1);
+  });
+  expect(findings(environment.entries).map((finding) => finding.title)).toEqual(
+    ["Broken call"],
+  );
+  expect(persistedStats(environment.statsEntries).usage).toMatchObject([
+    { stage: "attribution", outcomes: { failed: 1 }, costUsd: { measured: 0 } },
+  ]);
+  await environment.emit("session_shutdown");
+});
+
+it("never wakes the main agent from idle lifecycle events while review is disabled", async () => {
+  const environment = await setup("omp", false, true);
+  await environment.command("pair-programmer");
+  await environment.emit("agent_settled");
+  await environment.emit("agent_end");
+  expect(environment.sendMessage).not.toHaveBeenCalled();
+  expect(reviewFile).not.toHaveBeenCalled();
+  await environment.emit("session_shutdown");
+});
+
+it("records a reviewer timeout before model startup without inventing a model call", async () => {
+  const environment = await setup("pi", false, true);
+  vi.mocked(reviewFile).mockRejectedValue(
+    new ReviewTimeoutError("process deadline"),
+  );
+  await fsPromises.writeFile(
+    path.join(environment.cwd, "change.ts"),
+    "export const x = 1;\n",
+  );
+  await environment.emit("tool_result", {
+    toolName: "write",
+    input: { path: "change.ts" },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(persistedStats(environment.statsEntries).reviews.timeout).toBe(1);
+  });
+  expect(persistedStats(environment.statsEntries).usage).toEqual([]);
+  await environment.emit("session_shutdown");
+});
+
+it("keeps late usage on the originating session after cancellation and session switching", async () => {
+  const environment = await setup("omp", false, true);
+  const pending = Promise.withResolvers<ProposedFinding[]>();
+  vi.mocked(reviewFile).mockImplementation(async (request) => {
+    const findings = await pending.promise;
+    request.onModelCall?.({
+      stage: "review",
+      requestedModel: request.model,
+      outcome: "cancelled",
+      durationMs: 50,
+      usage: { inputTokens: 30 },
+    });
+    return findings;
+  });
+  await fsPromises.writeFile(
+    path.join(environment.cwd, "change.ts"),
+    "export const x = 1;\n",
+  );
+  await environment.emit("tool_result", {
+    toolName: "write",
+    input: { path: "change.ts" },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(reviewFile).toHaveBeenCalledOnce();
+  });
+  expect((await openStatistics(environment)).join("\n")).toContain("Running 1");
+  await environment.emit("session_before_switch");
+  const newJournal = environment.activateStatsJournal("new-session");
+  await environment.emit("session_switch", { reason: "new" });
+  expect(persistedStats(environment.statsEntries)).toMatchObject({
+    reviews: { cancelled: 1 },
+    incompleteJobs: 1,
+  });
+  pending.resolve([]);
+  await vi.waitFor(() => {
+    expect(vi.mocked(reviewFile).mock.settledResults[0]?.type).toBe(
+      "fulfilled",
+    );
+  });
+
+  expect(persistedStats(environment.statsEntries)).toMatchObject({
+    incompleteJobs: 1,
+    usage: [],
+  });
+  expect(newJournal).toEqual([]);
+  expect((await openStatistics(environment)).join("\n")).toContain(
+    "No finalized extension model calls",
+  );
+  environment.activateStatsJournal(testSession);
+  await environment.emit("session_switch", { reason: "resume" });
+  await vi.waitFor(() => {
+    expect(persistedStats(environment.statsEntries).incompleteJobs).toBe(0);
+  });
+  expect(
+    persistedStats(environment.statsEntries).usage[0]?.inputTokens.value,
+  ).toBe(30);
+  expect(newJournal).toEqual([]);
+  const resumed = (await openStatistics(environment)).join("\n");
+  expect(resumed).toContain("Cancelled 1");
+  expect(resumed).toContain("30 (complete 1/1)");
+  expect(environment.sendMessage).not.toHaveBeenCalled();
+  await environment.emit("session_shutdown");
+});
+
+it("rebinds late origin usage after Pi replaces and reloads extension factories", async () => {
+  const old = await setup("pi", false, true);
+  const pending = Promise.withResolvers<ProposedFinding[]>();
+  vi.mocked(reviewFile).mockImplementation(async (request) => {
+    const findings = await pending.promise;
+    request.onModelCall?.({
+      stage: "review",
+      requestedModel: request.model,
+      outcome: "cancelled",
+      durationMs: 10,
+      usage: { inputTokens: 23 },
+    });
+    return findings;
+  });
+  await fsPromises.writeFile(
+    path.join(old.cwd, "change.ts"),
+    "export const x = 1;\n",
+  );
+  await old.emit("tool_result", {
+    toolName: "write",
+    input: { path: "change.ts" },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(reviewFile).toHaveBeenCalledOnce();
+  });
+  await old.emit("session_before_switch");
+  await old.emit("session_shutdown");
+  const other = await setup("pi", false, true, (_cwd, ctx) => {
+    Object.assign(ctx.sessionManager, {
+      getHeader: () => ({ id: "other-session" }),
+    });
+    return Promise.resolve();
+  });
+  pending.resolve([]);
+  await vi.waitFor(() => {
+    expect(vi.mocked(reviewFile).mock.settledResults[0]?.type).toBe(
+      "fulfilled",
+    );
+  });
+  expect(persistedStats(old.statsEntries)).toMatchObject({
+    incompleteJobs: 1,
+    usage: [],
+  });
+  expect(other.statsEntries).toEqual([]);
+  await other.emit("session_shutdown");
+  const resumed = await setup("pi", false, true, (_cwd, ctx) => {
+    Object.assign(ctx.sessionManager, { getEntries: () => old.statsEntries });
+    return Promise.resolve();
+  });
+  expect(
+    persistedStats([...old.statsEntries, ...resumed.statsEntries]),
+  ).toMatchObject({
+    incompleteJobs: 0,
+    reviews: { cancelled: 1 },
+    usage: [{ inputTokens: { value: 23, measured: 1 } }],
+  });
+  expect(other.statsEntries).toEqual([]);
+  expect(resumed.sendMessage).not.toHaveBeenCalled();
+  await resumed.emit("session_shutdown");
+});
+
+it("counts a recovered reviewer job as completed while retaining both model call outcomes", async () => {
+  const environment = await setup("pi", false, true);
+  vi.mocked(reviewFile).mockImplementation((request) => {
+    for (const outcome of ["failed", "success"] as const)
+      request.onModelCall?.({
+        stage: "review",
+        requestedModel: request.model,
+        outcome,
+        durationMs: 5,
+        usage: { inputTokens: 2 },
+      });
+    return Promise.resolve([]);
+  });
+  await fsPromises.writeFile(
+    path.join(environment.cwd, "change.ts"),
+    "export const x = 1;\n",
+  );
+  await environment.emit("tool_result", {
+    toolName: "write",
+    input: { path: "change.ts" },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(persistedStats(environment.statsEntries).reviews.success).toBe(1);
+  });
+  expect(persistedStats(environment.statsEntries)).toMatchObject({
+    reviews: { failed: 0 },
+    usage: [
+      {
+        calls: 2,
+        outcomes: { failed: 1, success: 1 },
+        inputTokens: { value: 4, measured: 2 },
+      },
+    ],
+  });
+  await environment.emit("session_shutdown");
+});
+
+it.each(["changed", "invalid", "unavailable"] as const)(
+  "guards asynchronous accounting when the journal manager becomes %s",
+  async (mode) => {
+    let managerState = "valid";
+    const environment = await setup("pi", false, true, (_cwd, ctx) => {
+      Object.assign(ctx.sessionManager, {
+        getSessionId: () => {
+          if (managerState === "invalid") throw new Error("replaced context");
+          if (managerState === "changed") return "another-journal";
+          return managerState === "unavailable" ? undefined : testSession;
+        },
+        getHeader: () =>
+          managerState === "unavailable" ? undefined : { id: testSession },
+      });
+      return Promise.resolve();
+    });
+    const pending = Promise.withResolvers<ProposedFinding[]>();
+    vi.mocked(reviewFile).mockImplementation(async (request) => {
+      const result = await pending.promise;
+      request.onModelCall?.({
+        stage: "review",
+        requestedModel: request.model,
+        outcome: "success",
+        durationMs: 1,
+        usage: { inputTokens: 19 },
+      });
+      return result;
+    });
+    await fsPromises.writeFile(
+      path.join(environment.cwd, "change.ts"),
+      "export const x = 1;\n",
+    );
+    await environment.emit("tool_result", {
+      toolName: "write",
+      input: { path: "change.ts" },
+      isError: false,
+    });
+    await advanceReviews(() => {
+      expect(reviewFile).toHaveBeenCalledOnce();
+    });
+    managerState = mode;
+    pending.resolve([]);
+    await vi.waitFor(() => {
+      expect(vi.mocked(reviewFile).mock.settledResults[0]?.type).toBe(
+        "fulfilled",
+      );
+    });
+    if (mode !== "unavailable")
+      expect(persistedStats(environment.statsEntries)).toMatchObject({
+        incompleteJobs: 1,
+        usage: [],
+      });
+    managerState = "valid";
+    await environment.emit("session_start", { reason: "resume" });
+    await vi.waitFor(() => {
+      expect(persistedStats(environment.statsEntries)).toMatchObject({
+        incompleteJobs: 0,
+        usage: [{ inputTokens: { value: 19, measured: 1 } }],
+      });
+    });
+    await environment.emit("session_shutdown");
+  },
+);
+
+it("keeps the original journal writable when a pre-switch event is followed by a cancelled switch", async () => {
+  const environment = await setup("pi", false, true);
+  const pending = Promise.withResolvers<ProposedFinding[]>();
+  vi.mocked(reviewFile).mockImplementation(async (request) => {
+    const result = await pending.promise;
+    request.onModelCall?.({
+      stage: "review",
+      requestedModel: request.model,
+      outcome: request.signal.aborted ? "cancelled" : "success",
+      durationMs: 5,
+      usage: { inputTokens: 7 },
+    });
+    return result;
+  });
+  const file = path.join(environment.cwd, "change.ts");
+  await fsPromises.writeFile(file, "export const x = 1;\n");
+  await environment.emit("tool_result", {
+    toolName: "write",
+    input: { path: file },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(reviewFile).toHaveBeenCalledOnce();
+  });
+  await environment.emit("session_before_switch");
+  pending.resolve([]);
+  await vi.waitFor(() => {
+    expect(persistedStats(environment.statsEntries).incompleteJobs).toBe(0);
+  });
+  expect(
+    persistedStats(environment.statsEntries).usage[0]?.inputTokens.value,
+  ).toBe(7);
+  await fsPromises.writeFile(file, "export const x = 2;\n");
+  await environment.emit("tool_result", {
+    toolName: "write",
+    input: { path: file },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(persistedStats(environment.statsEntries).reviews.success).toBe(1);
+  });
+  expect(
+    persistedStats(environment.statsEntries).usage[0]?.inputTokens.value,
+  ).toBe(14);
+  await environment.emit("session_shutdown");
+});
+
+it("restores selected-branch findings without rewinding session-incurred review activity", async () => {
+  const environment = await setup("pi", false, true);
+  vi.mocked(reviewFile).mockResolvedValue([
+    {
+      line: 1,
+      title: "Fault",
+      quote: "broken()",
+      evidence: "Fails on invocation",
+    },
+  ]);
+  await fsPromises.writeFile(
+    path.join(environment.cwd, "change.ts"),
+    "broken();\n",
+  );
+  await environment.emit("tool_result", {
+    toolName: "write",
+    input: { path: "change.ts" },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(findings(environment.entries)).toHaveLength(1);
+  });
+  await environment.emit("turn_end");
+  const branchPoint = [...environment.entries];
+  const finding = findings(environment.entries)[0];
+  if (finding === undefined) throw new Error("missing finding");
+  await environment.decide("decision", {
+    findingId: finding.id,
+    decision: "accept",
+    reason: "confirmed",
+  });
+  expect((await openStatistics(environment)).join("\n")).toContain(
+    "Accepted 1",
+  );
+  Object.assign(environment.ctx.sessionManager, {
+    getBranch: () => branchPoint,
+  });
+  await environment.emit("session_tree");
+  const snapshot = (await openStatistics(environment)).join("\n");
+  expect(snapshot).toContain("Accepted 0");
+  expect(snapshot).toContain("awaiting decision 1");
+  expect(snapshot).toContain("completed 1");
+  await environment.emit("session_shutdown");
+});
+
+it("keeps review behavior and in-memory accounting when diagnostic persistence is unavailable", async () => {
+  const environment = await setup("pi", false, true);
+  environment.failEntry(new Error("private filesystem details"));
+  vi.mocked(reviewFile).mockImplementation((request) => {
+    request.onModelCall?.({
+      stage: "review",
+      requestedModel: request.model,
+      outcome: "success",
+      durationMs: 10,
+    });
+    return Promise.resolve([]);
+  });
+  await fsPromises.writeFile(
+    path.join(environment.cwd, "change.ts"),
+    "export const ok = 1;\n",
+  );
+  await environment.emit("tool_result", {
+    toolName: "write",
+    input: { path: "change.ts" },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(lifecycleLog).toHaveBeenCalledWith(
+      "review.finished",
+      expect.objectContaining({ outcome: "success" }),
+    );
+  });
+  const snapshot = (await openStatistics(environment)).join("\n");
+  expect(snapshot).toContain("completed 1");
+  expect(snapshot).toContain("Storage unavailable for 3 record(s)");
+  expect(environment.notify).not.toHaveBeenCalled();
+  expect(JSON.stringify(lifecycleLog.mock.calls)).not.toContain(
+    "private filesystem details",
+  );
+  environment.failEntry();
+  await environment.emit("session_shutdown");
 });
 
 const inheritedSource = [
@@ -496,6 +1090,7 @@ it.each(["pi", "omp"] as const)(
     });
     expect(environment.sendMessage).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(300);
+    await environment.emit("agent_settled");
     expect(environment.sendMessage).toHaveBeenCalledOnce();
     expect(environment.sendMessage.mock.calls[0]?.[1]).toEqual(
       host === "pi"

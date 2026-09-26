@@ -5,10 +5,12 @@ import { afterEach, beforeEach, expect, it, vi, type Mock } from "vitest";
 import {
   isInherited,
   reviewFile,
+  ReviewTimeoutError,
   type Host,
   type ProposedFinding,
 } from "../src/review-runner.js";
 import type { ChangeEvidence } from "../src/change-evidence.js";
+import type { ModelCallObservation } from "../src/model-usage.js";
 
 interface JudgmentRequest {
   model: string;
@@ -102,9 +104,32 @@ const valid: ProposedFinding = {
   evidence: "The user can be null at runtime",
 };
 
-function finish(child: FakeChild, findings: unknown): void {
-  child.stdout.write(JSON.stringify({ findings }));
+function finishText(child: FakeChild, text: string): void {
+  const message = {
+    role: "assistant",
+    provider: "openai",
+    model: "gpt-5",
+    timestamp: 1,
+    content: [{ type: "text", text }],
+    stopReason: "stop",
+    usage: {
+      input: 12,
+      output: 8,
+      cacheRead: 4,
+      cacheWrite: 0,
+      totalTokens: 24,
+      cost: { total: 0.001 },
+    },
+  };
+  child.stdout.write(`${JSON.stringify({ type: "message_end", message })}\n`);
+  child.stdout.write(
+    `${JSON.stringify({ type: "agent_end", messages: [message] })}\n`,
+  );
   child.emit("close", 0);
+}
+
+function finish(child: FakeChild, findings: unknown): void {
+  finishText(child, JSON.stringify({ findings }));
 }
 
 beforeEach(() => {
@@ -226,8 +251,7 @@ it("accepts exact maximum field lengths and verifies the full source quote", asy
 it("accepts empty findings and retains valid proposal data with extra fields", async () => {
   const empty = subprocess();
   const noFindings = reviewFile(request());
-  empty.child.stdout.write('{"findings":[],"metadata":"ignored"}');
-  empty.child.emit("close", 0);
+  finishText(empty.child, '{"findings":[],"metadata":"ignored"}');
   await expect(noFindings).resolves.toEqual([]);
 
   const extra = {
@@ -255,8 +279,7 @@ it.each([
 ])("rejects invalid reviewer JSON contracts: %s", async (output) => {
   const { child } = subprocess();
   const pending = reviewFile(request());
-  child.stdout.write(output);
-  child.emit("close", 0);
+  finishText(child, output);
   await expect(pending).rejects.toThrow(/findings array/u);
 });
 
@@ -266,10 +289,10 @@ it.each(["```json\n", "```\n", "```JSON\r\n"])(
     const { child } = subprocess();
     const pending = reviewFile(request("omp"));
     const lineEnding = opening.endsWith("\r\n") ? "\r\n" : "\n";
-    child.stdout.write(
+    finishText(
+      child,
       `${opening}${JSON.stringify({ findings: [valid] })}${lineEnding}\`\`\`\n`,
     );
-    child.emit("close", 0);
     await expect(pending).resolves.toEqual([valid]);
   },
 );
@@ -285,8 +308,7 @@ it.each([
   async (output) => {
     const { child } = subprocess();
     const pending = reviewFile(request("omp"));
-    child.stdout.write(output);
-    child.emit("close", 0);
+    finishText(child, output);
     await expect(pending).rejects.toThrow();
   },
 );
@@ -301,13 +323,64 @@ it("rejects non-JSON output and omits source beyond the excerpt limit", async ()
   await expect(pending).rejects.toThrow();
 });
 
-it("bounds stdout, drains late data, and terminates a noisy reviewer", async () => {
+it("bounds unframed stdout, drains late data, and terminates a noisy reviewer", async () => {
   const { child } = subprocess();
   const pending = reviewFile(request());
-  child.stdout.write(Buffer.alloc(256_001));
+  child.stdout.write(Buffer.alloc(1024 * 1024 + 1));
   child.stdout.write(Buffer.alloc(10));
   await expect(pending).rejects.toThrow("Reviewer output exceeded limit");
   expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+});
+
+it("accepts supported multibyte source echoes and repeated JSON lifecycle traffic", async () => {
+  const { child, input } = subprocess();
+  const observer = vi.fn();
+  const source = `const value = "${"漢".repeat(50_000)}";\n`;
+  const pending = reviewFile({
+    ...request("omp", source),
+    onModelCall: observer,
+  });
+  const user = {
+    role: "user",
+    content: [{ type: "text", text: input.join("") }],
+  };
+  for (const type of ["message_start", "message_end"])
+    child.stdout.write(`${JSON.stringify({ type, message: user })}\n`);
+  child.stdout.write(
+    `${JSON.stringify({ type: "message_start", message: { role: "assistant" } })}\n`,
+  );
+  for (let count = 0; count < 2000; count += 1)
+    child.stdout.write(
+      `${JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", delta: "x".repeat(200) } })}\n`,
+    );
+  finish(child, []);
+  await expect(pending).resolves.toEqual([]);
+  expect(child.kill).not.toHaveBeenCalled();
+  expect(observer).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({
+      usage: {
+        inputTokens: 12,
+        outputTokens: 8,
+        cacheReadTokens: 4,
+        cacheWriteTokens: 0,
+        totalTokens: 24,
+        costUsd: 0.001,
+      },
+    }),
+  );
+});
+
+it("rejects oversized individual JSON records and decoded answers", async () => {
+  const first = subprocess();
+  const untrusted = reviewFile(request());
+  first.child.stdout.write(
+    `${JSON.stringify({ type: "message_end", message: { role: "user", content: "x".repeat(1024 * 1024) } })}\n`,
+  );
+  await expect(untrusted).rejects.toThrow("Reviewer output exceeded limit");
+  const second = subprocess();
+  const answer = reviewFile(request());
+  finishText(second.child, "漢".repeat(90_000));
+  await expect(answer).rejects.toThrow("invalid JSON event stream");
 });
 
 it("reports bounded stderr on a failed reviewer and a fallback for no stderr", async () => {
@@ -542,4 +615,219 @@ it("keeps findings when attribution is unavailable or cancelled", async () => {
   });
   controller.abort();
   await expect(pending).resolves.toBe(false);
+});
+
+it.each(["pi", "omp"] as const)(
+  "returns %s findings alongside one redacted usage observation",
+  async (host) => {
+    const { child } = subprocess();
+    const observations: ModelCallObservation[] = [];
+    const pending = reviewFile({
+      ...request(host),
+      onModelCall: (event) => {
+        observations.push(event);
+      },
+    });
+    finish(child, [valid]);
+    await expect(pending).resolves.toEqual([valid]);
+    expect(observations).toEqual([
+      {
+        stage: "review",
+        requestedModel: "openai/gpt-5",
+        model: "gpt-5",
+        provider: "openai",
+        outcome: "success",
+        durationMs: expect.any(Number) as unknown,
+        usage: {
+          inputTokens: 12,
+          outputTokens: 8,
+          cacheReadTokens: 4,
+          cacheWriteTokens: 0,
+          totalTokens: 24,
+          costUsd: 0.001,
+        },
+      },
+    ]);
+  },
+);
+
+it("retains failed reviewer usage without turning a failed response into findings", async () => {
+  const { child } = subprocess();
+  const onModelCall = vi.fn();
+  const pending = reviewFile({ ...request(), onModelCall });
+  child.stdout.write(
+    `${JSON.stringify({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        model: "actual-fallback",
+        stopReason: "error",
+        usage: { input: 9, output: 2 },
+        content: [
+          { type: "text", text: JSON.stringify({ findings: [valid] }) },
+        ],
+        errorMessage: "private error",
+      },
+    })}\n`,
+  );
+  child.emit("close", 1);
+  await expect(pending).rejects.toThrow("Reviewer exited 1");
+  expect(onModelCall).toHaveBeenCalledExactlyOnceWith({
+    stage: "review",
+    requestedModel: "openai/gpt-5",
+    model: "actual-fallback",
+    outcome: "failed",
+    durationMs: expect.any(Number) as unknown,
+    usage: { inputTokens: 9, outputTokens: 2 },
+  });
+});
+
+it("records an unfinished provider call as failed without measuring streamed estimates", async () => {
+  const { child } = subprocess();
+  const observer = vi.fn();
+  const pending = reviewFile({ ...request(), onModelCall: observer });
+  child.stdout.write(
+    `${JSON.stringify({ type: "message_start", message: { role: "assistant", model: "observed" } })}\n`,
+  );
+  child.stdout.write(
+    `${JSON.stringify({ type: "message_update", usage: { input: 12 } })}\n`,
+  );
+  child.emit("close", 2);
+  await expect(pending).rejects.toThrow("Reviewer exited 2");
+  expect(observer).toHaveBeenCalledExactlyOnceWith({
+    stage: "review",
+    requestedModel: "openai/gpt-5",
+    model: "observed",
+    outcome: "failed",
+    durationMs: expect.any(Number) as unknown,
+  });
+});
+
+it.each([false, true])(
+  "leaves nonfinal usage unknown on reviewer interruption (deadline=%s)",
+  async (deadline) => {
+    const timeout = new AbortController();
+    vi.spyOn(AbortSignal, "timeout").mockReturnValue(timeout.signal);
+    const controller = new AbortController();
+    const { child } = subprocess();
+    const onModelCall = vi.fn();
+    const pending = reviewFile({
+      ...request(),
+      signal: controller.signal,
+      onModelCall,
+    });
+    child.stdout.write(
+      `${JSON.stringify({ type: "message_start", message: { role: "assistant", model: "observed" } })}\n`,
+    );
+    child.stdout.write(
+      `${JSON.stringify({ type: "message_update", usage: { input: 7 } })}\n`,
+    );
+    if (deadline) timeout.abort();
+    else controller.abort();
+    child.emit("error", new Error("interrupted"));
+    child.emit("close", null);
+    await expect(pending).rejects.toThrow("interrupted");
+    expect(onModelCall).toHaveBeenCalledExactlyOnceWith({
+      stage: "review",
+      requestedModel: "openai/gpt-5",
+      model: "observed",
+      outcome: deadline ? "timeout" : "cancelled",
+      durationMs: expect.any(Number) as unknown,
+    });
+  },
+);
+
+it.each([false, true])(
+  "classifies a startup deadline without inventing a model call (parent also aborted=%s)",
+  async (cancelled) => {
+    const timeout = new AbortController();
+    vi.spyOn(AbortSignal, "timeout").mockReturnValue(timeout.signal);
+    const parent = new AbortController();
+    const { child } = subprocess();
+    const onModelCall = vi.fn();
+    const pending = reviewFile({
+      ...request(),
+      signal: parent.signal,
+      onModelCall,
+    });
+    timeout.abort();
+    if (cancelled) parent.abort();
+    const error = new Error("Reviewer aborted");
+    child.emit("error", error);
+    if (cancelled) await expect(pending).rejects.toBe(error);
+    else await expect(pending).rejects.toBeInstanceOf(ReviewTimeoutError);
+    expect(onModelCall).not.toHaveBeenCalled();
+  },
+);
+
+it("decodes UTF-8 split across subprocess chunks before validating exact quotes", async () => {
+  const proposal = { ...valid, line: 1, quote: "élève.name" };
+  const { child } = subprocess();
+  const pending = reviewFile(request("omp", "élève.name"));
+  const bytes = Buffer.from(
+    `${JSON.stringify({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: JSON.stringify({ findings: [proposal] }) }] } })}\n`,
+  );
+  const split = bytes.indexOf(Buffer.from("é")) + 1;
+  child.stdout.write(bytes.subarray(0, split));
+  child.stdout.write(bytes.subarray(split));
+  child.emit("close", 0);
+  await expect(pending).resolves.toEqual([proposal]);
+});
+
+it("keeps attribution decisions while accounting real SDK usage and ignoring unavailable evidence", async () => {
+  const onModelCall = vi.fn();
+  const input = {
+    finding: valid,
+    evidence: changeEvidence,
+    signal: new AbortController().signal,
+    onModelCall,
+  };
+  systemOne.mockResolvedValueOnce({
+    answers: { category: inheritedAnswer },
+    model: "jev-actual",
+    usage: { input_tokens: 81, output_tokens: 3 },
+  });
+  await expect(isInherited(input)).resolves.toBe(true);
+  expect(onModelCall).toHaveBeenCalledExactlyOnceWith({
+    stage: "attribution",
+    requestedModel: "jev-latest",
+    model: "jev-actual",
+    outcome: "success",
+    durationMs: expect.any(Number) as unknown,
+    usage: { inputTokens: 81, outputTokens: 3 },
+  });
+  await expect(
+    isInherited({ ...input, evidence: { ...changeEvidence, diff: null } }),
+  ).resolves.toBe(false);
+  expect(onModelCall).toHaveBeenCalledOnce();
+});
+
+it("retains fail-open attribution when accounting fails or the provider fails", async () => {
+  const input = {
+    finding: valid,
+    evidence: changeEvidence,
+    signal: new AbortController().signal,
+  };
+  systemOne.mockResolvedValueOnce({
+    answers: { category: inheritedAnswer },
+    model: "jev-actual",
+    usage: { input_tokens: 0, output_tokens: 0 },
+  });
+  await expect(
+    isInherited({
+      ...input,
+      onModelCall: () => {
+        throw new Error("storage unavailable");
+      },
+    }),
+  ).resolves.toBe(true);
+  const onModelCall = vi.fn();
+  systemOne.mockRejectedValueOnce(new Error("private provider failure"));
+  await expect(isInherited({ ...input, onModelCall })).resolves.toBe(false);
+  expect(onModelCall).toHaveBeenCalledExactlyOnceWith({
+    stage: "attribution",
+    requestedModel: "jev-latest",
+    outcome: "failed",
+    durationMs: expect.any(Number) as unknown,
+  });
 });
