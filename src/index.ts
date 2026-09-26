@@ -196,6 +196,13 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   let resetTimer: NodeJS.Timeout | undefined;
   let checkReset: (() => void) | undefined;
 
+  function showState(ctx: ExtensionContext): void {
+    ctx.ui.setStatus(
+      "pair-programmer",
+      `Pair Programmer: ${store.enabled ? "on" : "off"}`,
+    );
+  }
+
   function stopWatchingResets(): void {
     clearInterval(resetTimer);
     resetTimer = undefined;
@@ -224,6 +231,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       stop("cleared");
       store = new ReviewStore(appendReviewEntry, manager.getBranch());
       admission = new FindingAdmission(store);
+      showState(ctx);
     };
     resetTimer = setInterval(checkReset, 100);
     resetTimer.unref();
@@ -730,6 +738,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     retainPending(stats);
     store = new ReviewStore(appendReviewEntry, ctx.sessionManager.getBranch());
     admission = new FindingAdmission(store);
+    showState(ctx);
     watchResets(ctx);
     await logging;
     if (session !== generation) return;
@@ -780,6 +789,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   pi.on("session_shutdown", () => {
     stopWatchingResets();
     stop("shutdown");
+    activeContext?.ui.setStatus("pair-programmer", undefined);
     activeContext = undefined;
     activeSessionId = undefined;
     replaceBaseline(undefined);
@@ -936,6 +946,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       const enabled = !store.enabled;
       if (!enabled) stop("disabled");
       store.setEnabled(enabled);
+      showState(ctx);
       logger?.log("extension.toggle", {
         sessionId: stats.sessionId,
         outcome: enabled ? "on" : "off",

@@ -40,7 +40,7 @@ Without it, reviews still run, but only exact duplicate findings are filtered.
 
 Reviews are on by default. After each successful `write` or `edit`, reviewers run in the background. The coding agent must accept or reject each finding with a reason before continuing with other tools. Only accepted findings appear in your transcript.
 
-Run `/pair-programmer` to toggle reviews.
+Run `/pair-programmer` to toggle reviews. The footer shows the current state (`Pair Programmer: on` or `Pair Programmer: off`).
 
 Run `/pair-clear` to cancel reviews and clear all findings.
 

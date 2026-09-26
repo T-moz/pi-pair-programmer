@@ -212,6 +212,7 @@ async function setup(
   sendMessage: Mock<ExtensionAPI["sendMessage"]>;
   isIdle: Mock<() => boolean>;
   notify: ReturnType<typeof vi.fn>;
+  setStatus: Mock<ExtensionContext["ui"]["setStatus"]>;
   entries: JournalEntry[];
   statsEntries: unknown[];
   activateStatsJournal: (sessionId: string) => unknown[];
@@ -262,6 +263,7 @@ async function setup(
   let entryError: Error | undefined;
   let entryAttempts = 0;
   const notify = vi.fn();
+  const setStatus = vi.fn<ExtensionContext["ui"]["setStatus"]>();
   const sendMessage = vi.fn<ExtensionAPI["sendMessage"]>();
   const isIdle = vi.fn<() => boolean>(() => false);
   let decide: DecisionTool["execute"] | undefined;
@@ -314,7 +316,7 @@ async function setup(
     },
     hasUI: true,
     mode: host === "pi" ? "tui" : undefined,
-    ui: { notify, custom },
+    ui: { notify, custom, setStatus },
   } as unknown as ExtensionContext;
   const emit = async (name: string, event: unknown = {}): Promise<unknown> => {
     const handler = hooks.get(name);
@@ -336,6 +338,7 @@ async function setup(
     sendMessage,
     isIdle,
     notify,
+    setStatus,
     entries,
     statsEntries,
     activateStatsJournal: (sessionId: string) => {
@@ -560,6 +563,36 @@ it("keeps attribution fail-open while recording its failed call separately from 
     { stage: "attribution", outcomes: { failed: 1 }, costUsd: { measured: 0 } },
   ]);
   await environment.emit("session_shutdown");
+});
+
+it("shows the current review state across toggles and session restoration", async () => {
+  const environment = await setup();
+  expect(environment.setStatus).toHaveBeenLastCalledWith(
+    "pair-programmer",
+    "Pair Programmer: on",
+  );
+
+  await environment.command("pair-programmer");
+  expect(environment.setStatus).toHaveBeenLastCalledWith(
+    "pair-programmer",
+    "Pair Programmer: off",
+  );
+  await environment.emit("session_start", { reason: "startup" });
+  expect(environment.setStatus).toHaveBeenLastCalledWith(
+    "pair-programmer",
+    "Pair Programmer: off",
+  );
+
+  await environment.command("pair-programmer");
+  expect(environment.setStatus).toHaveBeenLastCalledWith(
+    "pair-programmer",
+    "Pair Programmer: on",
+  );
+  await environment.emit("session_shutdown");
+  expect(environment.setStatus).toHaveBeenLastCalledWith(
+    "pair-programmer",
+    undefined,
+  );
 });
 
 it("never wakes the main agent from idle lifecycle events while review is disabled", async () => {
