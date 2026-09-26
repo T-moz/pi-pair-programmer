@@ -19,6 +19,7 @@ import {
 
 const MAX_ACTIVE_REVIEWERS = 2;
 const MAX_DELIVERY = 4;
+const DECISION_TOOL = "pair_programmer_decide";
 const ToolPathSchema = z.string();
 
 const DecisionParameters = Type.Object({
@@ -39,6 +40,21 @@ interface ReviewJob {
   key: string;
   host: Host;
   cwd: string;
+}
+
+function decisionInteraction(
+  toolName: string,
+  input: Record<string, unknown>,
+): boolean {
+  if (toolName === DECISION_TOOL) return true;
+  if (toolName !== "read" && toolName !== "write") return false;
+  const target = input["path"];
+  if (typeof target !== "string") return false;
+  const device = target.trim();
+  return (
+    device.slice(0, 5).toLowerCase() === "xd://" &&
+    device.slice(5) === DECISION_TOOL
+  );
 }
 
 function revisionOf(source: string): string {
@@ -419,12 +435,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   });
 
   pi.on("tool_call", (event) => {
-    if (
-      !store.enabled ||
-      event.toolName === "pair_programmer_decide" ||
-      (event.toolName === "write" &&
-        event.input.path === "xd://pair_programmer_decide")
-    )
+    if (!store.enabled || decisionInteraction(event.toolName, event.input))
       return;
     deliver();
     const outstanding = store.outstanding();
@@ -434,7 +445,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
-    name: "pair_programmer_decide",
+    name: DECISION_TOOL,
     label: "Decide review finding",
     description:
       "Accept or reject one delivered review finding and explain why before coding continues",
