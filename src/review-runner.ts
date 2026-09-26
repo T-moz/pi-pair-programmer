@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { choice, noul, TypeSafeClient } from "@typesafe-ai/sdk";
 import { z } from "zod";
 import type { ChangeEvidence } from "./change-evidence.js";
-import type { Finding, StoredFinding } from "./review-store.js";
+import type { Finding, StoredFinding, Verdict } from "./review-store.js";
 
 const MAX_SOURCE_CHARACTERS = 60_000;
 const MAX_FINDINGS = 5;
@@ -67,6 +67,7 @@ interface ReviewRequest {
 interface DeduplicationRequest {
   candidates: readonly Finding[];
   history: readonly StoredFinding[];
+  compareCandidates?: boolean;
   signal: AbortSignal;
 }
 
@@ -267,12 +268,43 @@ export async function isInherited(request: {
   }
 }
 
+type HistoryRecord = Finding & {
+  verdict: Verdict | null;
+  reason: string | null;
+};
+
+async function keepCandidate(
+  candidate: Finding,
+  history: HistoryRecord[],
+  earlier: readonly Finding[],
+  signal: AbortSignal,
+): Promise<boolean> {
+  const response = await jev().systemOne(
+    {
+      model: "jev-latest",
+      state: {
+        candidate: { ...candidate },
+        history,
+        earlierCandidates: earlier.map((finding) => ({ ...finding })),
+      },
+      questions: {
+        duplicate: noul(
+          "Is the candidate the same underlying problem with unchanged evidence as any history finding or earlier candidate? Previously accepted or rejected history findings count as duplicates. A material change to the evidence after a fix is not a duplicate.",
+          {
+            true: "Same root problem with unchanged evidence, even if wording or line number differs",
+            false: "Distinct root problem or materially changed evidence",
+          },
+        ),
+      },
+    },
+    { signal, timeout: 30_000, retry: { maxRetries: 0 } },
+  );
+  return response.answers.duplicate.noul < 0.5;
+}
+
 export async function deduplicate(
   request: DeduplicationRequest,
 ): Promise<readonly Finding[]> {
-  if (request.candidates.length === 0) {
-    return [];
-  }
   const history = request.history.map(({ finding, verdict, reason }) => ({
     ...finding,
     verdict: verdict ?? null,
@@ -280,33 +312,15 @@ export async function deduplicate(
   }));
   const novel: Finding[] = [];
   for (const [index, candidate] of request.candidates.entries()) {
-    if (history.length === 0 && index === 0) {
+    const earlier =
+      request.compareCandidates === false
+        ? []
+        : request.candidates.slice(0, index);
+    if (
+      (history.length === 0 && earlier.length === 0) ||
+      (await keepCandidate(candidate, history, earlier, request.signal))
+    )
       novel.push(candidate);
-      continue;
-    }
-    const response = await jev().systemOne(
-      {
-        model: "jev-latest",
-        state: {
-          candidate: { ...candidate },
-          history,
-          earlierCandidates: request.candidates
-            .slice(0, index)
-            .map((finding) => ({ ...finding })),
-        },
-        questions: {
-          duplicate: noul(
-            "Is the candidate the same underlying problem with unchanged evidence as any history finding or earlier candidate? Previously accepted or rejected history findings count as duplicates. A material change to the evidence after a fix is not a duplicate.",
-            {
-              true: "Same root problem with unchanged evidence, even if wording or line number differs",
-              false: "Distinct root problem or materially changed evidence",
-            },
-          ),
-        },
-      },
-      { signal: request.signal, timeout: 30_000, retry: { maxRetries: 0 } },
-    );
-    if (response.answers.duplicate.noul < 0.5) novel.push(candidate);
   }
   return novel;
 }
