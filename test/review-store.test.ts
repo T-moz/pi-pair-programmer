@@ -24,6 +24,59 @@ function session(): {
 }
 
 describe("ReviewStore", () => {
+  it.each([true, false])(
+    "clears finding history durably while preserving enabled=%s",
+    (enabled) => {
+      const { store, entries, append } = session();
+      store.add(finding("pending"));
+      store.add(finding("waiting"));
+      store.add(finding("accepted"));
+      store.deliver(["waiting", "accepted"]);
+      store.decide("accepted", "accept", "Confirmed");
+      store.setEnabled(enabled);
+      store.clear();
+
+      for (const current of [store, new ReviewStore(append, entries)]) {
+        expect(current.enabled).toBe(enabled);
+        expect(current.ready()).toEqual([]);
+        expect(current.outstanding()).toEqual([]);
+        expect(current.history("src/a.ts")).toEqual([]);
+        expect(current.decide("waiting", "accept", "Too late")).toBe(false);
+      }
+      const restored = new ReviewStore(append, entries);
+      restored.setEnabled(true);
+      expect(restored.add(finding("accepted"))).toBe(true);
+      expect(new ReviewStore(append, entries).ready()).toEqual([
+        finding("accepted"),
+      ]);
+    },
+  );
+
+  it("restores only post-clear findings while preserving settings and earlier branches", () => {
+    const { store, entries, append } = session();
+    store.add(finding("waiting"));
+    store.deliver(["waiting"]);
+    store.add(finding("pending"));
+    store.setEnabled(false);
+    const beforeClear = [...entries];
+    entries.push({ type: "reset_boundary" });
+    const restored = new ReviewStore(append, entries);
+    expect(restored.enabled).toBe(false);
+    expect(restored.outstanding()).toEqual([]);
+    expect(restored.history("src/a.ts")).toEqual([]);
+    expect(new ReviewStore(append, beforeClear).outstanding()).toEqual([
+      finding("waiting"),
+    ]);
+    restored.setEnabled(true);
+    restored.add(finding("after-clear"));
+    const reloaded = new ReviewStore(append, entries);
+    expect(reloaded.ready()).toEqual([finding("after-clear")]);
+    expect(reloaded.outstanding()).toEqual([]);
+    expect(reloaded.history("src/a.ts")).toEqual([
+      { finding: finding("after-clear") },
+    ]);
+  });
+
   it("derives mutually exclusive finding outcomes from the selected branch", () => {
     const { store, entries, append } = session();
     for (const id of [

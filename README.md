@@ -42,6 +42,8 @@ Reviews are on by default. After each successful `write` or `edit`, reviewers ru
 
 Run `/pair-programmer` to toggle reviews.
 
+Run `/pair-clear` to cancel reviews and clear all findings.
+
 The default reviewer uses your current model and asks: “Does it add entropy?” To change the prompt, model, or files reviewed, create `pair-programmer.reviewers.json` in your working directory:
 
 ```json

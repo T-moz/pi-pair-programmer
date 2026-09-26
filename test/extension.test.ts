@@ -307,6 +307,7 @@ async function setup(
     modelRegistry: host === "pi" ? { streamSimple: vi.fn() } : {},
     isIdle,
     sessionManager: {
+      getLeafId: () => null,
       getBranch: () => entries,
       getHeader: vi.fn(() => ({ id: testSession })),
       getEntries: vi.fn(() => transcript),
@@ -355,6 +356,27 @@ async function setup(
       entryError = error;
     },
     entryAttempts: () => entryAttempts,
+  };
+}
+
+function resettableSession(ctx: ExtensionContext): (type: string) => void {
+  const journal = ctx.sessionManager.getEntries() as { type: string }[];
+  Object.assign(ctx.sessionManager, {
+    getBranch: () => journal,
+    getLeafId: () => (journal.length === 0 ? null : String(journal.length - 1)),
+    getEntry: (id: string) => {
+      const entry = journal[Number(id)];
+      return entry === undefined
+        ? undefined
+        : {
+            ...entry,
+            id,
+            parentId: Number(id) === 0 ? null : String(Number(id) - 1),
+          };
+    },
+  });
+  return (type) => {
+    journal.push({ type });
   };
 }
 
@@ -2298,6 +2320,257 @@ it("discards ready findings if a changed source disappears before review", async
   expect(environment.sendMessage).not.toHaveBeenCalled();
   await environment.emit("session_shutdown");
 });
+
+it.each(["pi", "omp"] as const)(
+  "%s /pair-clear cancels running and scheduled reviews without blocking fresh work",
+  async (host) => {
+    const environment = await setup(host, false, true);
+    const running = path.join(environment.cwd, "running.ts");
+    const queued = path.join(environment.cwd, "queued.ts");
+    await fsPromises.writeFile(running, "export const value = 1;\n");
+    await fsPromises.writeFile(queued, "export const queued = 1;\n");
+    const abandoned = Promise.withResolvers<ProposedFinding[]>();
+    vi.mocked(reviewFile).mockReturnValue(abandoned.promise);
+    await environment.emit("tool_result", {
+      toolName: "write",
+      input: { path: running },
+      isError: false,
+    });
+    await advanceReviews(() => {
+      expect(reviewFile).toHaveBeenCalledOnce();
+    });
+    await environment.emit("tool_result", {
+      toolName: "write",
+      input: { path: queued },
+      isError: false,
+    });
+    await vi.waitFor(() => {
+      expect(realpathFinished.get(queued)).toBe(1);
+    });
+    await environment.command("pair-clear");
+    expect(vi.mocked(reviewFile).mock.calls[0]?.[0].signal.aborted).toBe(true);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(reviewFile).toHaveBeenCalledOnce();
+    expect(persistedStats(environment.statsEntries).reviews.cancelled).toBe(1);
+
+    vi.mocked(reviewFile).mockResolvedValue([]);
+    await environment.emit("tool_result", {
+      toolName: "edit",
+      input: { path: running },
+      isError: false,
+    });
+    await advanceReviews(() => {
+      expect(reviewFile).toHaveBeenCalledTimes(2);
+    });
+    abandoned.resolve([
+      { line: 1, title: "Old finding", quote: "value", evidence: "Obsolete" },
+    ]);
+    await vi.waitFor(() => {
+      expect(persistedStats(environment.statsEntries).incompleteJobs).toBe(0);
+    });
+    await vi.advanceTimersByTimeAsync(1000);
+    await environment.emit("turn_end");
+    expect(findings(environment.entries)).toEqual([]);
+    expect(environment.sendMessage).not.toHaveBeenCalled();
+    expect(
+      await environment.emit("tool_call", { toolName: "write", input: {} }),
+    ).toBeUndefined();
+    await environment.emit("session_shutdown");
+  },
+);
+
+it.each(["pi", "omp"] as const)(
+  "%s /pair-clear removes queued and outstanding findings across reloads",
+  async (host) => {
+    const environment = await setup(host, false, true);
+    const file = path.join(environment.cwd, "change.ts");
+    await fsPromises.writeFile(file, "export const value = 1;\n");
+    const proposals = Array.from({ length: 5 }, (_, index) => ({
+      line: 1,
+      title: `Problem ${String(index)}`,
+      quote: "value",
+      evidence: `Distinct problem ${String(index)}`,
+    }));
+    vi.mocked(reviewFile).mockResolvedValue(proposals);
+    const write = {
+      toolName: "write",
+      input: { path: file },
+      isError: false,
+    };
+    await environment.emit("tool_result", write);
+    await advanceReviews(() => {
+      expect(findings(environment.entries)).toHaveLength(5);
+    });
+    expect(
+      await environment.emit("tool_call", { toolName: "write", input: {} }),
+    ).toMatchObject({ block: true });
+    const oldMessage = environment.sendMessage.mock.calls[0]?.[0];
+    const priorReviews = persistedStats(environment.statsEntries).reviews;
+    await environment.command("pair-clear");
+    expect(persistedStats(environment.statsEntries).reviews).toEqual(
+      priorReviews,
+    );
+    environment.sendMessage.mockClear();
+    environment.isIdle.mockReturnValue(true);
+    await vi.advanceTimersByTimeAsync(1000);
+    await environment.emit("turn_end");
+    expect(environment.sendMessage).not.toHaveBeenCalled();
+    expect(
+      await environment.emit("tool_call", { toolName: "write", input: {} }),
+    ).toBeUndefined();
+    expect(
+      await environment.emit("context", {
+        messages: [{ ...oldMessage, role: "custom" }],
+      }),
+    ).toEqual({ messages: [] });
+    await environment.emit("session_start");
+    expect(
+      await environment.emit("tool_call", { toolName: "write", input: {} }),
+    ).toBeUndefined();
+    expect(environment.sendMessage).not.toHaveBeenCalled();
+    await environment.emit("tool_result", write);
+    await advanceReviews(() => {
+      expect(findings(environment.entries)).toHaveLength(10);
+    });
+    await environment.emit("session_shutdown");
+  },
+);
+
+it("OMP does not treat an unavailable journal entry as a review reset", async () => {
+  const environment = await setup("omp", false, true);
+  const journal = environment.ctx.sessionManager.getEntries() as unknown[];
+  journal.push({
+    type: "custom",
+    customType: "pair-programmer",
+    data: {
+      action: "add",
+      finding: {
+        id: "waiting",
+        reviewer: "logic",
+        file: "change.ts",
+        revision: "old",
+        line: 1,
+        title: "Existing issue",
+        evidence: "Still requires a decision",
+      },
+    },
+  });
+  const append = resettableSession(environment.ctx);
+  await environment.emit("session_start");
+  const toolCall = { toolName: "write", input: {} };
+  expect(await environment.emit("tool_call", toolCall)).toMatchObject({
+    block: true,
+  });
+  append("model_change");
+  vi.spyOn(environment.ctx.sessionManager, "getEntry").mockReturnValueOnce(
+    undefined,
+  );
+  await vi.advanceTimersByTimeAsync(100);
+  expect(await environment.emit("tool_call", toolCall)).toMatchObject({
+    block: true,
+  });
+  append("reset_boundary");
+  await vi.advanceTimersByTimeAsync(100);
+  expect(await environment.emit("tool_call", toolCall)).toBeUndefined();
+  await environment.emit("session_shutdown");
+});
+
+it("OMP /clear cancels idle reviews and their late results without a session event", async () => {
+  const environment = await setup("omp", false, true);
+  const append = resettableSession(environment.ctx);
+  await environment.emit("session_start");
+  const file = path.join(environment.cwd, "change.ts");
+  await fsPromises.writeFile(file, "export const value = 1;\n");
+  const abandoned = Promise.withResolvers<ProposedFinding[]>();
+  vi.mocked(reviewFile).mockReturnValue(abandoned.promise);
+  const write = { toolName: "write", input: { path: file }, isError: false };
+  await environment.emit("tool_result", write);
+  await advanceReviews(() => {
+    expect(reviewFile).toHaveBeenCalledOnce();
+  });
+  append("reset_boundary");
+  append("model_change");
+  await vi.advanceTimersByTimeAsync(100);
+  expect(vi.mocked(reviewFile).mock.calls[0]?.[0].signal.aborted).toBe(true);
+  expect(persistedStats(environment.statsEntries).reviews.cancelled).toBe(1);
+  vi.mocked(reviewFile).mockResolvedValue([]);
+  await environment.emit("tool_result", write);
+  await advanceReviews(() => {
+    expect(reviewFile).toHaveBeenCalledTimes(2);
+  });
+  abandoned.resolve([
+    { line: 1, title: "Old finding", quote: "value", evidence: "Obsolete" },
+  ]);
+  await vi.waitFor(() => {
+    expect(persistedStats(environment.statsEntries).incompleteJobs).toBe(0);
+  });
+  await environment.emit("agent_end", { willContinue: false });
+  expect(findings(environment.entries)).toEqual([]);
+  expect(environment.sendMessage).not.toHaveBeenCalled();
+  await environment.emit("session_before_switch");
+  append("reset_boundary");
+  await vi.advanceTimersByTimeAsync(200);
+  expect(persistedStats(environment.statsEntries).reviews.cancelled).toBe(1);
+  await environment.emit("session_shutdown");
+});
+
+it.each(["decision", "delivery", "context"])(
+  "OMP /clear removes old findings before %s without waiting for the monitor",
+  async (action) => {
+    const environment = await setup("omp", false, true);
+    const append = resettableSession(environment.ctx);
+    await environment.emit("session_start");
+    const file = path.join(environment.cwd, "change.ts");
+    await fsPromises.writeFile(file, "export const value = 1;\n");
+    vi.mocked(reviewFile).mockResolvedValue([
+      { line: 1, title: "Old finding", quote: "value", evidence: "Old issue" },
+    ]);
+    await environment.emit("tool_result", {
+      toolName: "write",
+      input: { path: file },
+      isError: false,
+    });
+    await advanceReviews(() => {
+      expect(findings(environment.entries)).toHaveLength(1);
+    });
+    const finding = findings(environment.entries)[0];
+    if (finding === undefined) throw new Error("Expected finding");
+    if (action !== "delivery") await environment.emit("turn_end");
+    environment.sendMessage.mockClear();
+    append("reset_boundary");
+    if (action === "decision") {
+      expect(
+        await environment.decide("old", {
+          findingId: finding.id,
+          decision: "accept",
+          reason: "Stale",
+        }),
+      ).toEqual(expect.objectContaining({ details: { saved: false } }));
+    } else if (action === "delivery") {
+      await environment.emit("agent_end", { willContinue: false });
+    } else {
+      expect(
+        await environment.emit("context", {
+          messages: [
+            {
+              role: "custom",
+              customType: "pair-programmer-findings",
+              content: finding.id,
+            },
+          ],
+        }),
+      ).toEqual({ messages: [] });
+    }
+    expect(environment.sendMessage).not.toHaveBeenCalled();
+    await environment.emit("session_start");
+    expect(
+      await environment.emit("tool_call", { toolName: "write", input: {} }),
+    ).toBeUndefined();
+    await environment.emit("turn_end");
+    expect(environment.sendMessage).not.toHaveBeenCalled();
+    await environment.emit("session_shutdown");
+  },
+);
 
 it("aborts in-flight work when switched off and suppresses queued finding messages", async () => {
   const environment = await setup();
