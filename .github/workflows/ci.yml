@@ -25,6 +25,59 @@ jobs:
       - name: Typecheck, lint, format, and test with coverage
         run: npm run check
 
+  publish:
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'T-moz/pi-pair-programmer'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: npm
+    concurrency:
+      group: npm-publish
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24.x
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Check whether this version is already published
+        id: release
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs';
+
+          const { name, version } = JSON.parse(readFileSync('package.json', 'utf8'));
+          const url = `https://registry.npmjs.org/${encodeURIComponent(name)}/${encodeURIComponent(version)}`;
+          const response = await fetch(url, { signal: AbortSignal.timeout(30_000) });
+          if (response.status === 404) {
+            appendFileSync(process.env.GITHUB_OUTPUT, 'publish=true\n');
+            console.log(`Publishing ${name}@${version}`);
+          } else if (response.ok) {
+            const published = await response.json();
+            if (published.name !== name || published.version !== version) {
+              throw new Error('Registry returned unexpected package metadata');
+            }
+            appendFileSync(process.env.GITHUB_OUTPUT, 'publish=false\n');
+            console.log(`${name}@${version} already exists; skipping publication`);
+          } else {
+            throw new Error(`Registry lookup failed: HTTP ${response.status}`);
+          }
+          NODE
+      - name: Install pinned npm CLI with trusted publishing support
+        if: steps.release.outputs.publish == 'true'
+        run: npm install --global npm@12.1.0 --ignore-scripts --no-audit --no-fund
+      # The checked-in TypeScript is the release artifact: no dependency install
+      # or package lifecycle scripts run in the OIDC-enabled job.
+      - name: Publish to npm using OIDC and provenance
+        if: steps.release.outputs.publish == 'true'
+        run: npm publish --access public --provenance --ignore-scripts
+
   dependency-review:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest

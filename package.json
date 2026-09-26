@@ -2,6 +2,10 @@
   "name": "pi-pair-programmer",
   "version": "0.1.0",
   "description": "A TypeScript extension for Pi and OMP",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/T-moz/pi-pair-programmer.git"
+  },
   "type": "module",
   "license": "MIT",
   "keywords": [
