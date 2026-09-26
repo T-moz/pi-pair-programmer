@@ -61,5 +61,5 @@ The default reviewer uses your current model and asks: â€œDoes it add entropy?â€
 
 Use `current` or a `provider/model` identifier. File patterns are relative to your working directory; exclusions take precedence. Add entries for more reviewers.
 
-- `/pair-stats`: view review activity, findings, tokens, and estimated costs on demand; missing usage stays unknown.
+- `/pair-stats`: view review activity, findings, tokens, and estimated costs on demand; missing usage stays unknown. Late reviewer usage remains with its originating session across switches and extension reloads, and pending records are written when that session resumes.
 - Diagnostics stay in files, never the terminal: OMP uses its native logs; Pi uses `~/.pi/agent/logs/pair-programmer/` (or `$PI_CODING_AGENT_DIR/logs/pair-programmer/`).
