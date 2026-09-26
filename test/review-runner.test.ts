@@ -473,6 +473,35 @@ it("deduplicates later same-id findings without comparing a candidate to itself"
   ]);
 });
 
+it("rechecks already-distinct candidates only against newly stored findings", async () => {
+  const stored = finding("stored");
+  const [first, second] = [finding("first"), finding("second")];
+  systemOne
+    .mockResolvedValueOnce({ answers: { duplicate: { noul: 0.9 } } })
+    .mockResolvedValueOnce({ answers: { duplicate: { noul: 0.1 } } });
+  const signal = new AbortController().signal;
+  await expect(
+    deduplicate({
+      candidates: [first, second],
+      history: [{ finding: stored }],
+      compareCandidates: false,
+      signal,
+    }),
+  ).resolves.toEqual([second]);
+  expect(
+    systemOne.mock.calls.map(([input]) => input.state.earlierCandidates),
+  ).toEqual([[], []]);
+  await expect(
+    deduplicate({
+      candidates: [first, second],
+      history: [],
+      compareCandidates: false,
+      signal,
+    }),
+  ).resolves.toEqual([first, second]);
+  expect(systemOne).toHaveBeenCalledTimes(2);
+});
+
 it("cancels an in-flight Jev judgment without retrying", async () => {
   const controller = new AbortController();
   systemOne.mockImplementationOnce(

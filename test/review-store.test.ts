@@ -54,6 +54,28 @@ describe("ReviewStore", () => {
     expect(replayed.history("src/b.ts")).toEqual([{ finding: second }]);
   });
 
+  it("reports only same-file findings stored after a version snapshot", () => {
+    const { store, entries } = session();
+    store.add(finding("before"));
+    const snapshot = store.version;
+    expect(store.add(finding("before"))).toBe(false);
+    expect(store.version).toBe(snapshot);
+    store.add(finding("other-file", "src/b.ts"));
+    store.add(finding("after"));
+    expect(store.version).toBe(snapshot + 2);
+    expect(store.addedSince(snapshot, "src/a.ts")).toEqual([
+      { finding: finding("after") },
+    ]);
+    expect(store.addedSince(store.version, "src/a.ts")).toEqual([]);
+    const replayed = new ReviewStore(() => {
+      throw new Error("Replay must not append");
+    }, entries);
+    expect(replayed.version).toBe(store.version);
+    expect(replayed.addedSince(snapshot, "src/b.ts")).toEqual([
+      { finding: finding("other-file", "src/b.ts") },
+    ]);
+  });
+
   it("requires a reason for each delivered finding and rejects unknown ids", () => {
     const { store } = session();
     const first = finding("first");

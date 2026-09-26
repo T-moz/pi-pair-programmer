@@ -18,7 +18,11 @@ import {
   reviewFile,
   type Host,
 } from "./review-runner.js";
-import { ReviewStore, type Finding } from "./review-store.js";
+import {
+  ReviewStore,
+  type Finding,
+  type StoredFinding,
+} from "./review-store.js";
 import {
   DEFAULT_REVIEWERS,
   loadReviewers,
@@ -183,8 +187,6 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     }
   }
 
-  let deduplication = Promise.resolve(null);
-
   async function runJob(job: ReviewJob, signal: AbortSignal): Promise<void> {
     const proposed = await reviewFile({
       host: job.host,
@@ -201,67 +203,90 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       reviewed.set(`${job.key}:${reviewer}:${job.model}`, job.revision);
       return;
     }
-    const candidates: Finding[] = [];
-    for (const finding of proposed) {
-      const inherited = await isInherited({
+    const judged = await Promise.all(
+      proposed.map(async (finding) => ({
         finding,
-        evidence: await buildChangeEvidence(
-          baseline,
-          job.file,
-          job.source,
-          finding.line,
-          finding.quote,
+        inherited: await isInherited({
+          finding,
+          evidence: await buildChangeEvidence(
+            baseline,
+            job.file,
+            job.source,
+            finding.line,
+            finding.quote,
+            signal,
+          ),
           signal,
-        ),
+        }),
+      })),
+    );
+    if (signal.aborted || !(await current(job))) return;
+    const candidates = judged.flatMap(({ finding, inherited }) =>
+      inherited
+        ? []
+        : [
+            {
+              id: createHash("sha256")
+                .update(
+                  JSON.stringify([
+                    job.file,
+                    reviewer,
+                    finding.title.toLowerCase().trim(),
+                    finding.quote.trim(),
+                  ]),
+                )
+                .digest("hex")
+                .slice(0, 16),
+              reviewer,
+              file: job.file,
+              revision: job.revision,
+              line: finding.line,
+              title: finding.title,
+              evidence: `${finding.quote} — ${finding.evidence}`,
+            },
+          ],
+    );
+    if (!(await storeNovel(job, candidates, signal))) return;
+    reviewed.set(`${job.key}:${reviewer}:${job.model}`, job.revision);
+  }
+
+  async function judge(
+    candidates: readonly Finding[],
+    history: readonly StoredFinding[],
+    compareCandidates: boolean,
+    signal: AbortSignal,
+  ): Promise<readonly Finding[]> {
+    try {
+      return await deduplicate({
+        candidates,
+        history,
+        compareCandidates,
         signal,
       });
-      if (signal.aborted || !(await current(job))) return;
-      if (inherited) continue;
-      candidates.push({
-        id: createHash("sha256")
-          .update(
-            JSON.stringify([
-              job.file,
-              reviewer,
-              finding.title.toLowerCase().trim(),
-              finding.quote.trim(),
-            ]),
-          )
-          .digest("hex")
-          .slice(0, 16),
-        reviewer,
-        file: job.file,
-        revision: job.revision,
-        line: finding.line,
-        title: finding.title,
-        evidence: `${finding.quote} — ${finding.evidence}`,
-      });
+    } catch {
+      return candidates.filter((candidate) =>
+        history.every(({ finding }) => finding.id !== candidate.id),
+      );
     }
+  }
 
-    const insert = async (): Promise<void> => {
-      if (!(await current(job))) return;
-      const history = store.history(job.file);
-      let novel: readonly Finding[];
-      try {
-        novel = await deduplicate({ candidates, history, signal });
-      } catch {
-        novel = candidates.filter((candidate) =>
-          history.every(({ finding }) => finding.id !== candidate.id),
-        );
-      }
-      if (!(await current(job))) return;
-      for (const finding of novel) store.add(finding);
-      reviewed.set(`${job.key}:${reviewer}:${job.model}`, job.revision);
-    };
-    const previous = deduplication;
-    const { promise, resolve: release } = Promise.withResolvers<null>();
-    deduplication = promise;
-    await previous;
-    try {
-      await insert();
-    } finally {
-      release(null);
+  async function storeNovel(
+    job: ReviewJob,
+    candidates: readonly Finding[],
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    let version = store.version;
+    let novel = await judge(candidates, store.history(job.file), true, signal);
+    for (;;) {
+      if (!(await current(job))) return false;
+      const added =
+        novel.length === 0 ? [] : store.addedSince(version, job.file);
+      if (added.length === 0) break;
+      version = store.version;
+      novel = await judge(novel, added, false, signal);
     }
+    for (const finding of novel) store.add(finding);
+    return true;
   }
 
   function startReviews(
