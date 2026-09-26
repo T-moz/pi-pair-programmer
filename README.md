@@ -65,5 +65,7 @@ The default reviewer uses your current model and asks: â€œDoes it add entropy?â€
 
 Use `current` or a `provider/model` identifier. File patterns are relative to your working directory; exclusions take precedence. Add entries for more reviewers.
 
-- `/pair-stats`: view review activity, findings, tokens, and estimated costs on demand; missing usage stays unknown.
+A small badge pinned to the top-right corner shows whether reviews are watching, running, queued, awaiting a decision, or paused. It never takes keyboard focus, stays visible when extensions such as zentui hide the footer, and hides in terminals narrower than 40 columns. Outside Pi's terminal UI (RPC, OMP), it falls back to a line above the editor. Accepted findings appear in the transcript with their location, evidence, and rationale.
+
+- `/pair-stats`: open a themed session overview with review activity, findings, and estimated cost. Press `d` for detailed token and model accounting, `r` to refresh the snapshot, arrows or Page Up/Down to scroll, and Esc, Enter, or `q` to close. Missing usage stays unknown; review usage covers the session across branches, while findings reflect the selected branch.
 - Diagnostics stay in files, never the terminal: OMP uses its native logs; Pi uses `~/.pi/agent/logs/pair-programmer/` (or `$PI_CODING_AGENT_DIR/logs/pair-programmer/`).

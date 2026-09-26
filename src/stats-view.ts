@@ -1,4 +1,9 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  truncateToWidth,
+  visibleWidth,
+  wrapTextWithAnsi,
+} from "@earendil-works/pi-tui";
 import type { MeasuredTotal, StatsSnapshot } from "./pair-stats.js";
 import type { ReviewStore } from "./review-store.js";
 
@@ -29,8 +34,7 @@ export function statsLines(
   const review = stats.reviews;
   const findings = store.summary();
   const lines = [
-    `Pair Programmer statistics - ${store.enabled ? "on" : "off"}`,
-    "Snapshot on open; close and run /pair-stats again to refresh.",
+    `Background review: ${store.enabled ? "on" : "off"}`,
     "",
     "Review activity: incurred in this session, across all branches",
     `Running ${String(review.running)} | completed ${String(review.success)} | failed ${String(review.failed)}`,
@@ -82,6 +86,48 @@ export function statsLines(
   return lines;
 }
 
+export function statsSummary(
+  stats: StatsSnapshot,
+  store: Pick<ReviewStore, "enabled" | "summary">,
+): string[] {
+  const review = stats.reviews;
+  const findings = store.summary();
+  const cost = stats.usage.reduce(
+    (total, group) => ({
+      value: total.value + group.costUsd.value,
+      measured: total.measured + group.costUsd.measured,
+    }),
+    { value: 0, measured: 0 },
+  );
+  const calls = stats.usage.reduce((total, group) => total + group.calls, 0);
+  return [
+    store.enabled ? "Watching your changes" : "Background review is paused",
+    "",
+    "REVIEWS  /  this session, all branches",
+    `${String(review.success)} completed   ·   ${String(review.running)} running`,
+    `${String(review.failed + review.timeout)} failed or timed out   ·   ${String(review.interrupted)} interrupted`,
+    "",
+    "FINDINGS  /  selected branch",
+    `${String(findings.accepted)} accepted   ·   ${String(findings.rejected)} rejected`,
+    `${String(findings.outstanding)} awaiting decision   ·   ${String(findings.pending)} queued`,
+    "",
+    "USAGE  /  extension only",
+    `Estimated cost  ${measured(cost, calls, true, stats.incompleteJobs === 0)}`,
+    `${String(calls)} recorded model calls · USD estimate, not a bill`,
+    ...(stats.incompleteJobs > 0
+      ? ["! Accounting is incomplete; missing usage is not zero."]
+      : []),
+    ...(stats.persistenceFailures > 0 || stats.pendingWrites > 0
+      ? ["! Some records could not be saved. See details."]
+      : []),
+  ];
+}
+
+export interface StatsReport {
+  summary: readonly string[];
+  details: readonly string[];
+}
+
 export class StatsView {
   private closeCurrent: (() => void) | undefined;
 
@@ -90,7 +136,7 @@ export class StatsView {
     this.closeCurrent = undefined;
   }
 
-  async open(ctx: ExtensionContext, lines: readonly string[]): Promise<void> {
+  async open(ctx: ExtensionContext, read: () => StatsReport): Promise<void> {
     this.close();
     const unavailable = "/pair-stats requires an interactive terminal (TUI).";
     if (!ctx.hasUI) throw new Error(unavailable);
@@ -104,8 +150,10 @@ export class StatsView {
     let close: (() => void) | undefined;
     try {
       await ctx.ui.custom<undefined>(
-        (tui, _theme, keys, done) => {
+        (tui, theme, keys, done) => {
           state.mounted = true;
+          let report = read();
+          let detailed = false;
           let offset = 0;
           let pageSize = 1;
           let disposed = false;
@@ -117,23 +165,65 @@ export class StatsView {
           this.closeCurrent = close;
           return {
             render(width: number): string[] {
-              const wrapped: string[] = [];
               const columns = Math.max(1, width);
-              for (const line of lines) {
-                if (line.length === 0) wrapped.push("");
-                for (let index = 0; index < line.length; index += columns)
-                  wrapped.push(line.slice(index, index + columns));
-              }
-              pageSize = Math.max(1, tui.terminal.rows - 4);
+              const framed = columns >= 12;
+              const inner = Math.max(1, columns - (framed ? 6 : 0));
+              const lines = detailed ? report.details : report.summary;
+              const wrapped = lines.flatMap((line) => {
+                let tone: "warning" | "accent" | "text" = "text";
+                if (line.startsWith("!")) tone = "warning";
+                else if (/^[A-Z]+ {2}\//u.test(line)) tone = "accent";
+                return wrapTextWithAnsi(line, inner).map((part) =>
+                  theme.fg(tone, part),
+                );
+              });
+              const compact = tui.terminal.rows < 8;
+              pageSize = Math.max(
+                1,
+                compact
+                  ? tui.terminal.rows
+                  : Math.floor(tui.terminal.rows * 0.8) - 7,
+              );
               offset = Math.min(offset, Math.max(0, wrapped.length - pageSize));
-              return [
-                ...wrapped.slice(offset, offset + pageSize),
-                "",
-                "Up/Down/PgUp/PgDn scroll | Enter/Esc/q close".slice(
-                  0,
-                  columns,
+              if (compact) return wrapped.slice(offset, offset + pageSize);
+              const row = (text: string): string => {
+                const clipped = truncateToWidth(text, inner, "…");
+                return framed
+                  ? theme.fg("borderMuted", "│") +
+                      "  " +
+                      clipped +
+                      " ".repeat(Math.max(0, inner - visibleWidth(clipped))) +
+                      "  " +
+                      theme.fg("borderMuted", "│")
+                  : clipped;
+              };
+              const title = theme.bold(theme.fg("accent", "Pair Programmer"));
+              const position = `${String(offset + 1)}–${String(Math.min(offset + pageSize, wrapped.length))}/${String(wrapped.length)}`;
+              const mode = detailed ? "overview" : "details";
+              const hint =
+                inner >= 52
+                  ? `↑↓ scroll  d ${mode}  r refresh  esc close  ${position}`
+                  : `↑↓  d ${mode}  r refresh  q close`;
+              const body = [
+                row(title),
+                row(
+                  theme.fg(
+                    "dim",
+                    detailed ? "Detailed accounting" : "Session overview",
+                  ),
                 ),
+                row(""),
+                ...wrapped.slice(offset, offset + pageSize).map(row),
+                row(""),
+                row(theme.fg("dim", hint)),
               ];
+              return framed
+                ? [
+                    theme.fg("borderMuted", `╭${"─".repeat(columns - 2)}╮`),
+                    ...body,
+                    theme.fg("borderMuted", `╰${"─".repeat(columns - 2)}╯`),
+                  ]
+                : body;
             },
             handleInput(data: string): void {
               if (
@@ -144,7 +234,13 @@ export class StatsView {
               )
                 close?.();
               else {
-                if (keys.matches(data, "tui.select.up"))
+                if (data === "d") {
+                  detailed = !detailed;
+                  offset = 0;
+                } else if (data === "r") {
+                  report = read();
+                  offset = 0;
+                } else if (keys.matches(data, "tui.select.up"))
                   offset = Math.max(0, offset - 1);
                 else if (keys.matches(data, "tui.select.down")) offset += 1;
                 else if (keys.matches(data, "tui.select.pageUp"))
@@ -162,7 +258,7 @@ export class StatsView {
             },
           };
         },
-        { overlay: true },
+        { overlay: true, overlayOptions: { width: 78 } },
       );
       if (!state.mounted) throw new Error(unavailable);
     } finally {

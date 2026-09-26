@@ -63,6 +63,7 @@
     "node": ">=22.19.0"
   },
   "dependencies": {
+    "@earendil-works/pi-tui": "^0.87.1",
     "@typesafe-ai/sdk": "^0.6.0",
     "minimatch": "^10.2.6",
     "pino": "^10.3.1",

@@ -212,7 +212,8 @@ async function setup(
   sendMessage: Mock<ExtensionAPI["sendMessage"]>;
   isIdle: Mock<() => boolean>;
   notify: ReturnType<typeof vi.fn>;
-  setStatus: Mock<ExtensionContext["ui"]["setStatus"]>;
+  setWidget: Mock<(key: string, content: string[] | undefined) => void>;
+  status: () => string | undefined;
   entries: JournalEntry[];
   statsEntries: unknown[];
   activateStatsJournal: (sessionId: string) => unknown[];
@@ -263,7 +264,8 @@ async function setup(
   let entryError: Error | undefined;
   let entryAttempts = 0;
   const notify = vi.fn();
-  const setStatus = vi.fn<ExtensionContext["ui"]["setStatus"]>();
+  const setWidget =
+    vi.fn<(key: string, content: string[] | undefined) => void>();
   const sendMessage = vi.fn<ExtensionAPI["sendMessage"]>();
   const isIdle = vi.fn<() => boolean>(() => false);
   let decide: DecisionTool["execute"] | undefined;
@@ -316,7 +318,7 @@ async function setup(
     },
     hasUI: true,
     mode: host === "pi" ? "tui" : undefined,
-    ui: { notify, custom, setStatus },
+    ui: { notify, custom, setWidget },
   } as unknown as ExtensionContext;
   const emit = async (name: string, event: unknown = {}): Promise<unknown> => {
     const handler = hooks.get(name);
@@ -338,7 +340,8 @@ async function setup(
     sendMessage,
     isIdle,
     notify,
-    setStatus,
+    setWidget,
+    status: () => setWidget.mock.lastCall?.[1]?.[0],
     entries,
     statsEntries,
     activateStatsJournal: (sessionId: string) => {
@@ -408,11 +411,16 @@ async function openStatistics(environment: {
           terminal: { rows: 100 },
           requestRender: vi.fn(),
         } as unknown as Parameters<StatsFactory>[0],
-        {} as Parameters<StatsFactory>[1],
-        {} as Parameters<StatsFactory>[2],
+        {
+          fg: (_color: string, text: string) => text,
+          bold: (text: string) => text,
+        } as unknown as Parameters<StatsFactory>[1],
+        { matches: () => false } as unknown as Parameters<StatsFactory>[2],
         vi.fn(),
       );
       lines = component.render(240);
+      component.handleInput?.("d");
+      lines = [...lines, ...component.render(240)];
       component.dispose?.();
     },
   );
@@ -488,7 +496,11 @@ it.each(["success", "failed", "timeout", "cancelled"] as const)(
       costUsd: { value: 0.003, measured: 1 },
     });
     expect(environment.notify).not.toHaveBeenCalled();
-    expect(environment.custom).not.toHaveBeenCalled();
+    expect(
+      environment.custom.mock.calls.every(
+        ([, options]) => options?.overlayOptions !== undefined,
+      ),
+    ).toBe(true);
     expect(environment.sendMessage).not.toHaveBeenCalled();
     expect(JSON.stringify(lifecycleLog.mock.calls)).not.toContain(
       "private-file",
@@ -567,29 +579,17 @@ it("keeps attribution fail-open while recording its failed call separately from 
 
 it("shows the current review state across toggles and session restoration", async () => {
   const environment = await setup();
-  expect(environment.setStatus).toHaveBeenLastCalledWith(
-    "pair-programmer",
-    "Pair Programmer: on",
-  );
+  expect(environment.status()).toBe("◆ pair · watching");
 
   await environment.command("pair-programmer");
-  expect(environment.setStatus).toHaveBeenLastCalledWith(
-    "pair-programmer",
-    "Pair Programmer: off",
-  );
+  expect(environment.status()).toBe("◆ pair · paused");
   await environment.emit("session_start", { reason: "startup" });
-  expect(environment.setStatus).toHaveBeenLastCalledWith(
-    "pair-programmer",
-    "Pair Programmer: off",
-  );
+  expect(environment.status()).toBe("◆ pair · paused");
 
   await environment.command("pair-programmer");
-  expect(environment.setStatus).toHaveBeenLastCalledWith(
-    "pair-programmer",
-    "Pair Programmer: on",
-  );
+  expect(environment.status()).toBe("◆ pair · watching");
   await environment.emit("session_shutdown");
-  expect(environment.setStatus).toHaveBeenLastCalledWith(
+  expect(environment.setWidget).toHaveBeenLastCalledWith(
     "pair-programmer",
     undefined,
   );
@@ -2703,6 +2703,61 @@ it("starts fresh reviews after on even when an aborted reviewer never settles", 
     await environment.emit("tool_call", { toolName: "write", input: {} }),
   ).toBeUndefined();
   await environment.emit("session_shutdown");
+});
+
+it("styles the status widget with the active host theme", async () => {
+  const environment = await setup();
+  Object.assign(environment.ctx.ui, {
+    theme: { fg: (color: string, text: string) => `<${color}>${text}` },
+  });
+  await environment.command("pair-programmer");
+  expect(environment.status()).toBe("<dim>\u{25C6} <muted>pair \u{B7} paused");
+  await environment.command("pair-programmer");
+  expect(environment.status()).toBe(
+    "<success>\u{25C6} <muted>pair \u{B7} watching",
+  );
+  await environment.emit("session_shutdown");
+});
+
+it("narrates review progress above the editor without surfacing finding contents", async () => {
+  const environment = await setup();
+  const file = path.join(environment.cwd, "change.ts");
+  await fsPromises.writeFile(file, "export const broken = true;\n");
+  const pending = Promise.withResolvers<ProposedFinding[]>();
+  vi.mocked(reviewFile).mockReturnValue(pending.promise);
+  await environment.emit("tool_result", {
+    toolName: "write",
+    input: { path: file },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(environment.status()).toBe("◆ pair · reviewing · 2");
+  });
+  pending.resolve([
+    { line: 1, title: "Secret title", quote: "broken", evidence: "Issue" },
+  ]);
+  await advanceReviews(() => {
+    expect(environment.status()).toBe("◆ pair · 2 queued");
+  });
+  await environment.emit("turn_end");
+  expect(environment.status()).toBe("◆ pair · 2 awaiting decision");
+  for (const finding of findings(environment.entries))
+    await environment.decide(finding.id, {
+      findingId: finding.id,
+      decision: "reject",
+      reason: "Intentional",
+    });
+  expect(environment.status()).toBe("◆ pair · watching");
+  await environment.emit("session_shutdown");
+  await environment.decide("late", {
+    findingId: "late",
+    decision: "reject",
+    reason: "After shutdown",
+  });
+  expect(environment.setWidget).toHaveBeenLastCalledWith(
+    "pair-programmer",
+    undefined,
+  );
 });
 
 it("restores delivered decisions after session start and removes decided findings from model context", async () => {
