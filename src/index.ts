@@ -12,6 +12,11 @@ import {
   captureBaseline,
   type TaskBaseline,
 } from "./change-evidence.js";
+import {
+  ACCEPTED_MESSAGE,
+  renderAccepted,
+  type AcceptedDetails,
+} from "./accepted-card.js";
 import { FindingAdmission } from "./finding-admission.js";
 import { createPairLogger, type PairLogger } from "./logger.js";
 import type { ModelCallObserver } from "./model-usage.js";
@@ -943,9 +948,16 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       if (saved && params.decision === "accept" && finding !== undefined) {
         pi.sendMessage(
           {
-            customType: "pair-programmer-accepted",
+            customType: ACCEPTED_MESSAGE,
             content: acceptedReview(finding, params.reason),
             display: true,
+            details: {
+              title: finding.title,
+              file: finding.file,
+              line: finding.line,
+              evidence: finding.evidence,
+              reason: params.reason,
+            } satisfies AcceptedDetails,
           },
           { triggerTurn: false },
         );
@@ -997,6 +1009,10 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     checkReset?.();
     sidebar.toggle(ctx);
   };
+  // OMP may not expose message renderers; its default rendering stays readable.
+  if (typeof pi.registerMessageRenderer === "function")
+    pi.registerMessageRenderer(ACCEPTED_MESSAGE, renderAccepted);
+
   pi.registerCommand("pair-feed", {
     description: "Toggle the live review sidebar",
     handler: (_args, ctx) => {

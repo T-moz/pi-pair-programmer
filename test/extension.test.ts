@@ -213,6 +213,7 @@ async function setup(
   isIdle: Mock<() => boolean>;
   notify: ReturnType<typeof vi.fn>;
   shortcuts: Map<string, (ctx: ExtensionContext) => void>;
+  renderers: Map<string, unknown>;
   setWidget: Mock<(key: string, content: string[] | undefined) => void>;
   status: () => string | undefined;
   entries: JournalEntry[];
@@ -251,6 +252,7 @@ async function setup(
   }
   const hooks = new Map<string, Handler>();
   const shortcuts = new Map<string, (ctx: ExtensionContext) => void>();
+  const renderers = new Map<string, unknown>();
   const commands = new Map<
     string,
     Parameters<ExtensionAPI["registerCommand"]>[1]
@@ -287,6 +289,9 @@ async function setup(
     sendMessage,
     ...(host === "pi"
       ? {
+          registerMessageRenderer(customType: string, renderer: unknown) {
+            renderers.set(customType, renderer);
+          },
           registerShortcut(
             key: string,
             options: { handler: (ctx: ExtensionContext) => void },
@@ -354,6 +359,7 @@ async function setup(
     notify,
     setWidget,
     shortcuts,
+    renderers,
     status: () => setWidget.mock.lastCall?.[1]?.[0],
     entries,
     statsEntries,
@@ -2885,6 +2891,16 @@ it("restores delivered decisions after session start and removes decided finding
   expect(published[0]?.[0].content).toContain("Confirmed by caller");
   expect(published[0]?.[0].content).toContain("First issue");
   expect(published[0]?.[0].content).toContain("change.ts:1");
+  expect(published[0]?.[0].details).toEqual({
+    title: first.title,
+    file: "change.ts",
+    line: 1,
+    evidence: "broken — First issue",
+    reason: "Confirmed by caller",
+  });
+  expect(environment.renderers.get("pair-programmer-accepted")).toBeTypeOf(
+    "function",
+  );
   expect(
     (
       await environment.decide("decision", {
