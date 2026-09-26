@@ -214,6 +214,7 @@ async function setup(
   notify: ReturnType<typeof vi.fn>;
   shortcuts: Map<string, (ctx: ExtensionContext) => void>;
   renderers: Map<string, unknown>;
+  rejectedCards: unknown[];
   setWidget: Mock<(key: string, content: string[] | undefined) => void>;
   status: () => string | undefined;
   entries: JournalEntry[];
@@ -253,6 +254,7 @@ async function setup(
   const hooks = new Map<string, Handler>();
   const shortcuts = new Map<string, (ctx: ExtensionContext) => void>();
   const renderers = new Map<string, unknown>();
+  const rejectedCards: unknown[] = [];
   const commands = new Map<
     string,
     Parameters<ExtensionAPI["registerCommand"]>[1]
@@ -292,6 +294,9 @@ async function setup(
           registerMessageRenderer(customType: string, renderer: unknown) {
             renderers.set(customType, renderer);
           },
+          registerEntryRenderer(customType: string, renderer: unknown) {
+            renderers.set(customType, renderer);
+          },
           registerShortcut(
             key: string,
             options: { handler: (ctx: ExtensionContext) => void },
@@ -306,6 +311,10 @@ async function setup(
         const entry = { type: "custom", customType, data };
         activeStatsEntries.push(entry);
         transcript.push(entry);
+        return;
+      }
+      if (customType === "pair-programmer-rejected") {
+        rejectedCards.push(data);
         return;
       }
       entryAttempts += 1;
@@ -360,6 +369,7 @@ async function setup(
     setWidget,
     shortcuts,
     renderers,
+    rejectedCards,
     status: () => setWidget.mock.lastCall?.[1]?.[0],
     entries,
     statsEntries,
@@ -2862,6 +2872,27 @@ it("narrates review progress above the editor without surfacing finding contents
       decision: "reject",
       reason: "Intentional",
     });
+  expect(
+    environment.rejectedCards.map((card) =>
+      JSON.stringify(card, ["title", "reason", "reviewer"]),
+    ),
+  ).toEqual(
+    findings(environment.entries).map((finding) =>
+      JSON.stringify({
+        title: finding.title,
+        reason: "Intentional",
+        reviewer: "gpt-5",
+      }),
+    ),
+  );
+  expect(
+    environment.sendMessage.mock.calls.some(
+      ([message]) => message.customType === "pair-programmer-accepted",
+    ),
+  ).toBe(false);
+  expect(environment.renderers.get("pair-programmer-rejected")).toBeTypeOf(
+    "function",
+  );
   expect(environment.status()).toBe("◆ pair · watching");
   await environment.emit("session_shutdown");
   await environment.decide("late", {

@@ -14,9 +14,11 @@ import {
 } from "./change-evidence.js";
 import {
   ACCEPTED_MESSAGE,
+  REJECTED_ENTRY,
   renderAccepted,
-  type AcceptedDetails,
-} from "./accepted-card.js";
+  renderRejected,
+  type CardDetails,
+} from "./finding-card.js";
 import { FindingAdmission } from "./finding-admission.js";
 import { createPairLogger, type PairLogger } from "./logger.js";
 import type { ModelCallObserver } from "./model-usage.js";
@@ -942,10 +944,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
           details: { saved: false },
         });
       }
-      const finding =
-        params.decision === "accept"
-          ? store.deliveredFinding(params.findingId)
-          : undefined;
+      const finding = store.deliveredFinding(params.findingId);
       const saved = store.decide(
         params.findingId,
         params.decision,
@@ -956,23 +955,27 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
         sessionId: accounting.stats.sessionId,
         outcome: saved ? params.decision : "invalid",
       });
-      if (saved && params.decision === "accept" && finding !== undefined) {
-        pi.sendMessage(
-          {
-            customType: ACCEPTED_MESSAGE,
-            content: acceptedReview(finding, params.reason),
-            display: true,
-            details: {
-              title: finding.title,
-              file: finding.file,
-              line: finding.line,
-              evidence: finding.evidence,
-              reason: params.reason,
-              ...optionalReviewer(reviewerNames.get(finding.reviewer)),
-            } satisfies AcceptedDetails,
-          },
-          { triggerTurn: false },
-        );
+      if (saved && finding !== undefined) {
+        const details = {
+          title: finding.title,
+          file: finding.file,
+          line: finding.line,
+          evidence: finding.evidence,
+          reason: params.reason,
+          ...optionalReviewer(reviewerNames.get(finding.reviewer)),
+        } satisfies CardDetails;
+        if (params.decision === "accept")
+          pi.sendMessage(
+            {
+              customType: ACCEPTED_MESSAGE,
+              content: acceptedReview(finding, params.reason),
+              display: true,
+              details,
+            },
+            { triggerTurn: false },
+          );
+        // Rejections are transcript-only: rendered for the user, never sent to the model.
+        else pi.appendEntry(REJECTED_ENTRY, details);
       }
       return Promise.resolve({
         content: [
@@ -1024,6 +1027,8 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   // OMP may not expose message renderers; its default rendering stays readable.
   if (typeof pi.registerMessageRenderer === "function")
     pi.registerMessageRenderer(ACCEPTED_MESSAGE, renderAccepted);
+  if (typeof pi.registerEntryRenderer === "function")
+    pi.registerEntryRenderer(REJECTED_ENTRY, renderRejected);
 
   pi.registerCommand("pair-feed", {
     description: "Toggle the live review sidebar",
