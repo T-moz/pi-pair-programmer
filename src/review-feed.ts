@@ -5,6 +5,7 @@ export type ReviewPhase = "running" | ReviewOutcome;
 export interface FeedEntry {
   id: string;
   file: string;
+  reviewer: string;
   model: string;
   startedAt: number;
   phase: ReviewPhase;
@@ -20,12 +21,13 @@ export class ReviewFeed {
 
   start(
     id: string,
-    job: { file: string; model: string },
+    job: { file: string; reviewer: string; model: string },
     now = Date.now(),
   ): void {
     this.entries.unshift({
       id,
       file: job.file,
+      reviewer: job.reviewer,
       model: job.model.slice(job.model.lastIndexOf("/") + 1),
       startedAt: now,
       phase: "running",

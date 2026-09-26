@@ -16,6 +16,7 @@ const plain = {
 } as unknown as Parameters<typeof renderSidebar>[2];
 const job = {
   file: "src/a.ts",
+  reviewer: "entropy",
   model: "openai/gpt-5",
 };
 const views: Record<string, FindingView> = {
@@ -90,7 +91,7 @@ describe("renderSidebar", () => {
       "“Reuse the existing padding helper",
       "Rejected :2",
       "“No”",
-      "gpt-5",
+      "entropy",
     ])
       expect(rendered).toContain(expected);
     for (const hidden of [
@@ -139,19 +140,20 @@ describe("renderSidebar", () => {
     expect(truncatePath("x.ts", 0)).toBe("…");
   });
 
-  it("shares a row between the outcome and a shortened model, without the prompt", () => {
+  it("shares a row between the outcome and a shortened reviewer name", () => {
     const feed = new ReviewFeed();
     feed.start(
       "a",
       {
         ...job,
-        model: "provider/a-very-long-model-name-that-cannot-fit-beside-it",
+        reviewer: "a-very-long-reviewer-name-that-cannot-fit-beside-it",
       },
       0,
     );
     const lines = text(feed, 40, 40).map((line) => line.slice(2, -2));
     expect(lines[5]).toContain("reviewing…");
     expect(lines[5]).toContain("a-very-long");
+    expect(lines[5]).not.toContain("gpt-5");
     expect(lines[5]?.trimEnd()).toMatch(/…$/u);
     expect(lines[6]?.trim()).toBe("");
     for (const width of [38, 12])

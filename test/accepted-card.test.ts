@@ -55,6 +55,9 @@ describe("accepted finding card", () => {
     expect(lines[3]).toBe(
       "   <dim>“Reworking it for the unsafe-index warning.”",
     );
+    expect(
+      acceptedLines({ ...details, reviewer: "entropy" }, plain, 60, false)[1],
+    ).toBe("  …/message_bubble/linkified_message_text.dart:91 · entropy");
   });
 
   it("wraps within narrow widths and keeps the file name", () => {

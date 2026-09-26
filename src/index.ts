@@ -42,6 +42,7 @@ import {
   loadReviewers,
   matchingReviewers,
   reviewerKey,
+  reviewerLabel,
   type ReviewerConfig,
 } from "./reviewers.js";
 
@@ -138,6 +139,10 @@ function describe(findings: readonly Finding[]): string {
   return `Review findings:\n${lines.join("\n")}\nAccept or reject every finding with pair_programmer_decide(findingId, decision, reason) before using another tool. Give a concrete reason for each decision.`;
 }
 
+function optionalReviewer(name: string | undefined): { reviewer?: string } {
+  return name === undefined ? {} : { reviewer: name };
+}
+
 function acceptedReview(finding: Finding, reason: string): string {
   return `**Accepted review · ${finding.title}**\n\n\`${finding.file}:${String(finding.line)}\`\n\n${finding.evidence}\n\n**Why accepted:** ${reason}`;
 }
@@ -153,6 +158,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   const statsView = new StatsView();
   const statusOverlay = new StatusOverlay();
   const feed = new ReviewFeed();
+  const reviewerNames = new Map<string, string>();
   const sidebar = new ReviewSidebar(
     () => feed.list(),
     (id) => store.lookup(id),
@@ -412,8 +418,13 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       finish("cancelled", false);
     });
     job.stats.start(job.id);
+    reviewerNames.set(
+      reviewerKey(job.reviewer),
+      reviewerLabel(job.reviewer, job.model),
+    );
     feed.start(job.id, {
       file: job.file,
+      reviewer: reviewerLabel(job.reviewer, job.model),
       model: job.model,
     });
     showState(job.ctx);
@@ -957,6 +968,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
               line: finding.line,
               evidence: finding.evidence,
               reason: params.reason,
+              ...optionalReviewer(reviewerNames.get(finding.reviewer)),
             } satisfies AcceptedDetails,
           },
           { triggerTurn: false },

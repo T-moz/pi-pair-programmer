@@ -117,7 +117,7 @@ function entryLines(
     ),
     spread(
       `  ${theme.fg(state.color, state.text)}`,
-      theme.fg("dim", entry.model),
+      theme.fg("dim", entry.reviewer),
       width,
     ),
   ];

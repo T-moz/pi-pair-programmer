@@ -54,6 +54,7 @@ The default reviewer uses your current model and asks: â€œDoes it add entropy?â€
 {
   "reviewers": [
     {
+      "name": "entropy",
       "model": "current",
       "prompt": "Does it add entropy?",
       "include": ["src/**/*.ts"],
@@ -63,7 +64,7 @@ The default reviewer uses your current model and asks: â€œDoes it add entropy?â€
 }
 ```
 
-Use `current` or a `provider/model` identifier. File patterns are relative to your working directory; exclusions take precedence. Add entries for more reviewers.
+The optional `name` (1â€“24 characters) labels the reviewer in the sidebar and chat cards; unnamed reviewers show their model name, and renaming a reviewer keeps its review history. Use `current` or a `provider/model` identifier. File patterns are relative to your working directory; exclusions take precedence. Add entries for more reviewers.
 
 A small badge pinned to the top-right corner shows whether reviews are watching, running, queued, awaiting a decision, or paused. It never takes keyboard focus, stays visible when extensions such as zentui hide the footer, and hides in terminals narrower than 40 columns. Outside Pi's terminal UI (RPC, OMP), it falls back to a line above the editor. Accepted findings appear in the transcript with their location, evidence, and rationale.
 

@@ -7,6 +7,7 @@ import {
   loadReviewers,
   matchingReviewers,
   reviewerKey,
+  reviewerLabel,
   type ReviewerConfig,
 } from "../src/reviewers.js";
 
@@ -274,4 +275,36 @@ it("uses semantic reviewer identity regardless of pattern order", () => {
   expect(key).not.toBe(reviewerKey({ ...first, model: "other/model" }));
   expect(key).not.toBe(reviewerKey({ ...first, include: ["src/**/*.ts"] }));
   expect(key).not.toBe(reviewerKey({ ...first, exclude: [] }));
+});
+
+it("accepts short reviewer names that label without changing identity", async () => {
+  const directory = await temporaryDirectory();
+  const file = path.join(directory, "pair-programmer.reviewers.json");
+  const named: ReviewerConfig = {
+    name: "security",
+    model: "provider/model",
+    prompt: "Is it exploitable?",
+    include: ["**/*"],
+    exclude: [],
+  };
+  await writeFile(file, JSON.stringify({ reviewers: [named] }));
+  expect(await loadReviewers(directory)).toEqual([named]);
+  for (const name of ["", " padded ", "x".repeat(25), "bad\u{7}"]) {
+    await writeFile(file, JSON.stringify({ reviewers: [{ ...named, name }] }));
+    await expect(loadReviewers(directory)).rejects.toThrow(
+      "reviewers[0].name must be 1-24 characters",
+    );
+  }
+  const unnamed: ReviewerConfig = {
+    model: named.model,
+    prompt: named.prompt,
+    include: named.include,
+    exclude: named.exclude,
+  };
+  expect(reviewerKey(named)).toBe(reviewerKey(unnamed));
+  expect(reviewerKey({ ...named, name: "renamed" })).toBe(reviewerKey(named));
+  expect(reviewerLabel(named, "provider/model")).toBe("security");
+  expect(reviewerLabel(unnamed, "openai/gpt-5")).toBe("gpt-5");
+  expect(reviewerLabel(unnamed, "local")).toBe("local");
+  expect(DEFAULT_REVIEWERS[0]?.name).toBe("entropy");
 });

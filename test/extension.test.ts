@@ -2800,6 +2800,42 @@ it("feeds each review's outcome and attributed findings into the toggled sidebar
   await environment.emit("session_shutdown");
 });
 
+it("omits the reviewer name from cards for findings restored from an earlier process", async () => {
+  const environment = await setup();
+  const restored: Finding = {
+    id: "restored",
+    reviewer: "unknown-reviewer",
+    file: "change.ts",
+    revision: "r1",
+    line: 3,
+    title: "Restored",
+    evidence: "From before a reload",
+  };
+  environment.entries.push(
+    {
+      type: "custom",
+      customType: "pair-programmer",
+      data: { action: "add", finding: restored },
+    },
+    {
+      type: "custom",
+      customType: "pair-programmer",
+      data: { action: "deliver", ids: ["restored"] },
+    },
+  );
+  await environment.emit("session_start", { reason: "startup" });
+  await environment.decide("restored", {
+    findingId: "restored",
+    decision: "accept",
+    reason: "Still valid",
+  });
+  const card = environment.sendMessage.mock.calls.find(
+    ([message]) => message.customType === "pair-programmer-accepted",
+  );
+  expect(card?.[0].details).not.toHaveProperty("reviewer");
+  await environment.emit("session_shutdown");
+});
+
 it("narrates review progress above the editor without surfacing finding contents", async () => {
   const environment = await setup();
   const file = path.join(environment.cwd, "change.ts");
@@ -2897,6 +2933,7 @@ it("restores delivered decisions after session start and removes decided finding
     line: 1,
     evidence: "broken — First issue",
     reason: "Confirmed by caller",
+    reviewer: "gpt-5",
   });
   expect(environment.renderers.get("pair-programmer-accepted")).toBeTypeOf(
     "function",

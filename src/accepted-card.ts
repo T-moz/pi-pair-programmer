@@ -15,6 +15,7 @@ const AcceptedDetails = z.object({
   line: z.number(),
   evidence: z.string(),
   reason: z.string(),
+  reviewer: z.string().optional(),
 });
 export type AcceptedDetails = z.infer<typeof AcceptedDetails>;
 
@@ -31,9 +32,10 @@ export function acceptedLines(
   const indent = " ".repeat(Math.max(0, Math.min(pad, width - 4)));
   const inner = Math.max(1, width - visibleWidth(indent) - 2);
   const location = `:${String(details.line)}`;
+  const by = details.reviewer === undefined ? "" : ` · ${details.reviewer}`;
   const path = truncatePath(
     details.file,
-    Math.max(1, inner - visibleWidth(location)),
+    Math.max(1, inner - visibleWidth(location + by)),
   );
   const title = wrapTextWithAnsi(details.title, Math.max(1, inner - 2));
   const marker = theme.fg("dim", expanded ? " ▾" : " ▸");
@@ -42,7 +44,7 @@ export function acceptedLines(
       (part, index) =>
         `${index === 0 ? theme.fg("warning", "◆") : " "} ${theme.bold(part)}${index === title.length - 1 ? marker : ""}`,
     ),
-    `  ${theme.fg("dim", path + location)}`,
+    `  ${theme.fg("dim", path + location + by)}`,
   ];
   if (expanded)
     lines.push(

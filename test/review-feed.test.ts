@@ -3,6 +3,7 @@ import { ReviewFeed } from "../src/review-feed.js";
 
 const job = {
   file: "src/a.ts",
+  reviewer: "entropy",
   model: "openai/gpt-5",
 };
 
