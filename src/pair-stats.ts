@@ -1,8 +1,13 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { z } from "zod";
 import type { ModelCallObservation } from "./model-usage.js";
 
 export const STATS_ENTRY = "pair-programmer-stats";
+const pendingStatsKey = Symbol.for("pi-pair-programmer.pending-stats.v1");
+const retainedStats = Reflect.get(globalThis, pendingStatsKey) as
+  Map<string, PairStats> | undefined;
+const pendingStats = retainedStats ?? new Map<string, PairStats>();
 const Count = z.number().nonnegative();
 const Outcome = z.enum([
   "success",
@@ -242,6 +247,80 @@ export class PairStats {
     } catch {
       this.persistenceFailures += 1;
       return false;
+    }
+  }
+}
+
+export class SessionAccounting {
+  private readonly appendEvent = this.append.bind(this);
+  private current = new PairStats(randomUUID(), this.appendEvent);
+  private journal:
+    | {
+        sessionId: string;
+        manager: Partial<ExtensionContext["sessionManager"]>;
+        append: (data: unknown) => void;
+        onPersistenceFailure: () => void;
+      }
+    | undefined;
+
+  constructor() {
+    Reflect.set(globalThis, pendingStatsKey, pendingStats);
+  }
+
+  get stats(): PairStats {
+    return this.current;
+  }
+
+  suspend(): void {
+    this.journal = undefined;
+  }
+
+  activate(
+    manager: Partial<ExtensionContext["sessionManager"]>,
+    append: (data: unknown) => void,
+    onPersistenceFailure: () => void,
+  ): void {
+    const sessionId = createHash("sha256")
+      .update(
+        manager.getSessionId?.() ?? manager.getHeader?.()?.id ?? randomUUID(),
+      )
+      .digest("hex");
+    const retained = pendingStats.get(sessionId);
+    this.current = retained ?? new PairStats(sessionId, this.appendEvent);
+    retained?.setAppender(this.appendEvent);
+    this.current.restore(manager.getEntries?.() ?? []);
+    this.journal = { sessionId, manager, append, onPersistenceFailure };
+    this.current.flush();
+    this.retain(this.current);
+  }
+
+  retain(stats: PairStats): void {
+    const snapshot = stats.snapshot();
+    if (snapshot.incompleteJobs > 0 || snapshot.pendingWrites > 0)
+      pendingStats.set(stats.sessionId, stats);
+    else pendingStats.delete(stats.sessionId);
+  }
+
+  private append(data: StatsEvent): boolean {
+    const journal = this.journal;
+    if (data.sessionId !== journal?.sessionId) return false;
+    try {
+      const currentId =
+        journal.manager.getSessionId?.() ?? journal.manager.getHeader?.()?.id;
+      if (
+        currentId !== undefined &&
+        createHash("sha256").update(currentId).digest("hex") !== data.sessionId
+      )
+        return false;
+    } catch {
+      return false;
+    }
+    try {
+      journal.append(data);
+      return true;
+    } catch (error) {
+      journal.onPersistenceFailure();
+      throw error;
     }
   }
 }
