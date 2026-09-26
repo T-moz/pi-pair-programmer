@@ -3,30 +3,21 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, expect, it, vi, type Mock } from "vitest";
 import {
-  deduplicate,
   isInherited,
   reviewFile,
   type Host,
   type ProposedFinding,
 } from "../src/review-runner.js";
 import type { ChangeEvidence } from "../src/change-evidence.js";
-import type { Finding, StoredFinding } from "../src/review-store.js";
 
 interface JudgmentRequest {
   model: string;
   state: {
-    candidate?: Finding;
     finding?: ProposedFinding;
     taskStartSource?: { file: string; source: string };
     currentSource?: { file: string; source: string };
-    history?: (Finding & {
-      verdict: "accept" | "reject" | null;
-      reason: string | null;
-    })[];
-    earlierCandidates?: Finding[];
   };
   questions: {
-    duplicate?: { type: "noul"; instructions?: unknown; criteria?: unknown };
     category?: { type: "choice"; instructions?: unknown; criteria?: unknown };
   };
 }
@@ -35,10 +26,6 @@ interface JudgmentOptions {
   signal: AbortSignal;
   timeout: number;
   retry: { maxRetries: number };
-}
-
-interface JudgmentResponse {
-  answers: { duplicate: { noul: number } };
 }
 
 const systemOne = vi.hoisted(() =>
@@ -118,21 +105,6 @@ const valid: ProposedFinding = {
 function finish(child: FakeChild, findings: unknown): void {
   child.stdout.write(JSON.stringify({ findings }));
   child.emit("close", 0);
-}
-
-function finding(
-  id: string,
-  evidence = "user.name — Dereferences nullable user",
-): Finding {
-  return {
-    id,
-    reviewer: "correctness",
-    file: "src/example.ts",
-    revision: "revision-1",
-    line: 2,
-    title: "Null dereference",
-    evidence,
-  };
 }
 
 beforeEach(() => {
@@ -378,155 +350,6 @@ it("propagates parent abort and deadline abort through the child signal", async 
   }
 });
 
-it("skips the network when no comparison exists", async () => {
-  const first = finding("first");
-  const signal = new AbortController().signal;
-  await expect(
-    deduplicate({ candidates: [], history: [], signal }),
-  ).resolves.toEqual([]);
-  await expect(
-    deduplicate({ candidates: [first], history: [], signal }),
-  ).resolves.toEqual([first]);
-  expect(systemOne).not.toHaveBeenCalled();
-});
-
-it("compares each candidate only against history and strictly earlier candidates", async () => {
-  const prior = finding("history");
-  const stored: StoredFinding = {
-    finding: prior,
-    verdict: "reject",
-    reason: "Known false positive",
-  };
-  const approved = finding(
-    "approved",
-    "user.name — Confirmed null dereference",
-  );
-  const accepted: StoredFinding = {
-    finding: approved,
-    verdict: "accept",
-    reason: "Confirmed on missing users",
-  };
-  const history = [
-    { ...prior, verdict: "reject", reason: "Known false positive" },
-    { ...approved, verdict: "accept", reason: "Confirmed on missing users" },
-  ];
-  const repeated = finding("same-id");
-  const fixed = finding("same-id", "user?.name — Null checked before access");
-  systemOne
-    .mockResolvedValueOnce({ answers: { duplicate: { noul: 0.94 } } })
-    .mockResolvedValueOnce({ answers: { duplicate: { noul: 0.04 } } });
-  const signal = new AbortController().signal;
-  await expect(
-    deduplicate({
-      candidates: [repeated, fixed],
-      history: [stored, accepted],
-      signal,
-    }),
-  ).resolves.toEqual([fixed]);
-  expect(systemOne).toHaveBeenCalledTimes(2);
-  const first = systemOne.mock.calls[0];
-  const second = systemOne.mock.calls[1];
-  expect(first?.[0]).toMatchObject({
-    model: "jev-latest",
-    state: { candidate: repeated, history, earlierCandidates: [] },
-    questions: { duplicate: { type: "noul" } },
-  });
-  expect(first?.[0].state).not.toHaveProperty("candidates");
-  expect(second?.[0].state).toEqual({
-    candidate: fixed,
-    history,
-    earlierCandidates: [repeated],
-  });
-  expect(first?.[1]).toEqual({
-    signal,
-    timeout: 30_000,
-    retry: { maxRetries: 0 },
-  });
-  expect(second?.[1]).toEqual({
-    signal,
-    timeout: 30_000,
-    retry: { maxRetries: 0 },
-  });
-});
-
-it("deduplicates later same-id findings without comparing a candidate to itself", async () => {
-  const first = finding("same-id");
-  const repeated = finding("same-id");
-  const changed = finding(
-    "same-id",
-    "user.name — New entry point also dereferences null",
-  );
-  systemOne
-    .mockResolvedValueOnce({ answers: { duplicate: { noul: 0.99 } } })
-    .mockResolvedValueOnce({ answers: { duplicate: { noul: 0.01 } } });
-  await expect(
-    deduplicate({
-      candidates: [first, repeated, changed],
-      history: [],
-      signal: new AbortController().signal,
-    }),
-  ).resolves.toEqual([first, changed]);
-  expect(systemOne.mock.calls[0]?.[0].state.earlierCandidates).toEqual([first]);
-  expect(systemOne.mock.calls[1]?.[0].state.earlierCandidates).toEqual([
-    first,
-    repeated,
-  ]);
-});
-
-it("rechecks already-distinct candidates only against newly stored findings", async () => {
-  const stored = finding("stored");
-  const [first, second] = [finding("first"), finding("second")];
-  systemOne
-    .mockResolvedValueOnce({ answers: { duplicate: { noul: 0.9 } } })
-    .mockResolvedValueOnce({ answers: { duplicate: { noul: 0.1 } } });
-  const signal = new AbortController().signal;
-  await expect(
-    deduplicate({
-      candidates: [first, second],
-      history: [{ finding: stored }],
-      compareCandidates: false,
-      signal,
-    }),
-  ).resolves.toEqual([second]);
-  expect(
-    systemOne.mock.calls.map(([input]) => input.state.earlierCandidates),
-  ).toEqual([[], []]);
-  await expect(
-    deduplicate({
-      candidates: [first, second],
-      history: [],
-      compareCandidates: false,
-      signal,
-    }),
-  ).resolves.toEqual([first, second]);
-  expect(systemOne).toHaveBeenCalledTimes(2);
-});
-
-it("cancels an in-flight Jev judgment without retrying", async () => {
-  const controller = new AbortController();
-  systemOne.mockImplementationOnce(
-    (_input: unknown, options: { signal: AbortSignal }) => {
-      const { promise, reject } = Promise.withResolvers<JudgmentResponse>();
-      options.signal.addEventListener(
-        "abort",
-        () => {
-          reject(options.signal.reason);
-        },
-        { once: true },
-      );
-      return promise;
-    },
-  );
-  const pending = deduplicate({
-    candidates: [finding("new")],
-    history: [{ finding: finding("old") }],
-    signal: controller.signal,
-  });
-  controller.abort(new Error("review cancelled"));
-  await expect(pending).rejects.toThrow("review cancelled");
-  expect(systemOne).toHaveBeenCalledOnce();
-});
-
 const changeEvidence: ChangeEvidence = {
   status: "available",
   before: {
@@ -719,19 +542,4 @@ it("keeps findings when attribution is unavailable or cancelled", async () => {
   });
   controller.abort();
   await expect(pending).resolves.toBe(false);
-});
-
-it("surfaces Jev failures for the host fallback instead of silently retaining findings", async () => {
-  const previous = finding("old");
-  systemOne.mockRejectedValueOnce(new Error("Jev unavailable"));
-  await expect(
-    deduplicate({
-      candidates: [finding("new")],
-      history: [{ finding: previous }],
-      signal: new AbortController().signal,
-    }),
-  ).rejects.toThrow("Jev unavailable");
-  expect(systemOne.mock.calls[0]?.[0].state.history).toEqual([
-    { ...previous, verdict: null, reason: null },
-  ]);
 });
