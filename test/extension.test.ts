@@ -1,20 +1,24 @@
+import { execFile } from "node:child_process";
 import * as fsPromises from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, expect, it, vi, type Mock } from "vitest";
+import * as changeEvidence from "../src/change-evidence.js";
 import pairProgrammer from "../src/index.js";
 import {
   deduplicate,
+  isInherited,
   reviewFile,
   type ProposedFinding,
 } from "../src/review-runner.js";
 import type { Finding } from "../src/review-store.js";
-import type * as reviewerModule from "../src/reviewers.js";
+import * as reviewerModule from "../src/reviewers.js";
 
 const realpathPauses = vi.hoisted(() => new Map<string, Promise<null>[]>());
 const matchingCalls = vi.hoisted(() => new Map<string, number>());
@@ -85,6 +89,7 @@ vi.mock("../src/reviewers.js", async (importOriginal) => {
 
 vi.mock("../src/review-runner.js", () => ({
   reviewFile: vi.fn(),
+  isInherited: vi.fn(),
   deduplicate: vi.fn(),
 }));
 
@@ -173,6 +178,7 @@ async function setup(
   host: "pi" | "omp" = "pi",
   aliasedCwd = false,
   useDefaults = false,
+  beforeStart?: (cwd: string, ctx: ExtensionContext) => Promise<void>,
 ): Promise<{
   cwd: string;
   ctx: ExtensionContext;
@@ -218,6 +224,7 @@ async function setup(
     Parameters<ExtensionAPI["registerCommand"]>[1]
   >();
   const entries: JournalEntry[] = [];
+  const transcript: unknown[] = [];
   let entryError: Error | undefined;
   let entryAttempts = 0;
   const notify = vi.fn();
@@ -242,11 +249,13 @@ async function setup(
       if (entryError !== undefined) throw entryError;
       if (customType !== "pair-programmer")
         throw new Error(`Unexpected entry ${customType}`);
-      entries.push({
+      const entry: JournalEntry = {
         type: "custom",
         customType,
         data: data as JournalEntry["data"],
-      });
+      };
+      entries.push(entry);
+      transcript.push(entry);
     },
   } as unknown as ExtensionAPI);
   if (decide === undefined) throw new Error("Decision tool not registered");
@@ -254,7 +263,11 @@ async function setup(
     cwd,
     model: { provider: "openai", id: "gpt-5" },
     modelRegistry: host === "pi" ? { streamSimple: vi.fn() } : {},
-    sessionManager: { getBranch: () => entries },
+    sessionManager: {
+      getBranch: () => entries,
+      getHeader: vi.fn(() => ({ id: "fresh-session" })),
+      getEntries: vi.fn(() => transcript),
+    },
     ui: { notify },
   } as unknown as ExtensionContext;
   const emit = async (name: string, event: unknown = {}): Promise<unknown> => {
@@ -262,7 +275,8 @@ async function setup(
     if (!handler) throw new Error(`Missing ${name} hook`);
     return await handler(event, ctx);
   };
-  await emit("session_start");
+  await beforeStart?.(cwd, ctx);
+  await emit("session_start", host === "pi" ? { reason: "startup" } : {});
   return {
     cwd,
     ctx,
@@ -295,6 +309,8 @@ beforeEach(() => {
   sourceReadFinished.clear();
   vi.useFakeTimers();
   vi.mocked(reviewFile).mockReset();
+  vi.mocked(isInherited).mockReset();
+  vi.mocked(isInherited).mockResolvedValue(false);
   vi.mocked(deduplicate).mockReset();
   vi.mocked(deduplicate).mockImplementation(({ candidates }) =>
     Promise.resolve(candidates),
@@ -310,6 +326,517 @@ afterEach(async () => {
         fsPromises.rm(directory, { recursive: true, force: true }),
       ),
   );
+});
+
+const inheritedSource = [
+  "export function displayProfile(user: { name: string } | null) {",
+  "  const normalized = user.name.trim().toLowerCase();",
+  "  return `Profile display name: ${normalized}`;",
+  "}",
+  "displayProfile(null);",
+  "",
+].join("\n");
+const inheritedProposal: ProposedFinding = {
+  line: 2,
+  title: "Inherited null dereference",
+  quote: "user.name",
+  evidence: "Calling displayProfile(null) throws before rendering the profile",
+};
+
+it("aborts baseline acquisition on shutdown and ignores its late completion", async () => {
+  const environment = await setup("omp", false, true);
+  const delayed = Promise.withResolvers<changeEvidence.BaselineCapture>();
+  const capture = vi
+    .spyOn(changeEvidence, "captureBaseline")
+    .mockReturnValueOnce(delayed.promise);
+  Object.assign(environment.ctx.sessionManager, {
+    getHeader: () => ({ id: "capturing-session" }),
+    getEntries: () => [],
+  });
+  const starting = environment.emit("session_start", { reason: "new" });
+  await vi.waitFor(() => {
+    expect(capture).toHaveBeenCalledOnce();
+  });
+  await environment.emit("session_shutdown");
+  expect(capture.mock.calls[0]?.[1]?.aborted).toBe(true);
+  delayed.resolve(await changeEvidence.captureBaseline(environment.cwd));
+  await starting;
+  expect(reviewFile).not.toHaveBeenCalled();
+  expect(environment.sendMessage).not.toHaveBeenCalled();
+  capture.mockRestore();
+});
+
+it("stores no finding and holds no coding when evidence building fails", async () => {
+  const environment = await setup("pi", false, true);
+  const evidence = vi
+    .spyOn(changeEvidence, "buildChangeEvidence")
+    .mockImplementation(() => {
+      throw new Error("Evidence unavailable");
+    });
+  vi.mocked(reviewFile).mockResolvedValue([inheritedProposal]);
+  await fsPromises.writeFile(
+    path.join(environment.cwd, "change.ts"),
+    inheritedSource,
+  );
+  await environment.emit("tool_result", {
+    toolName: "write",
+    input: { path: "change.ts" },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(evidence).toHaveBeenCalledOnce();
+  });
+  await vi.advanceTimersByTimeAsync(150);
+  expect(isInherited).not.toHaveBeenCalled();
+  expect(deduplicate).not.toHaveBeenCalled();
+  expect(findings(environment.entries)).toEqual([]);
+  expect(
+    await environment.emit("tool_call", { toolName: "bash" }),
+  ).toBeUndefined();
+  evidence.mockRestore();
+  await environment.emit("session_shutdown");
+});
+
+it.each(["pi", "omp"] as const)(
+  "%s filters inherited committed and dirty moves but keeps generated code and uncertain findings",
+  async (host) => {
+    const environment = await setup(host, false, true, async (cwd) => {
+      await promisify(execFile)("git", ["init", "--quiet"], { cwd });
+      await Promise.all(
+        Array.from({ length: 80 }, (_, index) =>
+          fsPromises.writeFile(
+            path.join(cwd, `filler-${String(index)}.ts`),
+            `export const filler = "${"x".repeat(60_000)}";\n`,
+          ),
+        ),
+      );
+      await fsPromises.writeFile(
+        path.join(cwd, "committed.ts"),
+        inheritedSource,
+      );
+      await fsPromises.writeFile(
+        path.join(cwd, "dirty.ts"),
+        "export const safe = true;\n",
+      );
+      await promisify(execFile)("git", ["add", "."], { cwd });
+      await promisify(execFile)(
+        "git",
+        [
+          "-c",
+          "user.name=Test",
+          "-c",
+          "user.email=test@example.invalid",
+          "commit",
+          "--quiet",
+          "-m",
+          "Baseline",
+        ],
+        { cwd },
+      );
+      await fsPromises.writeFile(
+        path.join(cwd, "dirty.ts"),
+        inheritedSource.replaceAll("displayProfile", "displayDirtyProfile"),
+      );
+      await fsPromises.writeFile(
+        path.join(cwd, "untracked.ts"),
+        inheritedSource.replaceAll("displayProfile", "displayUntrackedProfile"),
+      );
+    });
+    vi.mocked(reviewFile).mockResolvedValue([
+      inheritedProposal,
+      {
+        ...inheritedProposal,
+        title: "Uncertain consequence",
+        quote: "user.name",
+      },
+    ]);
+    vi.mocked(isInherited).mockImplementation(({ finding, evidence }) =>
+      Promise.resolve(
+        evidence.status === "available" &&
+          finding.title === "Inherited null dereference",
+      ),
+    );
+    for (const original of ["committed", "dirty", "untracked"]) {
+      const source = await fsPromises.readFile(
+        path.join(environment.cwd, `${original}.ts`),
+        "utf8",
+      );
+      await fsPromises.rm(path.join(environment.cwd, `${original}.ts`));
+      const moved = path.join(environment.cwd, `${original}-moved.ts`);
+      await fsPromises.writeFile(moved, source);
+      await environment.emit("tool_result", {
+        toolName: "write",
+        input: { path: moved },
+        isError: false,
+      });
+    }
+    await advanceReviews(() => {
+      expect(
+        findings(environment.entries).map((finding) => finding.title),
+      ).toEqual(Array.from({ length: 3 }, () => "Uncertain consequence"));
+    });
+    await environment.command("pair-programmer");
+    const generated = path.join(environment.cwd, "generated.ts");
+    await fsPromises.writeFile(
+      generated,
+      inheritedSource.replaceAll("displayProfile", "generatedProfile"),
+    );
+    await environment.command("pair-programmer");
+    await fsPromises.rename(
+      generated,
+      path.join(environment.cwd, "generated-moved.ts"),
+    );
+    await environment.emit("tool_result", {
+      toolName: "write",
+      input: { path: "generated-moved.ts" },
+      isError: false,
+    });
+    await advanceReviews(() => {
+      expect(
+        findings(environment.entries).some(
+          (finding) =>
+            finding.file === "generated-moved.ts" &&
+            finding.title === inheritedProposal.title,
+        ),
+      ).toBe(true);
+    });
+    await environment.emit("turn_end");
+    for (const finding of findings(environment.entries).filter(
+      (entry) => entry.file !== "generated-moved.ts",
+    )) {
+      expect(finding.title).toBe("Uncertain consequence");
+    }
+    expect(JSON.stringify(environment.sendMessage.mock.calls)).toContain(
+      "Uncertain consequence",
+    );
+    await environment.emit("session_shutdown");
+  },
+);
+
+it.each(["revision", "off", "shutdown"] as const)(
+  "discards attribution completing after %s without holding coding",
+  async (change) => {
+    const environment = await setup("pi", false, true);
+    const file = path.join(environment.cwd, "change.ts");
+    await fsPromises.writeFile(file, inheritedSource);
+    vi.mocked(reviewFile).mockResolvedValue([inheritedProposal]);
+    const judgment = Promise.withResolvers<boolean>();
+    vi.mocked(isInherited).mockReturnValueOnce(judgment.promise);
+    await environment.emit("tool_result", {
+      toolName: "write",
+      input: { path: file },
+      isError: false,
+    });
+    await advanceReviews(() => {
+      expect(isInherited).toHaveBeenCalledOnce();
+    });
+    expect(
+      await environment.emit("tool_call", { toolName: "bash" }),
+    ).toBeUndefined();
+    if (change === "revision")
+      await fsPromises.writeFile(file, "export const fixed = true;\n");
+    else if (change === "off") await environment.command("pair-programmer");
+    else await environment.emit("session_shutdown");
+    judgment.resolve(false);
+    await vi.waitFor(() => {
+      expect(vi.mocked(isInherited).mock.settledResults[0]?.type).toBe(
+        "fulfilled",
+      );
+    });
+    await vi.advanceTimersByTimeAsync(150);
+    expect(findings(environment.entries)).toEqual([]);
+    expect(deduplicate).not.toHaveBeenCalled();
+    await environment.emit("session_shutdown");
+  },
+);
+
+it.each([
+  "resume",
+  "fork",
+  "history",
+  "missing-header",
+  "null-header",
+  "missing-entries",
+  "parent",
+] as const)(
+  "keeps attribution unknown on %s rather than rebaselining generated work",
+  async (mode) => {
+    const environment = await setup("omp", false, true);
+    const file = path.join(environment.cwd, "change.ts");
+    await fsPromises.writeFile(file, inheritedSource);
+    const header = {
+      id: "different-session",
+      parentSession: mode === "parent" ? "parent" : undefined,
+    };
+    Object.assign(environment.ctx.sessionManager, {
+      getHeader:
+        mode === "missing-header"
+          ? undefined
+          : () => (mode === "null-header" ? null : header),
+      getEntries:
+        mode === "missing-entries"
+          ? undefined
+          : () => (mode === "history" ? [{ type: "message" }] : []),
+    });
+    await environment.emit(
+      mode === "fork" ? "session_branch" : "session_switch",
+      {
+        reason: ["resume", "fork"].includes(mode) ? mode : "new",
+      },
+    );
+    vi.mocked(reviewFile).mockResolvedValue([inheritedProposal]);
+    vi.mocked(isInherited).mockImplementation(({ evidence }) =>
+      Promise.resolve(evidence.status === "available"),
+    );
+    await environment.emit("tool_result", {
+      toolName: "edit",
+      input: { path: file },
+      isError: false,
+    });
+    await advanceReviews(() => {
+      expect(findings(environment.entries)).toHaveLength(1);
+    });
+    await environment.emit("turn_end");
+    expect(environment.sendMessage).toHaveBeenCalledOnce();
+    await environment.emit("session_shutdown");
+  },
+);
+
+it.each([
+  {
+    label: "model metadata",
+    history: [{ type: "model_change" }, { type: "service_tier_change" }],
+    inherited: true,
+  },
+  {
+    label: "review journal",
+    history: [
+      {
+        type: "custom",
+        customType: "pair-programmer",
+        data: { stage: "baseline" },
+      },
+    ],
+    inherited: false,
+  },
+  {
+    label: "coding messages",
+    history: [
+      { type: "message", message: { role: "assistant" } },
+      { type: "message", message: { role: "toolResult" } },
+    ],
+    inherited: false,
+  },
+])(
+  "only treats safe metadata as fresh when history contains $label",
+  async ({ history, inherited }) => {
+    const environment = await setup("omp", false, true, async (cwd, ctx) => {
+      await fsPromises.writeFile(path.join(cwd, "change.ts"), inheritedSource);
+      Object.assign(ctx.sessionManager, { getEntries: () => history });
+    });
+    await fsPromises.writeFile(
+      path.join(environment.cwd, "change.ts"),
+      `${inheritedSource}// task edit\n`,
+    );
+    vi.mocked(reviewFile).mockResolvedValue([inheritedProposal]);
+    vi.mocked(isInherited).mockImplementation(({ evidence }) =>
+      Promise.resolve(evidence.status === "available"),
+    );
+    await environment.emit("tool_result", {
+      toolName: "edit",
+      input: { path: "change.ts" },
+      isError: false,
+    });
+    await advanceReviews(() => {
+      expect(deduplicate).toHaveBeenCalledOnce();
+    });
+    expect(findings(environment.entries)).toHaveLength(inherited ? 0 : 1);
+    await environment.emit("session_shutdown");
+  },
+);
+
+it("starts a new OMP baseline from metadata-only history and preserves it on repeated starts", async () => {
+  const environment = await setup("omp", false, true);
+  const file = path.join(environment.cwd, "change.ts");
+  await fsPromises.writeFile(file, inheritedSource);
+  Object.assign(environment.ctx.sessionManager, {
+    getHeader: () => ({ id: "new-session" }),
+    getEntries: () => [
+      { type: "model_change" },
+      { type: "thinking_level_change" },
+    ],
+  });
+  await environment.emit("session_switch", { reason: "new" });
+  await fsPromises.writeFile(
+    file,
+    `${inheritedSource}// changed after capture\n`,
+  );
+  await environment.emit("session_start");
+  vi.mocked(reviewFile).mockResolvedValue([inheritedProposal]);
+  vi.mocked(isInherited).mockImplementation(({ evidence }) =>
+    Promise.resolve(evidence.before?.source === inheritedSource),
+  );
+  await environment.emit("tool_result", {
+    toolName: "edit",
+    input: { path: file },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(deduplicate).toHaveBeenCalledOnce();
+  });
+  expect(findings(environment.entries)).toEqual([]);
+  await environment.emit("session_shutdown");
+});
+
+it("does not let an older root resolution replace the active workspace", async () => {
+  const environment = await setup("omp", false, true);
+  const newerRoot = await fsPromises.mkdtemp(
+    path.join(tmpdir(), "pair-programmer-newer-"),
+  );
+  directories.push(newerRoot);
+  const paused = Promise.withResolvers<null>();
+  realpathPauses.set(environment.cwd, [paused.promise]);
+  const earlier = environment.emit("session_start");
+  environment.ctx.cwd = newerRoot;
+  Object.assign(environment.ctx.sessionManager, {
+    getHeader: () => ({ id: "newer-session" }),
+  });
+  await environment.emit("session_switch", { reason: "new" });
+  paused.resolve(null);
+  await earlier;
+  const file = path.join(newerRoot, "change.ts");
+  await fsPromises.writeFile(file, inheritedSource);
+  vi.mocked(reviewFile).mockResolvedValue([inheritedProposal]);
+  await environment.emit("tool_result", {
+    toolName: "write",
+    input: { path: file },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(
+      findings(environment.entries).map((finding) => finding.file),
+    ).toEqual(["change.ts"]);
+  });
+  await environment.emit("turn_end");
+  expect(environment.sendMessage).toHaveBeenCalledOnce();
+  await environment.emit("session_shutdown");
+});
+
+it.each(["resolve", "reject"] as const)(
+  "preserves active reviewers when an old configuration load %ss",
+  async (outcome) => {
+    const environment = await setup("omp", false, true);
+    const paused = Promise.withResolvers<reviewerModule.ReviewerConfig[]>();
+    const entered = Promise.withResolvers<null>();
+    const load = vi
+      .spyOn(reviewerModule, "loadReviewers")
+      .mockImplementationOnce(() => {
+        entered.resolve(null);
+        return paused.promise;
+      })
+      .mockResolvedValueOnce([
+        {
+          model: "current",
+          prompt: "Current reviewer",
+          include: ["**/*.ts"],
+          exclude: [],
+        },
+      ]);
+    const earlier = environment.emit("session_start");
+    await entered.promise;
+    Object.assign(environment.ctx.sessionManager, {
+      getHeader: () => ({ id: "newer-session" }),
+    });
+    await environment.emit("session_switch", { reason: "new" });
+    if (outcome === "resolve") paused.resolve([]);
+    else paused.reject(new Error("old configuration invalid"));
+    await earlier;
+    load.mockRestore();
+    const file = path.join(environment.cwd, "change.ts");
+    await fsPromises.writeFile(file, inheritedSource);
+    vi.mocked(reviewFile).mockResolvedValue([inheritedProposal]);
+    await environment.emit("tool_result", {
+      toolName: "write",
+      input: { path: file },
+      isError: false,
+    });
+    await advanceReviews(() => {
+      expect(findings(environment.entries)).toHaveLength(1);
+    });
+    expect(environment.notify).not.toHaveBeenCalled();
+    await environment.emit("session_shutdown");
+  },
+);
+
+it.each(["resolve", "reject"] as const)(
+  "ignores a baseline capture that %ss after a newer session starts",
+  async (outcome) => {
+    const environment = await setup("omp", false, true);
+    const file = path.join(environment.cwd, "change.ts");
+    await fsPromises.writeFile(file, inheritedSource);
+    const snapshot = await changeEvidence.captureBaseline(environment.cwd);
+    const delayed = Promise.withResolvers<changeEvidence.BaselineCapture>();
+    const capture = vi
+      .spyOn(changeEvidence, "captureBaseline")
+      .mockReturnValueOnce(delayed.promise)
+      .mockResolvedValueOnce(
+        outcome === "resolve"
+          ? { status: "unavailable", reason: "timeout" }
+          : snapshot,
+      );
+    let sessionId = "delayed-session";
+    Object.assign(environment.ctx.sessionManager, {
+      getHeader: () => ({ id: sessionId }),
+    });
+    const earlier = environment.emit("session_switch", { reason: "new" });
+    await vi.waitFor(() => {
+      expect(capture).toHaveBeenCalledOnce();
+    });
+    sessionId = "current-session";
+    await environment.emit("session_switch", { reason: "new" });
+    if (outcome === "resolve") delayed.resolve(snapshot);
+    else delayed.reject(new Error("cancelled acquisition"));
+    await earlier;
+    capture.mockRestore();
+    vi.mocked(reviewFile).mockResolvedValue([inheritedProposal]);
+    vi.mocked(isInherited).mockImplementation(({ evidence }) =>
+      Promise.resolve(evidence.status === "available"),
+    );
+    await environment.emit("tool_result", {
+      toolName: "edit",
+      input: { path: file },
+      isError: false,
+    });
+    await advanceReviews(() => {
+      expect(deduplicate).toHaveBeenCalledOnce();
+    });
+    expect(findings(environment.entries)).toHaveLength(
+      outcome === "resolve" ? 1 : 0,
+    );
+    await environment.emit("session_shutdown");
+  },
+);
+
+it("keeps ordinary reviews working after a failed baseline capture", async () => {
+  const capture = vi
+    .spyOn(changeEvidence, "captureBaseline")
+    .mockRejectedValueOnce(new Error("snapshot unreadable"));
+  const environment = await setup("pi", false, true);
+  capture.mockRestore();
+  const file = path.join(environment.cwd, "change.ts");
+  await fsPromises.writeFile(file, inheritedSource);
+  vi.mocked(reviewFile).mockResolvedValue([inheritedProposal]);
+  await environment.emit("tool_result", {
+    toolName: "write",
+    input: { path: file },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(findings(environment.entries)).toHaveLength(1);
+  });
+  await environment.emit("turn_end");
+  expect(environment.sendMessage).toHaveBeenCalledOnce();
+  await environment.emit("session_shutdown");
 });
 
 it("runs one built-in reviewer for a write without project configuration", async () => {

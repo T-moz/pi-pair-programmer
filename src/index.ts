@@ -7,7 +7,17 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { z } from "zod";
-import { deduplicate, reviewFile, type Host } from "./review-runner.js";
+import {
+  buildChangeEvidence,
+  captureBaseline,
+  type TaskBaseline,
+} from "./change-evidence.js";
+import {
+  deduplicate,
+  isInherited,
+  reviewFile,
+  type Host,
+} from "./review-runner.js";
 import { ReviewStore, type Finding } from "./review-store.js";
 import {
   DEFAULT_REVIEWERS,
@@ -40,6 +50,30 @@ interface ReviewJob {
   key: string;
   host: Host;
   cwd: string;
+}
+
+function isFreshSession(
+  reason: string | undefined,
+  header: { parentSession?: string } | null | undefined,
+  entries: readonly { type: string }[] | undefined,
+): boolean {
+  if (
+    header === undefined ||
+    header === null ||
+    header.parentSession !== undefined
+  )
+    return false;
+  return (
+    [undefined, "startup", "new"].includes(reason) &&
+    entries?.every((entry) =>
+      [
+        "model_change",
+        "thinking_level_change",
+        "mode_change",
+        "service_tier_change",
+      ].includes(entry.type),
+    ) === true
+  );
 }
 
 function decisionInteraction(
@@ -80,6 +114,8 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   let store = new ReviewStore(appendReviewEntry);
   let reviewers: readonly ReviewerConfig[] = DEFAULT_REVIEWERS;
   let root = process.cwd();
+  let baseline: TaskBaseline | undefined;
+  let baselineSession: string | undefined;
   let generation = 0;
   let active = 0;
   let unresolved = 0;
@@ -183,25 +219,42 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       reviewed.set(`${job.key}:${reviewer}:${job.model}`, job.revision);
       return;
     }
-    const candidates: Finding[] = proposed.map((finding) => ({
-      id: createHash("sha256")
-        .update(
-          JSON.stringify([
-            job.file,
-            reviewer,
-            finding.title.toLowerCase().trim(),
-            finding.quote.trim(),
-          ]),
-        )
-        .digest("hex")
-        .slice(0, 16),
-      reviewer,
-      file: job.file,
-      revision: job.revision,
-      line: finding.line,
-      title: finding.title,
-      evidence: `${finding.quote} — ${finding.evidence}`,
-    }));
+    const candidates: Finding[] = [];
+    for (const finding of proposed) {
+      const inherited = await isInherited({
+        finding,
+        evidence: await buildChangeEvidence(
+          baseline,
+          job.file,
+          job.source,
+          finding.line,
+          finding.quote,
+          signal,
+        ),
+        signal,
+      });
+      if (signal.aborted || !(await current(job))) return;
+      if (inherited) continue;
+      candidates.push({
+        id: createHash("sha256")
+          .update(
+            JSON.stringify([
+              job.file,
+              reviewer,
+              finding.title.toLowerCase().trim(),
+              finding.quote.trim(),
+            ]),
+          )
+          .digest("hex")
+          .slice(0, 16),
+        reviewer,
+        file: job.file,
+        revision: job.revision,
+        line: finding.line,
+        title: finding.title,
+        evidence: `${finding.quote} — ${finding.evidence}`,
+      });
+    }
 
     const insert = async (): Promise<void> => {
       if (!(await current(job))) return;
@@ -360,20 +413,81 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     }
   }
 
-  pi.on("session_start", async (_event, ctx) => {
-    stop();
-    root = await realpath(ctx.cwd);
-    store = new ReviewStore(appendReviewEntry, ctx.sessionManager.getBranch());
+  function replaceBaseline(next: TaskBaseline | undefined): void {
+    const previous = baseline;
+    baseline = next;
+    void previous?.dispose();
+  }
+
+  async function assessBaseline(
+    event: { reason?: string },
+    ctx: ExtensionContext,
+    session: number,
+  ): Promise<void> {
+    const controller = new AbortController();
+    controllers.set(controller, "");
     try {
-      reviewers = await loadReviewers(ctx.cwd);
+      const manager = ctx.sessionManager as Partial<
+        ExtensionContext["sessionManager"]
+      >;
+      const header = manager.getHeader?.();
+      if (event.reason === "fork" || header?.id !== baselineSession) {
+        replaceBaseline(undefined);
+        baselineSession = header?.id;
+        if (isFreshSession(event.reason, header, manager.getEntries?.())) {
+          const capture = await captureBaseline(root, controller.signal);
+          const captured =
+            capture.status === "available" ? capture.baseline : undefined;
+          if (session === generation) replaceBaseline(captured);
+          else void captured?.dispose();
+        }
+      }
+    } catch {
+      if (session === generation) replaceBaseline(undefined);
+    } finally {
+      controllers.delete(controller);
+    }
+  }
+
+  async function startSession(
+    event: { reason?: string },
+    ctx: ExtensionContext,
+  ): Promise<void> {
+    stop();
+    const session = generation;
+    const resolvedRoot = await realpath(ctx.cwd);
+    if (session !== generation) return;
+    root = resolvedRoot;
+    store = new ReviewStore(appendReviewEntry, ctx.sessionManager.getBranch());
+    await assessBaseline(event, ctx, session);
+    if (session !== generation) return;
+    try {
+      const loaded = await loadReviewers(ctx.cwd);
+      if (session === generation) reviewers = loaded;
     } catch (error) {
+      if (session !== generation) return;
       reviewers = [];
       ctx.ui.notify(String(error), "warning");
     }
-  });
+  }
+
+  pi.on("session_start", startSession);
+  const onOmpSession = pi.on.bind(pi) as unknown as (
+    name: "session_switch" | "session_branch",
+    handler: (
+      event: { reason?: string },
+      ctx: ExtensionContext,
+    ) => Promise<void>,
+  ) => void;
+  onOmpSession("session_switch", startSession);
+  onOmpSession("session_branch", (_event, ctx) =>
+    startSession({ reason: "fork" }, ctx),
+  );
 
   pi.on("session_shutdown", () => {
     stop();
+    replaceBaseline(undefined);
+    baselineSession = undefined;
   });
 
   pi.on("tool_result", (event, ctx) => {
