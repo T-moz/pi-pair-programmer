@@ -2,6 +2,7 @@ import { z } from "zod";
 
 const FindingSchema = z.object({
   id: z.string(),
+  duplicateKey: z.string().optional(),
   reviewer: z.string(),
   file: z.string(),
   revision: z.string(),
@@ -40,7 +41,6 @@ export interface StoredFinding {
 }
 
 interface FindingState extends StoredFinding {
-  sequence: number;
   delivered: boolean;
   discarded: boolean;
 }
@@ -49,7 +49,6 @@ export class ReviewStore {
   private readonly findings = new Map<string, FindingState>();
   private readonly append: (data: unknown) => void;
   private active = true;
-  private added = 0;
 
   constructor(
     append: (data: unknown) => void,
@@ -79,18 +78,10 @@ export class ReviewStore {
     this.record({ action: "enabled", enabled });
   }
 
-  get version(): number {
-    return this.added;
-  }
-
   history(file: string): readonly StoredFinding[] {
-    return this.addedSince(0, file);
-  }
-
-  addedSince(version: number, file: string): readonly StoredFinding[] {
     const result: StoredFinding[] = [];
     for (const state of this.findings.values()) {
-      if (state.finding.file !== file || state.sequence < version) continue;
+      if (state.finding.file !== file) continue;
       result.push({
         finding: { ...state.finding },
         ...(state.verdict === undefined ? {} : { verdict: state.verdict }),
@@ -203,7 +194,6 @@ export class ReviewStore {
     if (!this.active || this.findings.has(finding.id)) return;
     this.findings.set(finding.id, {
       finding: { ...finding },
-      sequence: this.added++,
       delivered: false,
       discarded: false,
     });

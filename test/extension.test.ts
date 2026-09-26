@@ -12,7 +12,6 @@ import { afterEach, beforeEach, expect, it, vi, type Mock } from "vitest";
 import * as changeEvidence from "../src/change-evidence.js";
 import pairProgrammer from "../src/index.js";
 import {
-  deduplicate,
   isInherited,
   reviewFile,
   type ProposedFinding,
@@ -90,7 +89,14 @@ vi.mock("../src/reviewers.js", async (importOriginal) => {
 vi.mock("../src/review-runner.js", () => ({
   reviewFile: vi.fn(),
   isInherited: vi.fn(),
-  deduplicate: vi.fn(),
+}));
+
+const systemOne = vi.hoisted(() => vi.fn<() => Promise<unknown>>());
+vi.mock("@typesafe-ai/sdk", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  TypeSafeClient: class {
+    readonly systemOne = systemOne;
+  },
 }));
 
 type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
@@ -315,10 +321,8 @@ beforeEach(() => {
   vi.mocked(reviewFile).mockReset();
   vi.mocked(isInherited).mockReset();
   vi.mocked(isInherited).mockResolvedValue(false);
-  vi.mocked(deduplicate).mockReset();
-  vi.mocked(deduplicate).mockImplementation(({ candidates }) =>
-    Promise.resolve(candidates),
-  );
+  systemOne.mockReset();
+  systemOne.mockResolvedValue({ answers: { duplicate: { noul: 0 } } });
 });
 
 afterEach(async () => {
@@ -367,12 +371,8 @@ it("starts every reviewer at once and separates attribution and deduplication wi
   const attributions = Array.from({ length: 2 }, () =>
     Promise.withResolvers<boolean>(),
   );
-  const deduplications = Array.from({ length: 2 }, () =>
-    Promise.withResolvers<null>(),
-  );
   let reviewIndex = 0;
   let attributionIndex = 0;
-  let deduplicationIndex = 0;
   vi.mocked(reviewFile).mockImplementation(async () => {
     const pending = reviews[reviewIndex++];
     if (pending === undefined) throw new Error("Unexpected review");
@@ -383,15 +383,6 @@ it("starts every reviewer at once and separates attribution and deduplication wi
     if (pending === undefined) throw new Error("Unexpected attribution");
     return await pending.promise;
   });
-  vi.mocked(deduplicate).mockImplementation(
-    async ({ candidates, compareCandidates }) => {
-      if (compareCandidates === false) return candidates;
-      const pending = deduplications[deduplicationIndex++];
-      if (pending === undefined) throw new Error("Unexpected deduplication");
-      await pending.promise;
-      return candidates;
-    },
-  );
   await fsPromises.writeFile(
     path.join(environment.cwd, "change.ts"),
     inheritedSource,
@@ -414,25 +405,12 @@ it("starts every reviewer at once and separates attribution and deduplication wi
   });
   attributions[0]?.resolve(false);
   await vi.waitFor(() => {
-    expect(deduplicate).toHaveBeenCalledTimes(1);
-  });
-  attributions[1]?.resolve(false);
-  await vi.waitFor(() => {
-    expect(deduplicate).toHaveBeenCalledTimes(2);
-  });
-  deduplications[0]?.resolve(null);
-  await vi.waitFor(() => {
     expect(findings(environment.entries)).toHaveLength(1);
   });
-  deduplications[1]?.resolve(null);
+  attributions[1]?.resolve(false);
   reviews[2]?.resolve([]);
   await vi.waitFor(() => {
     expect(findings(environment.entries)).toHaveLength(2);
-  });
-  expect(deduplicate).toHaveBeenCalledTimes(3);
-  expect(vi.mocked(deduplicate).mock.calls[2]?.[0]).toMatchObject({
-    compareCandidates: false,
-    history: [{ finding: findings(environment.entries)[0] }],
   });
   expect(environment.sendMessage).not.toHaveBeenCalled();
   expect(environment.notify).not.toHaveBeenCalled();
@@ -452,16 +430,7 @@ it("starts every reviewer at once and separates attribution and deduplication wi
 
 it("delivers a finding once when concurrent reviewers report it before either stores", async () => {
   const environment = await setup();
-  const judgments = [0, 1].map(() => Promise.withResolvers<null>());
-  let round = 0;
-  vi.mocked(deduplicate).mockImplementation(
-    async ({ candidates, history, compareCandidates }) => {
-      if (compareCandidates !== false) await judgments[round++]?.promise;
-      return candidates.filter((candidate) =>
-        history.every(({ finding }) => finding.title !== candidate.title),
-      );
-    },
-  );
+  systemOne.mockResolvedValue({ answers: { duplicate: { noul: 1 } } });
   vi.mocked(reviewFile).mockResolvedValue([inheritedProposal]);
   await fsPromises.writeFile(
     path.join(environment.cwd, "change.ts"),
@@ -473,11 +442,7 @@ it("delivers a finding once when concurrent reviewers report it before either st
     isError: false,
   });
   await advanceReviews(() => {
-    expect(deduplicate).toHaveBeenCalledTimes(2);
-  });
-  for (const judgment of judgments) judgment.resolve(null);
-  await advanceReviews(() => {
-    expect(deduplicate).toHaveBeenCalledTimes(3);
+    expect(systemOne.mock.settledResults[0]?.type).toBe("fulfilled");
   });
   expect(findings(environment.entries)).toHaveLength(1);
   await environment.emit("turn_end");
@@ -824,7 +789,7 @@ it("stores no finding and holds no coding when evidence building fails", async (
   });
   await vi.advanceTimersByTimeAsync(150);
   expect(isInherited).not.toHaveBeenCalled();
-  expect(deduplicate).not.toHaveBeenCalled();
+
   expect(findings(environment.entries)).toEqual([]);
   expect(
     await environment.emit("tool_call", { toolName: "bash" }),
@@ -981,7 +946,7 @@ it.each(["revision", "off", "shutdown"] as const)(
     });
     await vi.advanceTimersByTimeAsync(150);
     expect(findings(environment.entries)).toEqual([]);
-    expect(deduplicate).not.toHaveBeenCalled();
+
     await environment.emit("session_shutdown");
   },
 );
@@ -1084,9 +1049,11 @@ it.each([
       isError: false,
     });
     await advanceReviews(() => {
-      expect(deduplicate).toHaveBeenCalledOnce();
+      expect(vi.mocked(isInherited).mock.settledResults[0]?.type).toBe(
+        "fulfilled",
+      );
+      expect(findings(environment.entries)).toHaveLength(inherited ? 0 : 1);
     });
-    expect(findings(environment.entries)).toHaveLength(inherited ? 0 : 1);
     await environment.emit("session_shutdown");
   },
 );
@@ -1118,7 +1085,9 @@ it("starts a new OMP baseline from metadata-only history and preserves it on rep
     isError: false,
   });
   await advanceReviews(() => {
-    expect(deduplicate).toHaveBeenCalledOnce();
+    expect(vi.mocked(isInherited).mock.settledResults[0]?.type).toBe(
+      "fulfilled",
+    );
   });
   expect(findings(environment.entries)).toEqual([]);
   await environment.emit("session_shutdown");
@@ -1244,11 +1213,13 @@ it.each(["resolve", "reject"] as const)(
       isError: false,
     });
     await advanceReviews(() => {
-      expect(deduplicate).toHaveBeenCalledOnce();
+      expect(vi.mocked(isInherited).mock.settledResults[0]?.type).toBe(
+        "fulfilled",
+      );
+      expect(findings(environment.entries)).toHaveLength(
+        outcome === "resolve" ? 1 : 0,
+      );
     });
-    expect(findings(environment.entries)).toHaveLength(
-      outcome === "resolve" ? 1 : 0,
-    );
     await environment.emit("session_shutdown");
   },
 );
@@ -2131,7 +2102,16 @@ it("deduplicates old evidence after edits even if the Jev call fails", async () 
       ).details.saved,
     ).toBe(true);
   }
-  vi.mocked(deduplicate).mockRejectedValueOnce(new Error("Jev unavailable"));
+  systemOne.mockReset();
+  systemOne.mockRejectedValue(new Error("Jev unavailable"));
+  vi.mocked(reviewFile).mockResolvedValue([
+    {
+      line: 1,
+      title: "Bug",
+      quote: "broken",
+      evidence: "Reworded same defect",
+    },
+  ]);
   await fsPromises.writeFile(
     file,
     "export const broken = true;\nexport const next = true;\n",
@@ -2145,8 +2125,8 @@ it("deduplicates old evidence after edits even if the Jev call fails", async () 
     expect(reviewFile).toHaveBeenCalledTimes(4);
   });
   await advanceReviews(() => {
-    const { calls, settledResults } = vi.mocked(deduplicate).mock;
-    expect(calls.length).toBeGreaterThanOrEqual(4);
+    const { calls, settledResults } = systemOne.mock;
+    expect(calls).toHaveLength(2);
     expect(settledResults.every(({ type }) => type !== "incomplete")).toBe(
       true,
     );
@@ -2158,6 +2138,84 @@ it("deduplicates old evidence after edits even if the Jev call fails", async () 
   ).toBeUndefined();
   await environment.emit("session_shutdown");
 });
+
+it.each(["accept", "reject"] as const)(
+  "delivers and independently decides novel evidence after an earlier %s",
+  async (decision) => {
+    const environment = await setup("pi", false, true);
+    const file = path.join(environment.cwd, "change.ts");
+    await fsPromises.writeFile(file, inheritedSource);
+    vi.mocked(reviewFile).mockResolvedValue([inheritedProposal]);
+    await environment.emit("tool_result", {
+      toolName: "write",
+      input: { path: file },
+      isError: false,
+    });
+    await advanceReviews(() => {
+      expect(findings(environment.entries)).toHaveLength(1);
+    });
+    await environment.emit("turn_end");
+    const first = findings(environment.entries)[0];
+    if (first === undefined) throw new Error("Missing original finding");
+    await environment.decide("original", {
+      findingId: first.id,
+      decision,
+      reason: "Original consequence reviewed",
+    });
+    await fsPromises.writeFile(
+      file,
+      `${inheritedSource}displayProfile(null);\n`,
+    );
+    vi.mocked(reviewFile).mockResolvedValue([
+      {
+        ...inheritedProposal,
+        evidence: "A newly added caller passes null again",
+      },
+    ]);
+    await environment.emit("tool_result", {
+      toolName: "edit",
+      input: { path: file },
+      isError: false,
+    });
+    await advanceReviews(() => {
+      expect(findings(environment.entries)).toHaveLength(2);
+    });
+    await environment.emit("turn_end");
+    const second = findings(environment.entries)[1];
+    if (second === undefined) throw new Error("Missing changed finding");
+    expect(second.id).not.toBe(first.id);
+    expect(
+      (
+        await environment.decide("changed", {
+          findingId: second.id,
+          decision: "accept",
+          reason: "New caller confirmed",
+        })
+      ).details.saved,
+    ).toBe(true);
+    const accepted = environment.sendMessage.mock.calls.filter(
+      ([message]) => message.customType === "pair-programmer-accepted",
+    );
+    expect(accepted.map(([message]) => message.content)).toEqual(
+      expect.arrayContaining([expect.stringContaining("New caller confirmed")]),
+    );
+    expect(accepted).toHaveLength(decision === "accept" ? 2 : 1);
+    await environment.emit("session_start");
+    expect(
+      await environment.emit("tool_call", { toolName: "bash", input: {} }),
+    ).toBeUndefined();
+    expect(
+      (
+        await environment.decide("again", {
+          findingId: first.id,
+          decision: "accept",
+          reason: "Already reviewed",
+        })
+      ).details.saved,
+    ).toBe(false);
+    await environment.emit("session_shutdown");
+  },
+);
 
 it("does not dispatch current-model reviewers without a model", async () => {
   const environment = await setup();
@@ -2262,52 +2320,113 @@ it("does not expose review messages without active findings and disables decisio
   await environment.emit("session_shutdown");
 });
 
-it("drops a review when the source changes while Jev is judging it", async () => {
-  const environment = await setup();
-  const file = path.join(environment.cwd, "change.ts");
-  await fsPromises.writeFile(file, "export const vulnerable = true;\n");
-  vi.mocked(reviewFile).mockResolvedValue([
-    { line: 1, title: "Unsafe", quote: "vulnerable", evidence: "Old evidence" },
-  ]);
-  const judgment = Promise.withResolvers<readonly Finding[]>();
-  vi.mocked(deduplicate)
-    .mockReturnValueOnce(judgment.promise)
-    .mockReturnValueOnce(judgment.promise);
-  await environment.emit("tool_result", {
-    toolName: "write",
-    input: { path: file },
-    isError: false,
-  });
-  await advanceReviews(() => {
-    expect(deduplicate).toHaveBeenCalledTimes(2);
-  });
-  await fsPromises.writeFile(file, "export const vulnerable = false;\n");
-  vi.mocked(reviewFile).mockResolvedValue([
-    {
-      line: 1,
-      title: "New issue",
-      quote: "false",
-      evidence: "Current evidence",
-    },
-  ]);
-  await environment.emit("tool_result", {
-    toolName: "edit",
-    input: { path: file },
-    isError: false,
-  });
-  judgment.resolve(vi.mocked(deduplicate).mock.calls[0]?.[0].candidates ?? []);
-  await advanceReviews(() => {
-    expect(
-      findings(environment.entries).some(
-        (finding) => finding.title === "New issue",
-      ),
-    ).toBe(true);
-  });
-  expect(
-    findings(environment.entries).some((finding) => finding.title === "Unsafe"),
-  ).toBe(false);
-  await environment.emit("session_shutdown");
-});
+it.each(["revision", "session", "off", "shutdown"] as const)(
+  "drops admission after %s changes while Jev is judging",
+  async (change) => {
+    const environment = await setup("pi", false, true);
+    const file = path.join(environment.cwd, "change.ts");
+    await fsPromises.writeFile(file, "export const vulnerable = true;\n");
+    vi.mocked(reviewFile).mockResolvedValue([
+      {
+        line: 1,
+        title: "Unsafe",
+        quote: "vulnerable",
+        evidence: "Old evidence",
+      },
+      {
+        line: 1,
+        title: "Other issue",
+        quote: "true",
+        evidence: "More evidence",
+      },
+    ]);
+    const judgment = Promise.withResolvers<unknown>();
+    systemOne.mockReturnValueOnce(judgment.promise);
+    await environment.emit("tool_result", {
+      toolName: "write",
+      input: { path: file },
+      isError: false,
+    });
+    await advanceReviews(() => {
+      expect(systemOne).toHaveBeenCalledOnce();
+    });
+    switch (change) {
+      case "revision":
+        await fsPromises.writeFile(file, "export const vulnerable = false;\n");
+        break;
+      case "session":
+        await environment.emit("session_start");
+        break;
+      case "off":
+        await environment.command("pair-programmer");
+        break;
+      case "shutdown":
+        await environment.emit("session_shutdown");
+        break;
+    }
+    judgment.resolve({ answers: { duplicate: { noul: 0 } } });
+    await advanceReviews(() => {
+      expect(systemOne.mock.settledResults[0]?.type).toBe("fulfilled");
+    });
+    expect(findings(environment.entries)).toEqual([]);
+    expect(environment.sendMessage).not.toHaveBeenCalled();
+    await environment.emit("session_shutdown");
+  },
+);
+
+it.each(["off", "session", "revision"] as const)(
+  "does not persist when %s invalidates the final source freshness read",
+  async (change) => {
+    const environment = await setup("pi", false, true);
+    const file = path.join(environment.cwd, "change.ts");
+    await fsPromises.writeFile(file, inheritedSource);
+    const review = Promise.withResolvers<ProposedFinding[]>();
+    vi.mocked(reviewFile)
+      .mockReturnValueOnce(review.promise)
+      .mockResolvedValue([]);
+    await environment.emit("tool_result", {
+      toolName: "write",
+      input: { path: file },
+      isError: false,
+    });
+    await advanceReviews(() => {
+      expect(reviewFile).toHaveBeenCalledOnce();
+    });
+    const canonical = await fsPromises.realpath(file);
+    const before = sourceReadCalls.get(canonical) ?? 0;
+    const reading = Promise.withResolvers<null>();
+    sourceReadPauses.set(canonical, [
+      Promise.resolve(null),
+      Promise.resolve(null),
+      reading.promise,
+    ]);
+    review.resolve([inheritedProposal]);
+    await vi.waitFor(() => {
+      expect(sourceReadCalls.get(canonical)).toBe(before + 3);
+    });
+    if (change === "off") await environment.command("pair-programmer");
+    else if (change === "session") await environment.emit("session_start");
+    else {
+      const beforeSchedule = realpathFinished.get(file) ?? 0;
+      await environment.emit("tool_result", {
+        toolName: "edit",
+        input: { path: file },
+        isError: false,
+      });
+      await vi.waitFor(() => {
+        expect(realpathFinished.get(file)).toBe(beforeSchedule + 1);
+      });
+    }
+    reading.resolve(null);
+    await vi.waitFor(() => {
+      expect(sourceReadFinished.get(canonical)).toBe(before + 3);
+    });
+    await vi.advanceTimersByTimeAsync(150);
+    expect(findings(environment.entries)).toEqual([]);
+    expect(environment.sendMessage).not.toHaveBeenCalled();
+    await environment.emit("session_shutdown");
+  },
+);
 
 it("stores one file's findings while dropping another file changed during deduplication", async () => {
   const environment = await setup();
@@ -2329,13 +2448,17 @@ it("stores one file's findings while dropping another file changed during dedupl
   vi.mocked(reviewFile).mockImplementation((request) =>
     Promise.resolve([
       { line: 1, title: request.file, quote: "true", evidence: "Source issue" },
+      {
+        line: 1,
+        title: `Additional ${request.file}`,
+        quote: "true",
+        evidence: "Other issue",
+      },
     ]),
   );
-  const judgments = [0, 1].map(() =>
-    Promise.withResolvers<readonly Finding[]>(),
-  );
+  const judgments = [0, 1].map(() => Promise.withResolvers<unknown>());
   for (const judgment of judgments)
-    vi.mocked(deduplicate).mockReturnValueOnce(judgment.promise);
+    systemOne.mockReturnValueOnce(judgment.promise);
   for (const file of [first, second])
     await environment.emit("tool_result", {
       toolName: "write",
@@ -2343,19 +2466,17 @@ it("stores one file's findings while dropping another file changed during dedupl
       isError: false,
     });
   await advanceReviews(() => {
-    expect(deduplicate).toHaveBeenCalledTimes(2);
+    expect(systemOne).toHaveBeenCalledTimes(2);
   });
   await fsPromises.writeFile(second, "export const second = false;\n");
-  for (const [judgment, call] of judgments.map(
-    (entry, index) =>
-      [entry, vi.mocked(deduplicate).mock.calls.at(index)] as const,
-  ))
-    judgment.resolve(call?.[0].candidates ?? []);
+  for (const judgment of judgments)
+    judgment.resolve({ answers: { duplicate: { noul: 0 } } });
   await advanceReviews(() => {
-    expect(findings(environment.entries)).toHaveLength(1);
+    expect(findings(environment.entries)).toHaveLength(2);
   });
   await vi.advanceTimersByTimeAsync(150);
   expect(findings(environment.entries).map((finding) => finding.file)).toEqual([
+    "first.ts",
     "first.ts",
   ]);
   await environment.emit("turn_end");

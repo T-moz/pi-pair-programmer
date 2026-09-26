@@ -12,17 +12,9 @@ import {
   captureBaseline,
   type TaskBaseline,
 } from "./change-evidence.js";
-import {
-  deduplicate,
-  isInherited,
-  reviewFile,
-  type Host,
-} from "./review-runner.js";
-import {
-  ReviewStore,
-  type Finding,
-  type StoredFinding,
-} from "./review-store.js";
+import { FindingAdmission } from "./finding-admission.js";
+import { isInherited, reviewFile, type Host } from "./review-runner.js";
+import { ReviewStore, type Finding } from "./review-store.js";
 import {
   DEFAULT_REVIEWERS,
   loadReviewers,
@@ -130,6 +122,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     pi.appendEntry("pair-programmer", data);
   };
   let store = new ReviewStore(appendReviewEntry);
+  let admission = new FindingAdmission(store);
   let reviewers: readonly ReviewerConfig[] = DEFAULT_REVIEWERS;
   let root = process.cwd();
   let baseline: TaskBaseline | undefined;
@@ -228,18 +221,21 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       });
   }
 
+  function active(job: ReviewJob): boolean {
+    return (
+      store.enabled &&
+      job.session === generation &&
+      job.version === versions.get(job.key)
+    );
+  }
+
   async function current(job: ReviewJob): Promise<boolean> {
-    if (
-      !store.enabled ||
-      job.session !== generation ||
-      job.version !== versions.get(job.key)
-    ) {
-      return false;
-    }
+    if (!active(job)) return false;
     try {
       return (
         (await realpath(job.fullPath)) === job.fullPath &&
-        revisionOf(await readFile(job.fullPath, "utf8")) === job.revision
+        revisionOf(await readFile(job.fullPath, "utf8")) === job.revision &&
+        active(job)
       );
     } catch {
       return false;
@@ -280,75 +276,19 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       })),
     );
     if (signal.aborted || !(await current(job))) return;
-    const candidates = judged.flatMap(({ finding, inherited }) =>
-      inherited
-        ? []
-        : [
-            {
-              id: createHash("sha256")
-                .update(
-                  JSON.stringify([
-                    job.file,
-                    reviewer,
-                    finding.title.toLowerCase().trim(),
-                    finding.quote.trim(),
-                  ]),
-                )
-                .digest("hex")
-                .slice(0, 16),
-              reviewer,
-              file: job.file,
-              revision: job.revision,
-              line: finding.line,
-              title: finding.title,
-              evidence: `${finding.quote} — ${finding.evidence}`,
-            },
-          ],
-    );
-    if (!(await storeNovel(job, candidates, signal))) return;
+    const result = await admission.admit({
+      file: job.file,
+      reviewer,
+      revision: job.revision,
+      findings: judged.flatMap(({ finding, inherited }) =>
+        inherited ? [] : [finding],
+      ),
+      signal,
+      isCurrent: () => current(job),
+    });
+    if (result === "obsolete") return;
+    if (result === "added") scheduleWake(job.ctx);
     reviewed.set(`${job.key}:${reviewer}:${job.model}`, job.revision);
-  }
-
-  async function judge(
-    candidates: readonly Finding[],
-    history: readonly StoredFinding[],
-    compareCandidates: boolean,
-    signal: AbortSignal,
-  ): Promise<readonly Finding[]> {
-    try {
-      return await deduplicate({
-        candidates,
-        history,
-        compareCandidates,
-        signal,
-      });
-    } catch {
-      return candidates.filter((candidate) =>
-        history.every(({ finding }) => finding.id !== candidate.id),
-      );
-    }
-  }
-
-  async function storeNovel(
-    job: ReviewJob,
-    candidates: readonly Finding[],
-    signal: AbortSignal,
-  ): Promise<boolean> {
-    let version = store.version;
-    let novel = await judge(candidates, store.history(job.file), true, signal);
-    for (;;) {
-      if (!(await current(job))) return false;
-      const added =
-        novel.length === 0 ? [] : store.addedSince(version, job.file);
-      if (added.length === 0) break;
-      version = store.version;
-      novel = await judge(novel, added, false, signal);
-    }
-    const ids = novel.flatMap((finding) =>
-      store.add(finding) ? [finding.id] : [],
-    );
-    if (ids.length > 0) scheduleWake(job.ctx);
-    return true;
   }
 
   function startReviews(
@@ -527,6 +467,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     if (session !== generation) return;
     root = resolvedRoot;
     store = new ReviewStore(appendReviewEntry, ctx.sessionManager.getBranch());
+    admission = new FindingAdmission(store);
     await assessBaseline(event, ctx, session);
     if (session !== generation) return;
     try {
