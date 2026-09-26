@@ -173,6 +173,26 @@ export class ReviewStore {
     return result;
   }
 
+  /** Decided findings per file, most accepted first (selected branch). */
+  hotspots(): { file: string; accepted: number; rejected: number }[] {
+    const files = new Map<string, { accepted: number; rejected: number }>();
+    for (const { finding, verdict } of this.findings.values()) {
+      if (verdict === undefined) continue;
+      const counts = files.get(finding.file) ?? { accepted: 0, rejected: 0 };
+      if (verdict === "accept") counts.accepted += 1;
+      else counts.rejected += 1;
+      files.set(finding.file, counts);
+    }
+    return [...files]
+      .map(([file, counts]) => ({ file, ...counts }))
+      .toSorted(
+        (left, right) =>
+          right.accepted - left.accepted ||
+          right.rejected - left.rejected ||
+          left.file.localeCompare(right.file),
+      );
+  }
+
   lookup(id: string): FindingView | undefined {
     const state = this.findings.get(id);
     if (state === undefined) return undefined;

@@ -450,6 +450,8 @@ async function openStatistics(environment: {
       lines = component.render(240);
       component.handleInput?.("d");
       lines = [...lines, ...component.render(240)];
+      component.handleInput?.("h");
+      lines = [...lines, ...component.render(240)];
       component.dispose?.();
     },
   );

@@ -6,6 +6,7 @@ import { ReviewStore } from "../src/review-store.js";
 import {
   StatsView,
   statsLines,
+  statsHotspots,
   statsSummary,
   type StatsReport,
 } from "../src/stats-view.js";
@@ -15,6 +16,7 @@ const report =
   () => ({
     summary: lines,
     details: [`detail ${lines.join(" ")}`],
+    hotspots: (width: number) => [`hot ${String(width)}`],
   });
 
 type Factory = Parameters<ExtensionContext["ui"]["custom"]>[0];
@@ -198,6 +200,35 @@ describe("statistics presentation", () => {
   });
 });
 
+describe("hotspots", () => {
+  it("ranks files by accepted findings with scaled bars and rejected counts", () => {
+    const store = {
+      hotspots: () => [
+        {
+          file: "apps/lib/pages/chat/controller.dart",
+          accepted: 6,
+          rejected: 2,
+        },
+        { file: "src/utils.ts", accepted: 3, rejected: 0 },
+        { file: "src/legacy.ts", accepted: 0, rejected: 1 },
+      ],
+    };
+    const lines = statsHotspots(store, 72);
+    expect(lines[0]).toBe("ACCEPTED  /  by file, selected branch");
+    expect(lines[1]).toMatch(
+      /^apps\/lib\/pages\/chat\/controller\.dart +█{12} {2}6 {2}· 2 rejected$/u,
+    );
+    expect(lines[2]).toMatch(/^src\/utils\.ts +█{6} +3$/u);
+    expect(lines[3]).toMatch(/^src\/legacy\.ts {2,}0 {2}· 1 rejected$/u);
+    const narrow = statsHotspots(store, 30);
+    expect(narrow[1]).toMatch(/^…/u);
+    expect(narrow[1]).toContain("████ ");
+    expect(statsHotspots({ hotspots: () => [] }, 72)[0]).toContain(
+      "No decided findings",
+    );
+  });
+});
+
 describe("StatsView", () => {
   it.each([
     "q",
@@ -228,12 +259,12 @@ describe("StatsView", () => {
       "USAGE  /",
       "now",
       "",
-      "↑↓  d deta\u{1B}[0m…\u{1B}[0m",
+      "↑↓  d h  r\u{1B}[0m…\u{1B}[0m",
     ]);
     const framed = component.render(24);
     expect(framed[0]).toBe(`╭${"─".repeat(22)}╮`);
     expect(framed[4]).toBe(`│  Review counts${" ".repeat(5)}  │`);
-    expect(framed.at(-2)).toContain("↑↓  d details  r ");
+    expect(framed.at(-2)).toContain("↑↓  d h  r  q clo");
     expect(framed.at(-1)).toBe(`╰${"─".repeat(22)}╯`);
     component.invalidate();
     component.handleInput?.(key);
@@ -255,7 +286,9 @@ describe("StatsView", () => {
     const component = host.component();
     const first = (): string | undefined => component.render(80)[4];
     expect(first()).toContain("Row 0");
-    expect(component.render(80).at(-2)).toContain("esc close  1–9/12");
+    expect(component.render(80).at(-2)).toContain(
+      "d details  h hotspots  r refresh  esc  1–9/12",
+    );
     component.handleInput?.("\u{1B}[B");
     expect(first()).toContain("Row 1");
     component.handleInput?.("\u{1B}[A");
@@ -267,14 +300,20 @@ describe("StatsView", () => {
     component.handleInput?.("d");
     expect(component.render(80)[2]).toContain("Detailed accounting");
     expect(first()).toContain("detail Row 0");
-    expect(component.render(80).at(-2)).toContain("d overview");
+    expect(component.render(80).at(-2)).toContain("o overview  h hotspots");
     component.handleInput?.("\u{1B}[B");
     component.handleInput?.("r");
     expect(first()).toContain("detail Row 0");
+    component.handleInput?.("h");
+    expect(component.render(80)[2]).toContain("Hotspots");
+    expect(first()).toContain("hot 74");
+    component.handleInput?.("o");
+    expect(first()).toContain("Row 0");
+    component.handleInput?.("d");
     component.handleInput?.("d");
     expect(first()).toContain("Row 0");
     component.handleInput?.("ignored");
-    expect(host.renderRequests()).toBe(9);
+    expect(host.renderRequests()).toBe(12);
     view.close();
     await opened;
   });
@@ -283,7 +322,11 @@ describe("StatsView", () => {
     let color = "31";
     let value = "変更 e\u{301} 👩‍💻 " + "long-model-name".repeat(10);
     const host = ui(40, (_tone, text) => `\u{1B}[${color}m${text}\u{1B}[0m`);
-    const read = vi.fn(() => ({ summary: [value], details: [value] }));
+    const read = vi.fn(() => ({
+      summary: [value],
+      details: [value],
+      hotspots: () => [value],
+    }));
     const view = new StatsView();
     const opened = view.open(host.ctx, read);
     await host.mounted;

@@ -24,6 +24,36 @@ function session(): {
 }
 
 describe("ReviewStore", () => {
+  it("ranks files by accepted then rejected findings, ignoring undecided ones", () => {
+    const { store } = session();
+    const ids = ["a1", "a2", "a3", "b1", "b2", "c1", "c2", "d1"];
+    const files: Record<string, string> = {
+      a: "src/a.ts",
+      b: "src/b.ts",
+      c: "src/c.ts",
+      d: "src/d.ts",
+    };
+    for (const id of ids)
+      store.add(finding(id, new Map(Object.entries(files)).get(id.charAt(0))));
+    store.deliver(ids);
+    for (const id of ["a1", "a2", "b1"]) store.decide(id, "accept", "Yes");
+    for (const id of ["a3", "b2", "c1", "c2"]) store.decide(id, "reject", "No");
+    expect(store.hotspots()).toEqual([
+      { file: "src/a.ts", accepted: 2, rejected: 1 },
+      { file: "src/b.ts", accepted: 1, rejected: 1 },
+      { file: "src/c.ts", accepted: 0, rejected: 2 },
+    ]);
+    const tie = session().store;
+    for (const id of ["z", "y"]) tie.add(finding(id, `src/${id}.ts`));
+    tie.deliver(["z", "y"]);
+    tie.decide("z", "accept", "Yes");
+    tie.decide("y", "accept", "Yes");
+    expect(tie.hotspots().map(({ file }) => file)).toEqual([
+      "src/y.ts",
+      "src/z.ts",
+    ]);
+  });
+
   it("describes each finding's live status for the review feed", () => {
     const { store } = session();
     for (const id of ["queued", "awaiting", "accepted", "rejected", "stale"])

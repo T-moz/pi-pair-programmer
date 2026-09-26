@@ -6,6 +6,7 @@ import {
 } from "@earendil-works/pi-tui";
 import type { MeasuredTotal, StatsSnapshot } from "./pair-stats.js";
 import type { ReviewStore } from "./review-store.js";
+import { truncatePath } from "./review-sidebar.js";
 
 function measured(
   total: MeasuredTotal,
@@ -123,10 +124,48 @@ export function statsSummary(
   ];
 }
 
+/** Files ranked by accepted findings, with bars scaled to `width` columns. */
+export function statsHotspots(
+  store: Pick<ReviewStore, "hotspots">,
+  width: number,
+): string[] {
+  const files = store.hotspots();
+  if (files.length === 0)
+    return [
+      "No decided findings on this branch yet.",
+      "Files with accepted findings will rank here.",
+    ];
+  const most = Math.max(1, ...files.map(({ accepted }) => accepted));
+  const count = String(most).length;
+  const bar = Math.max(4, Math.min(12, Math.floor(width / 6)));
+  const path = Math.max(8, width - bar - count - 16);
+  return [
+    "ACCEPTED  /  by file, selected branch",
+    ...files.map(({ file, accepted, rejected }) => {
+      const name = truncatePath(file, path).padEnd(path);
+      const filled = "█".repeat(Math.ceil((accepted / most) * bar));
+      const extra = rejected > 0 ? `  · ${String(rejected)} rejected` : "";
+      return `${name}  ${filled.padEnd(bar)}  ${String(accepted).padStart(count)}${extra}`;
+    }),
+  ];
+}
+
 export interface StatsReport {
   summary: readonly string[];
   details: readonly string[];
+  hotspots: (width: number) => readonly string[];
 }
+
+type Tab = "overview" | "details" | "hotspots";
+type TabSpec = readonly [key: string, tab: Tab, subtitle: string];
+const OVERVIEW: TabSpec = ["o", "overview", "Session overview"];
+/** Tabs in hint order. */
+const TABS: readonly TabSpec[] = [
+  OVERVIEW,
+  ["d", "details", "Detailed accounting"],
+  ["h", "hotspots", "Hotspots · accepted findings by file"],
+];
+const TAB_BY_KEY = new Map(TABS.map((spec) => [spec[0], spec]));
 
 export class StatsView {
   private closeCurrent: (() => void) | undefined;
@@ -153,7 +192,7 @@ export class StatsView {
         (tui, theme, keys, done) => {
           state.mounted = true;
           let report = read();
-          let detailed = false;
+          let spec = OVERVIEW;
           let offset = 0;
           let pageSize = 1;
           let disposed = false;
@@ -168,7 +207,10 @@ export class StatsView {
               const columns = Math.max(1, width);
               const framed = columns >= 12;
               const inner = Math.max(1, columns - (framed ? 6 : 0));
-              const lines = detailed ? report.details : report.summary;
+              const tab = spec[1];
+              let lines = report.summary;
+              if (tab === "details") lines = report.details;
+              else if (tab === "hotspots") lines = report.hotspots(inner);
               const wrapped = lines.flatMap((line) => {
                 let tone: "warning" | "accent" | "text" = "text";
                 if (line.startsWith("!")) tone = "warning";
@@ -199,19 +241,17 @@ export class StatsView {
               };
               const title = theme.bold(theme.fg("accent", "Pair Programmer"));
               const position = `${String(offset + 1)}–${String(Math.min(offset + pageSize, wrapped.length))}/${String(wrapped.length)}`;
-              const mode = detailed ? "overview" : "details";
+              const others = TABS.filter(([, name]) => name !== tab);
+              const tabs = others
+                .map(([key, name]) => `${key} ${name}`)
+                .join("  ");
               const hint =
-                inner >= 52
-                  ? `↑↓ scroll  d ${mode}  r refresh  esc close  ${position}`
-                  : `↑↓  d ${mode}  r refresh  q close`;
+                inner >= 64
+                  ? `↑↓ scroll  ${tabs}  r refresh  esc  ${position}`
+                  : `↑↓  ${others.map(([key]) => key).join(" ")}  r  q close`;
               const body = [
                 row(title),
-                row(
-                  theme.fg(
-                    "dim",
-                    detailed ? "Detailed accounting" : "Session overview",
-                  ),
-                ),
+                row(theme.fg("dim", spec[2])),
                 row(""),
                 ...wrapped.slice(offset, offset + pageSize).map(row),
                 row(""),
@@ -234,8 +274,9 @@ export class StatsView {
               )
                 close?.();
               else {
-                if (data === "d") {
-                  detailed = !detailed;
+                const next = TAB_BY_KEY.get(data);
+                if (next !== undefined) {
+                  spec = next === spec ? OVERVIEW : next;
                   offset = 0;
                 } else if (data === "r") {
                   report = read();

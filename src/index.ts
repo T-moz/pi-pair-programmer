@@ -28,7 +28,12 @@ import {
   type PairStats,
   type ReviewOutcome,
 } from "./pair-stats.js";
-import { StatsView, statsLines, statsSummary } from "./stats-view.js";
+import {
+  StatsView,
+  statsHotspots,
+  statsLines,
+  statsSummary,
+} from "./stats-view.js";
 import { StatusOverlay, type StatusTone } from "./status-overlay.js";
 import { ReviewFeed } from "./review-feed.js";
 import { ReviewSidebar } from "./review-sidebar.js";
@@ -1054,6 +1059,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
         return {
           summary: statsSummary(snapshot, store),
           details: statsLines(snapshot, store),
+          hotspots: (width: number) => statsHotspots(store, width),
         };
       });
     },
