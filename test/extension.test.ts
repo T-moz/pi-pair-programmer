@@ -186,6 +186,7 @@ async function setup(
   command: (name: string) => Promise<void>;
   decide: DecisionTool["execute"];
   sendMessage: Mock<ExtensionAPI["sendMessage"]>;
+  isIdle: Mock<() => boolean>;
   notify: ReturnType<typeof vi.fn>;
   entries: JournalEntry[];
   failEntry: (error?: Error) => void;
@@ -229,6 +230,7 @@ async function setup(
   let entryAttempts = 0;
   const notify = vi.fn();
   const sendMessage = vi.fn<ExtensionAPI["sendMessage"]>();
+  const isIdle = vi.fn<() => boolean>(() => false);
   let decide: DecisionTool["execute"] | undefined;
   pairProgrammer({
     on(name: string, handler: Handler) {
@@ -263,6 +265,7 @@ async function setup(
     cwd,
     model: { provider: "openai", id: "gpt-5" },
     modelRegistry: host === "pi" ? { streamSimple: vi.fn() } : {},
+    isIdle,
     sessionManager: {
       getBranch: () => entries,
       getHeader: vi.fn(() => ({ id: "fresh-session" })),
@@ -288,6 +291,7 @@ async function setup(
     },
     decide,
     sendMessage,
+    isIdle,
     notify,
     entries,
     failEntry: (error?: Error) => {
@@ -484,6 +488,238 @@ it("delivers a finding once when concurrent reviewers report it before either st
       entry.data.action === "deliver" ? (entry.data.ids ?? []) : [],
     ),
   ).toEqual([findings(environment.entries)[0]?.id]);
+  await environment.emit("session_shutdown");
+});
+
+it.each(["pi", "omp"] as const)(
+  "%s wakes an idle agent once for a burst of completions",
+  async (host) => {
+    const environment = await setup(host);
+    environment.isIdle.mockReturnValue(true);
+    const reviews = Array.from({ length: 4 }, () =>
+      Promise.withResolvers<ProposedFinding[]>(),
+    );
+    let index = 0;
+    vi.mocked(reviewFile).mockImplementation(
+      () => reviews[index++]?.promise ?? Promise.resolve([]),
+    );
+    for (const name of ["first.ts", "second.ts"]) {
+      await fsPromises.writeFile(
+        path.join(environment.cwd, name),
+        "export const value = 1;\n",
+      );
+      await environment.emit("tool_result", {
+        toolName: "write",
+        input: { path: name },
+        isError: false,
+      });
+    }
+    await advanceReviews(() => {
+      expect(reviewFile).toHaveBeenCalledTimes(4);
+    });
+    for (const [position, review] of reviews.entries())
+      review.resolve([
+        {
+          line: 1,
+          title: `Issue ${String(position)}`,
+          quote: "value",
+          evidence: "Concrete consequence",
+        },
+      ]);
+    await vi.waitFor(() => {
+      expect(findings(environment.entries)).toHaveLength(4);
+    });
+    expect(environment.sendMessage).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(300);
+    expect(environment.sendMessage).toHaveBeenCalledOnce();
+    expect(environment.sendMessage.mock.calls[0]?.[1]).toEqual(
+      host === "pi"
+        ? { triggerTurn: true }
+        : { deliverAs: "nextTurn", triggerTurn: true },
+    );
+    for (const finding of findings(environment.entries))
+      expect(environment.sendMessage.mock.calls[0]?.[0].content).toContain(
+        finding.id,
+      );
+    vi.mocked(reviewFile).mockResolvedValue([
+      { line: 1, title: "Later", quote: "value", evidence: "Next burst" },
+    ]);
+    await fsPromises.writeFile(
+      path.join(environment.cwd, "second.ts"),
+      "export const value = 2;\n",
+    );
+    await environment.emit("tool_result", {
+      toolName: "edit",
+      input: { path: "second.ts" },
+      isError: false,
+    });
+    await environment.emit("agent_start");
+    await advanceReviews(() => {
+      expect(reviewFile).toHaveBeenCalledTimes(6);
+    });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(environment.sendMessage).toHaveBeenCalledOnce();
+    await environment.emit("session_shutdown");
+  },
+);
+
+it("defers completions of a busy agent to the next boundary and wakes when its run settles", async () => {
+  const environment = await setup("pi");
+  vi.mocked(reviewFile).mockResolvedValue([inheritedProposal]);
+  await fsPromises.writeFile(
+    path.join(environment.cwd, "change.ts"),
+    inheritedSource,
+  );
+  await environment.emit("tool_result", {
+    toolName: "write",
+    input: { path: "change.ts" },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(findings(environment.entries)).toHaveLength(2);
+  });
+  await vi.advanceTimersByTimeAsync(300);
+  expect(environment.sendMessage).not.toHaveBeenCalled();
+  await environment.emit("turn_end");
+  expect(environment.sendMessage).toHaveBeenLastCalledWith(
+    expect.objectContaining({ customType: "pair-programmer-findings" }),
+    { deliverAs: "nextTurn", triggerTurn: false },
+  );
+  environment.isIdle.mockReturnValue(true);
+  await environment.emit("agent_settled");
+  expect(environment.sendMessage).toHaveBeenCalledTimes(2);
+  expect(environment.sendMessage).toHaveBeenLastCalledWith(
+    expect.objectContaining({ customType: "pair-programmer-findings" }),
+    { triggerTurn: true },
+  );
+  await environment.emit("agent_start");
+  await environment.emit("agent_settled");
+  expect(environment.sendMessage).toHaveBeenCalledTimes(2);
+  await environment.emit("session_shutdown");
+});
+
+it("does not wake an idle agent for findings superseded before the wake", async () => {
+  const environment = await setup("pi");
+  environment.isIdle.mockReturnValue(true);
+  const file = path.join(environment.cwd, "change.ts");
+  await fsPromises.writeFile(file, inheritedSource);
+  vi.mocked(reviewFile).mockResolvedValue([inheritedProposal]);
+  await environment.emit("tool_result", {
+    toolName: "write",
+    input: { path: file },
+    isError: false,
+  });
+  await vi.advanceTimersByTimeAsync(150);
+  await vi.waitFor(() => {
+    expect(findings(environment.entries)).toHaveLength(2);
+  });
+  vi.mocked(reviewFile).mockResolvedValue([]);
+  await fsPromises.writeFile(file, "export const fixed = true;\n");
+  await environment.emit("tool_result", {
+    toolName: "edit",
+    input: { path: file },
+    isError: false,
+  });
+  await vi.advanceTimersByTimeAsync(130);
+  await vi.waitFor(() => {
+    expect(reviewFile).toHaveBeenCalledTimes(4);
+  });
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(environment.sendMessage).not.toHaveBeenCalled();
+  await environment.emit("session_shutdown");
+});
+
+it("does not wake an agent that already saw its outstanding findings", async () => {
+  const environment = await setup("pi");
+  vi.mocked(reviewFile).mockResolvedValue([inheritedProposal]);
+  await fsPromises.writeFile(
+    path.join(environment.cwd, "change.ts"),
+    inheritedSource,
+  );
+  await environment.emit("tool_result", {
+    toolName: "write",
+    input: { path: "change.ts" },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(findings(environment.entries)).toHaveLength(2);
+  });
+  await environment.emit("before_agent_start");
+  const [message] = environment.sendMessage.mock.calls[0] ?? [];
+  await environment.emit("context", {
+    messages: [{ ...message, role: "custom" }],
+  });
+  environment.isIdle.mockReturnValue(true);
+  await environment.emit("agent_settled");
+  expect(environment.sendMessage).toHaveBeenCalledOnce();
+  await environment.emit("tool_call", { toolName: "bash", input: {} });
+  expect(environment.sendMessage).toHaveBeenCalledOnce();
+  await environment.emit("session_shutdown");
+});
+
+it.each([
+  { willContinue: true, wakes: false },
+  { willContinue: false, wakes: true },
+  { willContinue: undefined, wakes: true },
+])(
+  "OMP wakes at a final agent end ($willContinue) even before reporting idle",
+  async ({ willContinue, wakes }) => {
+    const environment = await setup("omp");
+    vi.mocked(reviewFile).mockResolvedValue([inheritedProposal]);
+    await fsPromises.writeFile(
+      path.join(environment.cwd, "change.ts"),
+      inheritedSource,
+    );
+    await environment.emit("tool_result", {
+      toolName: "write",
+      input: { path: "change.ts" },
+      isError: false,
+    });
+    await advanceReviews(() => {
+      expect(findings(environment.entries)).toHaveLength(2);
+    });
+    await environment.emit("agent_end", { messages: [], willContinue });
+    expect(environment.sendMessage.mock.calls).toEqual(
+      wakes
+        ? [
+            [
+              expect.objectContaining({
+                customType: "pair-programmer-findings",
+              }),
+              { deliverAs: "nextTurn", triggerTurn: true },
+            ],
+          ]
+        : [],
+    );
+    await environment.emit("session_shutdown");
+  },
+);
+
+it("treats a stale host context as busy and ignores Pi agent end", async () => {
+  const environment = await setup("pi");
+  environment.isIdle.mockImplementation(() => {
+    throw new Error("stale extension context");
+  });
+  vi.mocked(reviewFile).mockResolvedValue([inheritedProposal]);
+  await fsPromises.writeFile(
+    path.join(environment.cwd, "change.ts"),
+    inheritedSource,
+  );
+  await environment.emit("tool_result", {
+    toolName: "write",
+    input: { path: "change.ts" },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(findings(environment.entries)).toHaveLength(2);
+  });
+  await vi.advanceTimersByTimeAsync(1000);
+  await environment.emit("agent_end", { messages: [] });
+  await environment.emit("agent_settled");
+  environment.isIdle.mockReturnValue(true);
+  await environment.command("pair-programmer");
+  await environment.emit("agent_settled");
+  expect(environment.sendMessage).not.toHaveBeenCalled();
   await environment.emit("session_shutdown");
 });
 
