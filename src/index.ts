@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import type {
@@ -13,7 +13,16 @@ import {
   type TaskBaseline,
 } from "./change-evidence.js";
 import { FindingAdmission } from "./finding-admission.js";
-import { isInherited, reviewFile, type Host } from "./review-runner.js";
+import { createPairLogger, type PairLogger } from "./logger.js";
+import type { ModelCallObserver } from "./model-usage.js";
+import { PairStats, STATS_ENTRY, type ReviewOutcome } from "./pair-stats.js";
+import { StatsView, statsLines } from "./stats-view.js";
+import {
+  isInherited,
+  reviewFile,
+  ReviewTimeoutError,
+  type Host,
+} from "./review-runner.js";
 import { ReviewStore, type Finding } from "./review-store.js";
 import {
   DEFAULT_REVIEWERS,
@@ -26,6 +35,18 @@ import {
 const MAX_DELIVERY = 4;
 const DECISION_TOOL = "pair_programmer_decide";
 const WAKE_COALESCE_MS = 250;
+
+const pendingStatsKey = Symbol.for("pi-pair-programmer.pending-stats.v1");
+const retainedStats = Reflect.get(globalThis, pendingStatsKey) as
+  Map<string, PairStats> | undefined;
+const pendingStats = retainedStats ?? new Map<string, PairStats>();
+
+function retainPending(stats: PairStats): void {
+  const snapshot = stats.snapshot();
+  if (snapshot.incompleteJobs > 0 || snapshot.pendingWrites > 0)
+    pendingStats.set(stats.sessionId, stats);
+  else pendingStats.delete(stats.sessionId);
+}
 const ToolPathSchema = z.string();
 const ContinuingRunSchema = z.object({ willContinue: z.literal(true) });
 
@@ -36,6 +57,8 @@ const DecisionParameters = Type.Object({
 });
 
 interface ReviewJob {
+  id: string;
+  stats: PairStats;
   file: string;
   fullPath: string;
   revision: string;
@@ -118,9 +141,42 @@ function acceptedReview(finding: Finding, reason: string): string {
 }
 
 export default function pairProgrammer(pi: ExtensionAPI): void {
+  Reflect.set(globalThis, pendingStatsKey, pendingStats);
   const appendReviewEntry = (data: unknown): void => {
     pi.appendEntry("pair-programmer", data);
   };
+  let logger: PairLogger | undefined;
+  const logging = (async () => {
+    logger = await createPairLogger(pi);
+  })();
+  const statsView = new StatsView();
+  let activeContext: ExtensionContext | undefined;
+  let activeSessionId: string | undefined;
+  const appendStatsEntry = (data: { sessionId: string }): boolean => {
+    if (activeContext === undefined || data.sessionId !== activeSessionId)
+      return false;
+    try {
+      const manager = activeContext.sessionManager as Partial<
+        ExtensionContext["sessionManager"]
+      >;
+      const currentId = manager.getSessionId?.() ?? manager.getHeader?.()?.id;
+      if (currentId !== undefined && revisionOf(currentId) !== data.sessionId)
+        return false;
+    } catch {
+      return false;
+    }
+    try {
+      pi.appendEntry(STATS_ENTRY, data);
+      return true;
+    } catch (error) {
+      logger?.log("extension.persistence_failed", {
+        reasonCode: "persistence_failed",
+      });
+      throw error;
+    }
+  };
+  let stats = new PairStats(randomUUID(), appendStatsEntry);
+  const cancelJobs = new Map<AbortController, () => void>();
   let store = new ReviewStore(appendReviewEntry);
   let admission = new FindingAdmission(store);
   let reviewers: readonly ReviewerConfig[] = DEFAULT_REVIEWERS;
@@ -138,7 +194,12 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   let wakePending = false;
   const controllers = new Map<AbortController, string>();
 
-  function stop(): void {
+  function stop(reasonCode: "session_change" | "shutdown" | "disabled"): void {
+    logger?.log("session.stop", { sessionId: stats.sessionId, reasonCode });
+    statsView.close();
+    for (const cancel of cancelJobs.values()) cancel();
+    cancelJobs.clear();
+    retainPending(stats);
     generation += 1;
     unresolved = 0;
     versions.clear();
@@ -180,6 +241,11 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     );
     const ids = batch.map((finding) => finding.id);
     store.deliver(ids);
+    logger?.log("delivery.sent", {
+      sessionId: stats.sessionId,
+      count: ids.length,
+      reasonCode: waking === undefined ? "passive" : "ready",
+    });
     if (waking === undefined) return;
     wakePending = true;
     for (const id of ids) presented.add(id);
@@ -191,14 +257,39 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   }
 
   function wake(ctx: ExtensionContext, ending: boolean): void {
-    if (!store.enabled || wakePending) return;
-    if (!ending && !idle(ctx)) return;
+    if (!store.enabled || wakePending) {
+      logger?.log("delivery.wake", {
+        sessionId: stats.sessionId,
+        reasonCode: wakePending ? "wake_pending" : "disabled",
+      });
+      return;
+    }
+    if (!ending && !idle(ctx)) {
+      logger?.log("delivery.wake", {
+        sessionId: stats.sessionId,
+        reasonCode: "busy",
+      });
+      return;
+    }
     const outstanding = store.outstanding();
     if (outstanding.length === 0) {
       const batch = deliverable();
+      logger?.log("delivery.wake", {
+        sessionId: stats.sessionId,
+        reasonCode: batch.length > 0 ? "ready" : "no_findings_ready",
+      });
       if (batch.length > 0) send(batch, hostOf(ctx));
     } else if (outstanding.some((finding) => !presented.has(finding.id))) {
+      logger?.log("delivery.wake", {
+        sessionId: stats.sessionId,
+        reasonCode: "outstanding",
+      });
       send(outstanding, hostOf(ctx));
+    } else {
+      logger?.log("delivery.wake", {
+        sessionId: stats.sessionId,
+        reasonCode: "already_presented",
+      });
     }
   }
 
@@ -211,14 +302,81 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
 
   function start(job: ReviewJob): void {
     const controller = new AbortController();
-    controllers.set(controller, job.key);
-    void runJob(job, controller.signal)
-      .catch(() => {
-        return;
-      })
-      .finally(() => {
-        controllers.delete(controller);
+    const started = performance.now();
+    const fields = {
+      sessionId: job.stats.sessionId,
+      jobId: job.id,
+      reviewerId: reviewerKey(job.reviewer),
+      modelId: revisionOf(job.model),
+    };
+    const reviewState: { outcome: ReviewOutcome } = { outcome: "success" };
+    let finished = false;
+    const finish = (result: ReviewOutcome, settled = true): void => {
+      if (finished) return;
+      finished = true;
+      const durationMs = performance.now() - started;
+      job.stats.finish(job.id, result, durationMs, settled);
+      logger?.log("review.finished", {
+        ...fields,
+        outcome: result,
+        durationMs,
       });
+    };
+    const onModelCall: ModelCallObserver = (observation) => {
+      job.stats.observe(job.id, observation);
+      logger?.log("model.finished", {
+        ...fields,
+        modelId: revisionOf(
+          JSON.stringify([
+            observation.provider,
+            observation.model,
+            observation.requestedModel,
+          ]),
+        ),
+        stage: observation.stage,
+        outcome: observation.outcome,
+        durationMs: observation.durationMs,
+        ...observation.usage,
+      });
+      if (observation.stage === "review")
+        reviewState.outcome = observation.outcome;
+      else if (
+        observation.outcome === "failed" ||
+        observation.outcome === "timeout"
+      ) {
+        logger?.log("finding.filtered", {
+          ...fields,
+          stage: observation.stage,
+          reasonCode:
+            observation.stage === "attribution"
+              ? "attribution_fallback"
+              : "dedup_fallback",
+        });
+      }
+    };
+    controllers.set(controller, job.key);
+    cancelJobs.set(controller, () => {
+      finish("cancelled", false);
+    });
+    job.stats.start(job.id);
+    logger?.log("review.started", fields);
+    void (async () => {
+      try {
+        const result = await runJob(job, controller.signal, onModelCall);
+        const settledOutcome =
+          reviewState.outcome === "success" ? result : reviewState.outcome;
+        finish(controller.signal.aborted ? "cancelled" : settledOutcome);
+      } catch (error) {
+        const failure =
+          error instanceof ReviewTimeoutError ? "timeout" : "failed";
+        finish(controller.signal.aborted ? "cancelled" : failure);
+      } finally {
+        job.stats.settle(job.id);
+        retainPending(job.stats);
+        controllers.delete(controller);
+        cancelJobs.delete(controller);
+      }
+    })();
   }
 
   function active(job: ReviewJob): boolean {
@@ -242,7 +400,11 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     }
   }
 
-  async function runJob(job: ReviewJob, signal: AbortSignal): Promise<void> {
+  async function runJob(
+    job: ReviewJob,
+    signal: AbortSignal,
+    onModelCall: ModelCallObserver,
+  ): Promise<ReviewOutcome> {
     const proposed = await reviewFile({
       host: job.host,
       cwd: job.cwd,
@@ -251,12 +413,20 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       file: job.file,
       source: job.source,
       signal,
+      onModelCall,
     });
-    if (!(await current(job))) return;
+    if (!(await current(job))) {
+      logger?.log("review.skipped", {
+        sessionId: job.stats.sessionId,
+        jobId: job.id,
+        reasonCode: "stale",
+      });
+      return "obsolete";
+    }
     const reviewer = reviewerKey(job.reviewer);
     if (proposed.length === 0) {
       reviewed.set(`${job.key}:${reviewer}:${job.model}`, job.revision);
-      return;
+      return "success";
     }
     const judged = await Promise.all(
       proposed.map(async (finding) => ({
@@ -272,10 +442,17 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
             signal,
           ),
           signal,
+          onModelCall,
         }),
       })),
     );
-    if (signal.aborted || !(await current(job))) return;
+    logger?.log("finding.filtered", {
+      sessionId: job.stats.sessionId,
+      jobId: job.id,
+      reasonCode: "inherited",
+      count: judged.filter(({ inherited }) => inherited).length,
+    });
+    if (signal.aborted || !(await current(job))) return "obsolete";
     const result = await admission.admit({
       file: job.file,
       reviewer,
@@ -285,14 +462,21 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       ),
       signal,
       isCurrent: () => current(job),
+      onModelCall,
     });
-    if (result === "obsolete") return;
+    logger?.log("finding.admission", {
+      sessionId: job.stats.sessionId,
+      jobId: job.id,
+      outcome: result,
+    });
+    if (result === "obsolete") return "obsolete";
     if (result === "added") scheduleWake(job.ctx);
     reviewed.set(`${job.key}:${reviewer}:${job.model}`, job.revision);
+    return "success";
   }
 
   function startReviews(
-    base: Omit<ReviewJob, "model" | "reviewer">,
+    base: Omit<ReviewJob, "model" | "reviewer" | "id" | "stats">,
     ctx: ExtensionContext,
   ): void {
     const jobs: ReviewJob[] = [];
@@ -300,13 +484,30 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     for (const reviewer of matchingReviewers(base.file, reviewers)) {
       let model = reviewer.model;
       if (model === "current") {
-        if (ctx.model === undefined) continue;
+        if (ctx.model === undefined) {
+          logger?.log("review.skipped", {
+            sessionId: stats.sessionId,
+            reasonCode: "missing_model",
+          });
+          continue;
+        }
         model = `${ctx.model.provider}/${ctx.model.id}`;
       }
       const key = `${base.file}:${reviewerKey(reviewer)}:${model}`;
-      if (reviewed.get(key) === base.revision || keys.has(key)) continue;
+      if (reviewed.get(key) === base.revision || keys.has(key)) {
+        logger?.log("review.skipped", {
+          sessionId: stats.sessionId,
+          reasonCode: keys.has(key) ? "duplicate_config" : "unchanged",
+        });
+        continue;
+      }
       keys.add(key);
-      jobs.push({ ...base, model, reviewer });
+      const id = randomUUID();
+      logger?.log("review.scheduled", {
+        sessionId: stats.sessionId,
+        jobId: id,
+      });
+      jobs.push({ ...base, model, reviewer, id, stats });
     }
     for (const job of jobs) start(job);
   }
@@ -405,7 +606,10 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       if (lexical !== file) store.discardStale(lexical, "missing");
       versions.set(file, version);
       for (const [controller, activeFile] of controllers) {
-        if (activeFile === file) controller.abort();
+        if (activeFile === file) {
+          cancelJobs.get(controller)?.();
+          controller.abort();
+        }
       }
       clearTimeout(timers.get(file));
       timers.set(
@@ -461,13 +665,32 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     event: { reason?: string },
     ctx: ExtensionContext,
   ): Promise<void> {
-    stop();
+    activeContext = ctx;
+    activeSessionId = undefined;
+    stop("session_change");
     const session = generation;
     const resolvedRoot = await realpath(ctx.cwd);
     if (session !== generation) return;
     root = resolvedRoot;
+    const manager = ctx.sessionManager as Partial<
+      ExtensionContext["sessionManager"]
+    >;
+    const sessionId = revisionOf(
+      manager.getSessionId?.() ?? manager.getHeader?.()?.id ?? randomUUID(),
+    );
+    const restored =
+      pendingStats.get(sessionId) ?? new PairStats(sessionId, appendStatsEntry);
+    restored.setAppender(appendStatsEntry);
+    restored.restore(manager.getEntries?.() ?? []);
+    stats = restored;
+    activeSessionId = sessionId;
+    stats.flush();
+    retainPending(stats);
     store = new ReviewStore(appendReviewEntry, ctx.sessionManager.getBranch());
     admission = new FindingAdmission(store);
+    await logging;
+    if (session !== generation) return;
+    logger?.log("session.start", { sessionId });
     await assessBaseline(event, ctx, session);
     if (session !== generation) return;
     try {
@@ -476,11 +699,26 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     } catch (error) {
       if (session !== generation) return;
       reviewers = [];
+      logger?.log("review.skipped", {
+        sessionId: stats.sessionId,
+        reasonCode: "configuration_failed",
+      });
       ctx.ui.notify(String(error), "warning");
     }
   }
 
   pi.on("session_start", startSession);
+  const beforeSessionChange = (): void => {
+    stop("session_change");
+  };
+  pi.on("session_before_switch", beforeSessionChange);
+  pi.on("session_before_fork", beforeSessionChange);
+  pi.on("session_before_tree", beforeSessionChange);
+  const onOmpBeforeBranch = pi.on.bind(pi) as unknown as (
+    name: "session_before_branch",
+    handler: () => void,
+  ) => void;
+  onOmpBeforeBranch("session_before_branch", beforeSessionChange);
   const onOmpSession = pi.on.bind(pi) as unknown as (
     name: "session_switch" | "session_branch",
     handler: (
@@ -493,10 +731,21 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     startSession({ reason: "fork" }, ctx),
   );
 
+  pi.on("session_tree", (_event, ctx) => startSession({ reason: "tree" }, ctx));
+
   pi.on("session_shutdown", () => {
-    stop();
+    stop("shutdown");
+    activeContext = undefined;
+    activeSessionId = undefined;
     replaceBaseline(undefined);
     baselineSession = undefined;
+    const sessionId = stats.sessionId;
+
+    void (async () => {
+      await logging;
+      logger?.log("extension.shutdown", { sessionId });
+      await logger?.close();
+    })();
   });
 
   pi.on("tool_result", (event, ctx) => {
@@ -603,6 +852,10 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
         params.decision,
         params.reason,
       );
+      logger?.log("finding.verdict", {
+        sessionId: stats.sessionId,
+        outcome: saved ? params.decision : "invalid",
+      });
       if (saved && params.decision === "accept" && finding !== undefined) {
         pi.sendMessage(
           {
@@ -631,10 +884,21 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     description: "Toggle background peer review on or off",
     handler: (_args, ctx) => {
       const enabled = !store.enabled;
-      if (!enabled) stop();
+      if (!enabled) stop("disabled");
       store.setEnabled(enabled);
+      logger?.log("extension.toggle", {
+        sessionId: stats.sessionId,
+        outcome: enabled ? "on" : "off",
+      });
       ctx.ui.notify(`Pair Programmer ${enabled ? "on" : "off"}.`, "info");
       return Promise.resolve();
     },
+  });
+
+  pi.registerCommand("pair-stats", {
+    description:
+      "Show on-demand Pair Programmer activity, findings and extension usage",
+    handler: (_args, ctx) =>
+      statsView.open(ctx, statsLines(stats.snapshot(), store)),
   });
 }

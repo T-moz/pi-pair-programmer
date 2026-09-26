@@ -24,6 +24,46 @@ function session(): {
 }
 
 describe("ReviewStore", () => {
+  it("derives mutually exclusive finding outcomes from the selected branch", () => {
+    const { store, entries, append } = session();
+    for (const id of [
+      "pending",
+      "waiting",
+      "accepted",
+      "rejected",
+      "discarded",
+    ])
+      store.add(finding(id, `${id}.ts`));
+    store.deliver(["waiting", "accepted", "rejected"]);
+    const branchPoint = [...entries];
+    store.decide("accepted", "accept", "Confirmed");
+    store.decide("rejected", "reject", "Expected behavior");
+    store.discardStale("discarded.ts", "new-revision");
+    expect(store.summary()).toEqual({
+      pending: 1,
+      outstanding: 1,
+      accepted: 1,
+      rejected: 1,
+      discarded: 1,
+    });
+    const branched = new ReviewStore(append, branchPoint);
+    expect(branched.summary()).toEqual({
+      pending: 2,
+      outstanding: 3,
+      accepted: 0,
+      rejected: 0,
+      discarded: 0,
+    });
+    branched.setEnabled(false);
+    expect(branched.summary()).toEqual({
+      pending: 0,
+      outstanding: 3,
+      accepted: 0,
+      rejected: 0,
+      discarded: 2,
+    });
+  });
+
   it("queues findings, delivers only selected ids, and preserves decisions in history", () => {
     const { store, entries } = session();
     const first = finding("first");

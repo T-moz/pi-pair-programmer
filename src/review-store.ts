@@ -66,6 +66,30 @@ export class ReviewStore {
     return this.active;
   }
 
+  summary(): {
+    pending: number;
+    outstanding: number;
+    accepted: number;
+    rejected: number;
+    discarded: number;
+  } {
+    const counts = {
+      pending: 0,
+      outstanding: 0,
+      accepted: 0,
+      rejected: 0,
+      discarded: 0,
+    };
+    for (const state of this.findings.values()) {
+      if (state.verdict === "accept") counts.accepted += 1;
+      else if (state.verdict === "reject") counts.rejected += 1;
+      else if (state.discarded) counts.discarded += 1;
+      else if (state.delivered) counts.outstanding += 1;
+      else counts.pending += 1;
+    }
+    return counts;
+  }
+
   setEnabled(enabled: boolean): void {
     if (this.active === enabled) return;
     if (!enabled) {
