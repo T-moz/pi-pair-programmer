@@ -396,6 +396,8 @@ it.each(["pi", "omp"] as const)(
             },
           };
     const gatedCalls = [
+      { toolName: "read", input: { path: "xd://another_tool" } },
+      { toolName: "read", input: {} },
       { toolName: "bash", input: { command: "npm run check" } },
       { toolName: "todo", input: { op: "done", task: "Verify" } },
       { toolName: "edit", input: { path: "xd://pair_programmer_decide" } },
@@ -405,8 +407,8 @@ it.each(["pi", "omp"] as const)(
         "xd://another_tool",
         "xd://pair_programmer_decide/",
         "xd://pair_programmer_decide?extra=true",
+        "xd://Pair_Programmer_Decide",
         "xd://pair_programmer_decide_extra",
-        " xd://pair_programmer_decide",
       ].map((target) => ({
         toolName: "write",
         input: { path: target, content: JSON.stringify(params) },
@@ -416,6 +418,17 @@ it.each(["pi", "omp"] as const)(
       expect(await environment.emit("tool_call", call)).toMatchObject({
         block: true,
       });
+    }
+    for (const target of [
+      "xd://pair_programmer_decide",
+      " XD://pair_programmer_decide\n",
+    ]) {
+      expect(
+        await environment.emit("tool_call", {
+          toolName: "read",
+          input: { path: target },
+        }),
+      ).toBeUndefined();
     }
     expect(await environment.emit("tool_call", decisionCall)).toBeUndefined();
     expect(
@@ -1939,7 +1952,7 @@ it("contains failed background persistence and resumes after storage recovers", 
     ).toBe(true);
   });
   expect(
-    await environment.emit("tool_call", { toolName: "read" }),
+    await environment.emit("tool_call", { toolName: "read", input: {} }),
   ).toBeUndefined();
   await environment.emit("session_shutdown");
 });
