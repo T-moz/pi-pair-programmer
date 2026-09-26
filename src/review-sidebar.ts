@@ -35,12 +35,15 @@ export function truncatePath(file: string, width: number): string {
   return start === -1 ? "…" : `…${graphemes.slice(start).join("")}`;
 }
 
+/** Cuts text to `width` columns with a plain ellipsis (no stray reset codes). */
+function clip(text: string, width: number): string {
+  if (visibleWidth(text) <= width) return text;
+  return width <= 0 ? "" : `${sliceByColumn(text, 0, width - 1).trimEnd()}…`;
+}
+
 /** Joins left and right text on one row, shrinking the right side first. */
 function spread(left: string, right: string, width: number): string {
-  const room = Math.max(0, width - visibleWidth(left) - 1);
-  let shown = right;
-  if (visibleWidth(right) > room)
-    shown = room === 0 ? "" : `${sliceByColumn(right, 0, room - 1).trimEnd()}…`;
+  const shown = clip(right, Math.max(0, width - visibleWidth(left) - 1));
   const gap = Math.max(1, width - visibleWidth(left) - visibleWidth(shown));
   return `${left}${" ".repeat(gap)}${shown}`;
 }
@@ -72,6 +75,8 @@ function summary(findings: readonly Decided[]): {
   icon: string;
   color: Color;
   text: string;
+  accepted: number;
+  rejected: number;
 } {
   const accepted = findings.filter((f) => f.status === "accepted").length;
   const rejected = findings.length - accepted;
@@ -82,45 +87,50 @@ function summary(findings: readonly Decided[]): {
     .filter(Boolean)
     .join(" · ");
   return accepted > 0
-    ? { icon: "◆", color: "warning", text }
-    : { icon: "✗", color: "muted", text };
+    ? { icon: "◆", color: "warning", text, accepted, rejected }
+    : { icon: "✗", color: "muted", text, accepted, rejected };
+}
+
+/** Compact verdict counts for the collapsed row, e.g. `1✓ 2✗`. */
+function counts(theme: Painter, accepted: number, rejected: number): string {
+  return [
+    accepted > 0 ? theme.fg("success", `${String(accepted)}✓`) : "",
+    rejected > 0 ? theme.fg("muted", `${String(rejected)}✗`) : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
 }
 
 function entryLines(
   entry: FeedEntry,
   findings: readonly Decided[],
+  open: boolean,
   theme: Painter,
   width: number,
   now: number,
 ): string[] {
-  const state =
-    entry.phase === "running"
-      ? {
-          icon: SPINNER.charAt(Math.floor(now / 250) % SPINNER.length),
-          color: "accent" as const,
-          text: "reviewing…",
-        }
-      : summary(findings);
+  const running = entry.phase === "running";
+  const state = summary(findings);
+  const icon = running
+    ? theme.fg("accent", SPINNER.charAt(Math.floor(now / 250) % SPINNER.length))
+    : theme.fg(state.color, state.icon);
   const time = theme.fg(
     "dim",
     seconds(entry.durationMs ?? Math.max(0, now - entry.startedAt)),
   );
+  const marker = theme.fg("dim", open ? "▾" : "▸");
+  const tail = running
+    ? time
+    : `${counts(theme, state.accepted, state.rejected)} ${marker}`;
+  const name = clip(entry.reviewer, Math.max(1, Math.floor(width / 3)));
+  const right = `${theme.fg("dim", name)}  ${tail}`;
   const file = truncatePath(
     entry.file,
-    Math.max(1, width - visibleWidth(time) - 3),
+    Math.max(1, width - visibleWidth(right) - 3),
   );
-  const lines = [
-    spread(
-      `${theme.fg(state.color, state.icon)} ${theme.bold(file)}`,
-      time,
-      width,
-    ),
-    spread(
-      `  ${theme.fg(state.color, state.text)}`,
-      theme.fg("dim", entry.reviewer),
-      width,
-    ),
-  ];
+  const lines = [spread(`${icon} ${theme.bold(file)}`, right, width)];
+  if (running || !open) return lines;
+  lines.push(spread(`  ${theme.fg(state.color, state.text)}`, time, width));
   for (const finding of findings) {
     const style = FINDING[finding.status];
     lines.push(
@@ -136,15 +146,22 @@ function entryLines(
   return lines;
 }
 
-/** Renders the framed sidebar at an exact width, at most `height` rows. */
-export function renderSidebar(
+export interface SidebarLayout {
+  lines: string[];
+  /** Review id owning each rendered row, for click targeting. */
+  rows: (string | undefined)[];
+}
+
+/** Lays out the framed sidebar at an exact width, at most `height` rows. */
+export function layoutSidebar(
   entries: readonly FeedEntry[],
   lookup: Lookup,
   theme: Painter,
   width: number,
   height: number,
   now = Date.now(),
-): string[] {
+  expanded: ReadonlySet<string> = new Set(),
+): SidebarLayout {
   const inner = Math.max(1, width - 4);
   const visible = entries.flatMap((entry) => {
     const findings = decided(entry, lookup);
@@ -168,24 +185,32 @@ export function renderSidebar(
     ),
     "",
   ];
-  const footer = ["", theme.fg("dim", "alt+r hide · /pair-stats totals")];
+  const footer = ["", theme.fg("dim", "click to expand · alt+r hide")];
   const room = Math.max(0, height - 2 - header.length - footer.length);
   const body: string[] = [];
-  if (visible.length === 0)
+  const owners: (string | undefined)[] = [];
+  if (visible.length === 0) {
     body.push(
       theme.fg("muted", "Nothing to show yet."),
       theme.fg("dim", "Running reviews and decided"),
       theme.fg("dim", "findings appear here."),
     );
+    owners.push(undefined, undefined, undefined);
+  }
   let shown = 0;
   for (const { entry, findings } of visible) {
-    const block = [
-      ...(shown === 0 ? [] : [""]),
-      ...entryLines(entry, findings, theme, inner, now),
-    ];
+    const gap = shown === 0 ? [] : [""];
     const reserve = shown + 1 < visible.length ? 1 : 0;
-    if (body.length + block.length + reserve > room) break;
-    body.push(...block);
+    const fits = (lines: readonly string[]): boolean =>
+      body.length + gap.length + lines.length + reserve <= room;
+    const open = expanded.has(entry.id);
+    let lines = entryLines(entry, findings, open, theme, inner, now);
+    // An expanded review that no longer fits falls back to its collapsed row.
+    if (open && !fits(lines))
+      lines = entryLines(entry, findings, false, theme, inner, now);
+    if (!fits(lines)) break;
+    body.push(...gap, ...lines);
+    owners.push(...gap.map(() => ""), ...lines.map(() => entry.id));
     shown += 1;
   }
   if (shown < visible.length) {
@@ -196,13 +221,28 @@ export function renderSidebar(
         `+${String(hidden)} earlier review${hidden === 1 ? "" : "s"}`,
       ),
     );
+    owners.push(undefined);
   }
   const content = [...header, ...body].slice(0, room + header.length);
-  return [
-    theme.fg("borderMuted", `╭${"─".repeat(Math.max(0, width - 2))}╮`),
-    ...[...content, ...footer].map(row),
-    theme.fg("borderMuted", `╰${"─".repeat(Math.max(0, width - 2))}╯`),
-  ];
+  return {
+    lines: [
+      theme.fg("borderMuted", `╭${"─".repeat(Math.max(0, width - 2))}╮`),
+      ...[...content, ...footer].map(row),
+      theme.fg("borderMuted", `╰${"─".repeat(Math.max(0, width - 2))}╯`),
+    ],
+    rows: [
+      ...Array.from<undefined>({ length: 1 + header.length }),
+      ...owners.slice(0, content.length - header.length),
+      ...Array.from<undefined>({ length: footer.length + 1 }),
+    ],
+  };
+}
+
+/** Renders the framed sidebar at an exact width, at most `height` rows. */
+export function renderSidebar(
+  ...args: Parameters<typeof layoutSidebar>
+): string[] {
+  return layoutSidebar(...args).lines;
 }
 
 /** Togglable, non-capturing right-hand overlay showing the live review feed. */
@@ -213,6 +253,8 @@ export class ReviewSidebar {
   private close: (() => void) | undefined;
   private requestRender: (() => void) | undefined;
   private ticker: NodeJS.Timeout | undefined;
+  /** Reviews the user expanded by click; ids are unique per review. */
+  private readonly expanded = new Set<string>();
 
   constructor(entries: () => readonly FeedEntry[], lookup: Lookup) {
     this.entries = entries;
@@ -277,15 +319,31 @@ export class ReviewSidebar {
               tui.requestRender();
           }, 250);
           this.ticker.unref();
+          let rows: SidebarLayout["rows"] = [];
           return {
-            render: (width: number): string[] =>
-              renderSidebar(
+            render: (width: number): string[] => {
+              const layout = layoutSidebar(
                 this.entries(),
                 this.lookup,
                 theme,
                 width,
                 Math.max(8, tui.terminal.rows - EDITOR_RESERVE),
-              ),
+                Date.now(),
+                this.expanded,
+              );
+              rows = layout.rows;
+              return layout.lines;
+            },
+            handleMouse: (event) => {
+              if (event.type !== "click" || event.button !== "left") return;
+              const id = rows[event.y];
+              const entry = this.entries().find(
+                (candidate) => candidate.id === id,
+              );
+              if (entry === undefined || entry.phase === "running") return;
+              if (!this.expanded.delete(entry.id)) this.expanded.add(entry.id);
+              return { handled: true, render: true };
+            },
             invalidate(): void {
               return;
             },

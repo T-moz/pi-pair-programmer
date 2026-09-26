@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 import { ReviewFeed } from "../src/review-feed.js";
 import {
@@ -39,7 +39,9 @@ const text = (
   width = 48,
   height = 60,
   now = 20_000,
-): string[] => renderSidebar(feed.list(), lookup, plain, width, height, now);
+  expanded: ReadonlySet<string> = new Set(feed.list().map(({ id }) => id)),
+): string[] =>
+  renderSidebar(feed.list(), lookup, plain, width, height, now, expanded);
 
 describe("renderSidebar", () => {
   it("frames an empty feed at its natural height", () => {
@@ -79,7 +81,6 @@ describe("renderSidebar", () => {
     for (const expected of [
       "Live reviews · 1 running",
       "live.ts",
-      "reviewing…",
       "1.0s",
       "rejected.ts",
       "12s",
@@ -124,9 +125,7 @@ describe("renderSidebar", () => {
     const single = new ReviewFeed();
     single.start("a", job, 0);
     single.start("b", job, 0);
-    expect(text(single, 40, 10).join("\n")).toContain(
-      "+1 earlier review\u{20}",
-    );
+    expect(text(single, 40, 9).join("\n")).toContain("+1 earlier review\u{20}");
     for (const line of text(feed, 38, 5)) expect(visibleWidth(line)).toBe(38);
   });
 
@@ -140,22 +139,38 @@ describe("renderSidebar", () => {
     expect(truncatePath("x.ts", 0)).toBe("…");
   });
 
-  it("shares a row between the outcome and a shortened reviewer name", () => {
+  it("collapses each review to one row of file, reviewer and verdict counts", () => {
     const feed = new ReviewFeed();
+    feed.start("done", { ...job, file: "src/deep/done.ts" }, 0);
+    feed.finish("done", "success", 8400);
+    feed.attach("done", ["accepted", "rejected"]);
     feed.start(
-      "a",
+      "live",
       {
         ...job,
+        file: "src/live.ts",
         reviewer: "a-very-long-reviewer-name-that-cannot-fit-beside-it",
       },
-      0,
+      19_000,
     );
-    const lines = text(feed, 40, 40).map((line) => line.slice(2, -2));
-    expect(lines[5]).toContain("reviewing…");
-    expect(lines[5]).toContain("a-very-long");
-    expect(lines[5]).not.toContain("gpt-5");
-    expect(lines[5]?.trimEnd()).toMatch(/…$/u);
-    expect(lines[6]?.trim()).toBe("");
+    const collapsed = text(feed, 44, 40, 20_000, new Set()).map((line) =>
+      line.slice(2, -2),
+    );
+    expect(collapsed[4]).toMatch(/^◐ src\/live\.ts +a-very-long-… {2}1\.0s$/u);
+    expect(collapsed[6]).toMatch(
+      /^◆ src\/deep\/done\.ts +entropy {2}1✓ 1✗ ▸$/u,
+    );
+    expect(collapsed[7]?.trim()).toBe("");
+    const open = text(feed, 44, 40).map((line) => line.slice(2, -2));
+    expect(open[4]).toContain("1.0s");
+    expect(open[5]?.trim()).toBe("");
+    expect(open[6]).toMatch(/1✓ 1✗ ▾$/u);
+    expect(open[7]).toMatch(/^ {2}1 accepted · 1 rejected +8\.4s$/u);
+    const rejectedOnly = new ReviewFeed();
+    rejectedOnly.start("r", job, 0);
+    rejectedOnly.finish("r", "success", 1);
+    rejectedOnly.attach("r", ["rejected"]);
+    expect(text(rejectedOnly, 44, 40, 0, new Set())[4]).toMatch(/✗ ▸/u);
     for (const width of [38, 12])
       for (const line of text(feed, width, 40))
         expect(visibleWidth(line)).toBe(width);
@@ -185,14 +200,16 @@ interface Host {
     visible: (columns: number) => boolean;
   };
   render: (width: number) => string[] | undefined;
+  click: (y: number, button?: string, type?: string) => unknown;
 }
 
-function host(mode = "tui"): Host {
+function host(mode = "tui", rows = 20): Host {
   const requestRender = vi.fn();
   const notify = vi.fn();
   const closed = vi.fn();
   let options: ReturnType<Host["options"]> | undefined;
   let render: ((width: number) => string[]) | undefined;
+  let mouse: ((event: TuiMouseEvent) => unknown) | undefined;
   const custom = vi.fn(
     async (
       factory: Factory,
@@ -203,7 +220,7 @@ function host(mode = "tui"): Host {
       const component = await factory(
         {
           requestRender,
-          terminal: { rows: 20 },
+          terminal: { rows },
         } as unknown as Parameters<Factory>[0],
         plain as unknown as Parameters<Factory>[1],
         {} as Parameters<Factory>[2],
@@ -214,6 +231,7 @@ function host(mode = "tui"): Host {
       );
       component.invalidate();
       render = (width) => component.render(width);
+      mouse = (event) => component.handleMouse?.(event);
       return done.promise;
     },
   );
@@ -232,6 +250,8 @@ function host(mode = "tui"): Host {
       return options;
     },
     render: (width) => render?.(width),
+    click: (y, button = "left", type = "click") =>
+      mouse?.({ type, button, y } as TuiMouseEvent),
   };
 }
 
@@ -270,6 +290,35 @@ describe("ReviewSidebar", () => {
     expect(tui.closed).toHaveBeenCalledTimes(1);
     vi.advanceTimersByTime(1000);
     expect(tui.requestRender).toHaveBeenCalledTimes(2);
+  });
+
+  it("expands and collapses a finished review by left click on any of its rows", async () => {
+    const feed = new ReviewFeed();
+    feed.start("done", { ...job, file: "done.ts" }, 0);
+    feed.finish("done", "success", 1);
+    feed.attach("done", ["accepted"]);
+    feed.start("live", { ...job, file: "live.ts" }, Date.now());
+    const tui = host("tui", 40);
+    const sidebar = new ReviewSidebar(() => feed.list(), lookup);
+    sidebar.toggle(tui.ctx);
+    await Promise.resolve();
+    const rows = (): string[] => tui.render(40) ?? [];
+    const at = (name: string): number =>
+      rows().findIndex((line) => line.includes(name));
+    expect(rows().join("\n")).not.toContain("Duplicate helper");
+    for (const ignored of [
+      tui.click(0),
+      tui.click(at("live.ts")),
+      tui.click(at("done.ts"), "right"),
+      tui.click(at("done.ts"), "left", "press"),
+      tui.click(99),
+    ])
+      expect(ignored).toBeUndefined();
+    expect(tui.click(at("done.ts"))).toEqual({ handled: true, render: true });
+    expect(rows().join("\n")).toContain("Duplicate helper :42");
+    expect(tui.click(at("Duplicate helper"))).toMatchObject({ handled: true });
+    expect(rows().join("\n")).not.toContain("Duplicate helper");
+    sidebar.dispose();
   });
 
   it("follows session replacement while open", async () => {

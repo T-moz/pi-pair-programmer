@@ -2790,9 +2790,7 @@ it("feeds each review's outcome and attributed findings into the toggled sidebar
   });
   const decidedFeed = render?.(60).join("\n") ?? "";
   expect(decidedFeed).toContain("change.ts");
-  expect(decidedFeed).toContain("1 accepted");
-  expect(decidedFeed).toContain("Sidebar issue :1");
-  expect(decidedFeed).toContain("“Real issue”");
+  expect(decidedFeed).toContain("gpt-5  1✓ ▸");
   await environment.command("pair-clear");
   expect(render?.(60).join("\n")).toContain("Nothing to show yet.");
   await environment.command("pair-feed");
