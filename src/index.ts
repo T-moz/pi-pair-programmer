@@ -27,7 +27,6 @@ import {
   type ReviewerConfig,
 } from "./reviewers.js";
 
-const MAX_ACTIVE_REVIEWERS = 2;
 const MAX_DELIVERY = 4;
 const DECISION_TOOL = "pair_programmer_decide";
 const ToolPathSchema = z.string();
@@ -117,10 +116,8 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   let baseline: TaskBaseline | undefined;
   let baselineSession: string | undefined;
   let generation = 0;
-  let active = 0;
   let unresolved = 0;
   let nextVersion = 0;
-  let pending: ReviewJob[] = [];
   const versions = new Map<string, number>();
   const reviewed = new Map<string, string>();
   const timers = new Map<string, NodeJS.Timeout>();
@@ -128,9 +125,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
 
   function stop(): void {
     generation += 1;
-    active = 0;
     unresolved = 0;
-    pending = [];
     versions.clear();
     reviewed.clear();
     for (const timer of timers.values()) clearTimeout(timer);
@@ -158,29 +153,16 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     store.deliver(batch.map((finding) => finding.id));
   }
 
-  function pump(): void {
-    while (active < MAX_ACTIVE_REVIEWERS && store.enabled) {
-      const job = pending.shift();
-      if (job === undefined) return;
-      if (
-        reviewed.get(`${job.key}:${reviewerKey(job.reviewer)}:${job.model}`) ===
-        job.revision
-      )
-        continue;
-      const controller = new AbortController();
-      controllers.set(controller, job.key);
-      active += 1;
-      void runJob(job, controller.signal)
-        .catch(() => {
-          return;
-        })
-        .finally(() => {
-          controllers.delete(controller);
-          if (job.session !== generation) return;
-          active -= 1;
-          pump();
-        });
-    }
+  function start(job: ReviewJob): void {
+    const controller = new AbortController();
+    controllers.set(controller, job.key);
+    void runJob(job, controller.signal)
+      .catch(() => {
+        return;
+      })
+      .finally(() => {
+        controllers.delete(controller);
+      });
   }
 
   async function current(job: ReviewJob): Promise<boolean> {
@@ -282,24 +264,24 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     }
   }
 
-  function enqueueReviews(
+  function startReviews(
     base: Omit<ReviewJob, "model" | "reviewer">,
     ctx: ExtensionContext,
   ): void {
+    const jobs: ReviewJob[] = [];
+    const keys = new Set<string>();
     for (const reviewer of matchingReviewers(base.file, reviewers)) {
       let model = reviewer.model;
       if (model === "current") {
         if (ctx.model === undefined) continue;
         model = `${ctx.model.provider}/${ctx.model.id}`;
       }
-      if (
-        reviewed.get(`${base.file}:${reviewerKey(reviewer)}:${model}`) ===
-        base.revision
-      )
-        continue;
-      pending.push({ ...base, model, reviewer });
+      const key = `${base.file}:${reviewerKey(reviewer)}:${model}`;
+      if (reviewed.get(key) === base.revision || keys.has(key)) continue;
+      keys.add(key);
+      jobs.push({ ...base, model, reviewer });
     }
-    pump();
+    for (const job of jobs) start(job);
   }
 
   async function prepare(
@@ -334,7 +316,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       store.discardStale(file, revision);
       const host: Host =
         typeof ctx.modelRegistry.streamSimple === "function" ? "pi" : "omp";
-      enqueueReviews(
+      startReviews(
         {
           file,
           fullPath,
@@ -398,7 +380,6 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       for (const [controller, activeFile] of controllers) {
         if (activeFile === file) controller.abort();
       }
-      pending = pending.filter((job) => job.key !== file);
       clearTimeout(timers.get(file));
       timers.set(
         file,

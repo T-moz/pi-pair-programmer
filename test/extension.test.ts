@@ -343,6 +343,62 @@ const inheritedProposal: ProposedFinding = {
   evidence: "Calling displayProfile(null) throws before rendering the profile",
 };
 
+it("cancels every in-flight reviewer on disable, whether it rejects or resolves late", async () => {
+  const environment = await setup("pi", false, false, async (cwd) => {
+    await fsPromises.writeFile(
+      path.join(cwd, "pair-programmer.reviewers.json"),
+      JSON.stringify({
+        reviewers: [0, 1, 2].map((index) => ({
+          model: "current",
+          prompt: `Review criterion ${String(index)}`,
+          include: ["**/*"],
+          exclude: [],
+        })),
+      }),
+    );
+  });
+  const pending = Promise.withResolvers<ProposedFinding[]>();
+  vi.mocked(reviewFile)
+    .mockImplementationOnce(({ signal }) => {
+      const cancelled = Promise.withResolvers<ProposedFinding[]>();
+      signal.addEventListener(
+        "abort",
+        () => {
+          cancelled.reject(new DOMException("Reviewer aborted", "AbortError"));
+        },
+        { once: true },
+      );
+      return cancelled.promise;
+    })
+    .mockReturnValue(pending.promise);
+  await fsPromises.writeFile(
+    path.join(environment.cwd, "change.ts"),
+    inheritedSource,
+  );
+  await environment.emit("tool_result", {
+    toolName: "write",
+    input: { path: "change.ts" },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(reviewFile).toHaveBeenCalledTimes(3);
+  });
+  await environment.command("pair-programmer");
+  expect(
+    vi
+      .mocked(reviewFile)
+      .mock.calls.every(([request]) => request.signal.aborted),
+  ).toBe(true);
+  pending.resolve([inheritedProposal]);
+  await vi.advanceTimersByTimeAsync(0);
+  await environment.emit("turn_end");
+  await environment.emit("before_agent_start");
+  expect(reviewFile).toHaveBeenCalledTimes(3);
+  expect(findings(environment.entries)).toEqual([]);
+  expect(environment.sendMessage).not.toHaveBeenCalled();
+  await environment.emit("session_shutdown");
+});
+
 it("aborts baseline acquisition on shutdown and ignores its late completion", async () => {
   const environment = await setup("omp", false, true);
   const delayed = Promise.withResolvers<changeEvidence.BaselineCapture>();
@@ -1501,7 +1557,7 @@ it("restores delivered decisions after session start and removes decided finding
   await environment.emit("session_shutdown");
 });
 
-it("bounds concurrent reviews and sends the next finding batch only after decisions", async () => {
+it("reviews every written file at once and sends the next finding batch only after decisions", async () => {
   const environment = await setup();
   await fsPromises.writeFile(
     path.join(environment.cwd, "pair-programmer.reviewers.json"),
@@ -1539,7 +1595,7 @@ it("bounds concurrent reviews and sends the next finding batch only after decisi
     });
   }
   await advanceReviews(() => {
-    expect(reviewFile).toHaveBeenCalledTimes(2);
+    expect(reviewFile).toHaveBeenCalledTimes(3);
   });
   expect(
     await environment.emit("tool_call", { toolName: "bash" }),
@@ -1552,9 +1608,6 @@ it("bounds concurrent reviews and sends the next finding batch only after decisi
       evidence: `Distinct problem ${String(index)}`,
     })),
   );
-  await advanceReviews(() => {
-    expect(reviewFile).toHaveBeenCalledTimes(3);
-  });
   second.resolve([]);
   await advanceReviews(() => {
     expect(findings(environment.entries)).toHaveLength(5);
@@ -2484,76 +2537,65 @@ it("contains failed background persistence and resumes after storage recovers", 
   await environment.emit("session_shutdown");
 });
 
-it("replaces only a changed file among queued reviewer jobs", async () => {
+it("supersedes only the rewritten file's in-flight reviewers", async () => {
   const environment = await setup();
-  const reviewer = {
-    model: "current",
-    prompt: "Correctness review",
-    include: ["**/*.ts"],
-    exclude: [],
-  };
-  await fsPromises.writeFile(
-    path.join(environment.cwd, "pair-programmer.reviewers.json"),
-    JSON.stringify({ reviewers: [reviewer] }),
-  );
-  await environment.emit("session_start");
-  const files = ["first.ts", "second.ts", "third.ts", "fourth.ts"].map((name) =>
+  const [first, second] = ["first.ts", "second.ts"].map((name) =>
     path.join(environment.cwd, name),
   );
-  for (const file of files)
+  if (first === undefined || second === undefined)
+    throw new Error("Missing files");
+  for (const file of [first, second])
     await fsPromises.writeFile(file, "export const value = 1;\n");
-  const first = Promise.withResolvers<ProposedFinding[]>();
-  const second = Promise.withResolvers<ProposedFinding[]>();
-  vi.mocked(reviewFile)
-    .mockReturnValueOnce(first.promise)
-    .mockReturnValueOnce(second.promise)
-    .mockResolvedValue([]);
-  for (const file of files.slice(0, 2))
+  const stalled = Promise.withResolvers<ProposedFinding[]>();
+  vi.mocked(reviewFile).mockReturnValue(stalled.promise);
+  for (const file of [first, second])
     await environment.emit("tool_result", {
       toolName: "write",
       input: { path: file },
       isError: false,
     });
-  await advanceReviews(() => {
-    expect(reviewFile).toHaveBeenCalledTimes(2);
-  });
-  for (const file of files.slice(2))
-    await environment.emit("tool_result", {
-      toolName: "write",
-      input: { path: file },
-      isError: false,
-    });
-  await advanceReviews(() => {
-    expect(matchingCalls.get("third.ts")).toBe(1);
-    expect(matchingCalls.get("fourth.ts")).toBe(1);
-  });
-  const third = files[2];
-  if (third === undefined) throw new Error("Missing queued file");
-  await fsPromises.writeFile(third, "export const value = 2;\n");
-  await environment.emit("tool_result", {
-    toolName: "edit",
-    input: { path: third },
-    isError: false,
-  });
-  await advanceReviews(() => {
-    expect(matchingCalls.get("third.ts")).toBe(2);
-  });
-  first.resolve([]);
-  second.resolve([]);
   await advanceReviews(() => {
     expect(reviewFile).toHaveBeenCalledTimes(4);
   });
-  const dispatched = vi
-    .mocked(reviewFile)
-    .mock.calls.map(([request]) => request);
-  expect(
-    dispatched.find((request) => request.file === "third.ts")?.source,
-  ).toContain("value = 2");
-  expect(dispatched.some((request) => request.file === "fourth.ts")).toBe(true);
+  const signals = (name: string): boolean[] =>
+    vi
+      .mocked(reviewFile)
+      .mock.calls.filter(([request]) => request.file === name)
+      .map(([request]) => request.signal.aborted);
+  await fsPromises.writeFile(first, "export const value = 2;\n");
+  vi.mocked(reviewFile).mockResolvedValue([
+    { line: 1, title: "Current", quote: "value = 2", evidence: "Fresh" },
+  ]);
+  await environment.emit("tool_result", {
+    toolName: "edit",
+    input: { path: first },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(reviewFile).toHaveBeenCalledTimes(6);
+  });
+  expect(signals("first.ts")).toEqual([true, true, false, false]);
+  expect(signals("second.ts")).toEqual([false, false]);
+  stalled.resolve([
+    { line: 1, title: "Stale", quote: "value = 1", evidence: "Old" },
+  ]);
+  await advanceReviews(() => {
+    expect(
+      findings(environment.entries).map((finding) => [
+        finding.file,
+        finding.title,
+      ]),
+    ).toEqual([
+      ["first.ts", "Current"],
+      ["first.ts", "Current"],
+      ["second.ts", "Stale"],
+      ["second.ts", "Stale"],
+    ]);
+  });
   await environment.emit("session_shutdown");
 });
 
-it("keeps the reviewer queue bounded when identical configured reviews finish", async () => {
+it("reviews identical reviewer configurations once per revision", async () => {
   const environment = await setup();
   const reviewer = {
     model: "current",
@@ -2568,20 +2610,7 @@ it("keeps the reviewer queue bounded when identical configured reviews finish", 
   await environment.emit("session_start");
   const file = path.join(environment.cwd, "change.ts");
   await fsPromises.writeFile(file, "export const value = 1;\n");
-  const first = Promise.withResolvers<ProposedFinding[]>();
-  const second = Promise.withResolvers<ProposedFinding[]>();
-  vi.mocked(reviewFile)
-    .mockReturnValueOnce(first.promise)
-    .mockReturnValueOnce(second.promise);
-  await environment.emit("tool_result", {
-    toolName: "write",
-    input: { path: file },
-    isError: false,
-  });
-  await advanceReviews(() => {
-    expect(reviewFile).toHaveBeenCalledTimes(2);
-  });
-  first.resolve([
+  vi.mocked(reviewFile).mockResolvedValue([
     {
       line: 1,
       title: "Duplicate configuration",
@@ -2589,12 +2618,16 @@ it("keeps the reviewer queue bounded when identical configured reviews finish", 
       evidence: "One material issue",
     },
   ]);
+  await environment.emit("tool_result", {
+    toolName: "write",
+    input: { path: file },
+    isError: false,
+  });
   await advanceReviews(() => {
     expect(findings(environment.entries)).toHaveLength(1);
   });
-  second.resolve([]);
+  expect(reviewFile).toHaveBeenCalledOnce();
   await environment.emit("turn_end");
   expect(environment.sendMessage).toHaveBeenCalledOnce();
-  expect(reviewFile).toHaveBeenCalledTimes(2);
   await environment.emit("session_shutdown");
 });
