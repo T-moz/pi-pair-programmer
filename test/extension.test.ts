@@ -2759,7 +2759,7 @@ it("feeds each review's outcome and attributed findings into the toggled sidebar
   });
   environment.shortcuts.get("alt+r")?.(environment.ctx);
   await Promise.resolve();
-  expect(render?.(60).join("\n")).toContain("No reviews yet.");
+  expect(render?.(60).join("\n")).toContain("Nothing to show yet.");
   vi.mocked(reviewFile).mockResolvedValue([
     { line: 1, title: "Sidebar issue", quote: "broken", evidence: "Why" },
   ]);
@@ -2773,12 +2773,22 @@ it("feeds each review's outcome and attributed findings into the toggled sidebar
   });
   await vi.advanceTimersByTimeAsync(0);
   const feed = render?.(60).join("\n") ?? "";
-  expect(feed).toContain("change.ts");
-  expect(feed).toContain("1 finding");
-  expect(feed).toContain("Sidebar issue :1");
-  expect(feed).toContain("queued");
+  expect(feed).not.toContain("change.ts");
+  await environment.emit("turn_end");
+  const [finding] = findings(environment.entries);
+  if (finding === undefined) throw new Error("Missing finding");
+  await environment.decide(finding.id, {
+    findingId: finding.id,
+    decision: "accept",
+    reason: "Real issue",
+  });
+  const decidedFeed = render?.(60).join("\n") ?? "";
+  expect(decidedFeed).toContain("change.ts");
+  expect(decidedFeed).toContain("1 accepted");
+  expect(decidedFeed).toContain("Sidebar issue :1");
+  expect(decidedFeed).toContain("“Real issue”");
   await environment.command("pair-clear");
-  expect(render?.(60).join("\n")).toContain("No reviews yet.");
+  expect(render?.(60).join("\n")).toContain("Nothing to show yet.");
   await environment.command("pair-feed");
   await environment.command("pair-feed");
   await environment.emit("session_shutdown");

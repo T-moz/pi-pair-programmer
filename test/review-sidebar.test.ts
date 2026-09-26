@@ -29,6 +29,7 @@ const views: Record<string, FindingView> = {
   queued: { title: "Queued", line: 1, status: "queued" },
   rejected: { title: "Rejected", line: 2, status: "rejected", reason: "No" },
   discarded: { title: "Discarded", line: 3, status: "discarded" },
+  bare: { title: "Bare accept", line: 4, status: "accepted" },
 };
 const viewMap = new Map(Object.entries(views));
 const lookup = (id: string): FindingView | undefined => viewMap.get(id);
@@ -42,15 +43,15 @@ const text = (
 describe("renderSidebar", () => {
   it("frames an empty feed at its natural height", () => {
     const lines = text(new ReviewFeed(), 40, 12);
-    expect(lines).toHaveLength(9);
+    expect(lines).toHaveLength(10);
     expect(lines[0]).toBe(`╭${"─".repeat(38)}╮`);
     expect(lines.at(-1)).toBe(`╰${"─".repeat(38)}╯`);
-    expect(lines.join("\n")).toContain("No reviews yet.");
+    expect(lines.join("\n")).toContain("Nothing to show yet.");
     expect(lines.at(-2)).toContain("alt+r hide");
     for (const line of lines) expect(visibleWidth(line)).toBe(40);
   });
 
-  it("narrates every review outcome and finding verdict", () => {
+  it("shows only running reviews and those with accepted or rejected findings", () => {
     const feed = new ReviewFeed();
     const outcomes = [
       "failed",
@@ -59,40 +60,48 @@ describe("renderSidebar", () => {
       "cancelled",
       "success",
     ] as const;
-    for (const [index, outcome] of outcomes.entries()) {
-      feed.start(outcome, job, index);
+    for (const outcome of outcomes) {
+      feed.start(outcome, { ...job, file: `${outcome}.ts` }, 0);
       feed.finish(outcome, outcome, 1500);
     }
-    feed.start("one", job, 0);
-    feed.finish("one", "success", 12_400);
-    feed.attach("one", ["awaiting", "missing"]);
-    feed.start("many", job, 0);
-    feed.finish("many", "success", 900);
-    feed.attach("many", Object.keys(views));
-    feed.start("live", { ...job, model: "" }, 19_000);
+    feed.start("undecided", { ...job, file: "undecided.ts" }, 0);
+    feed.finish("undecided", "success", 1);
+    feed.attach("undecided", ["awaiting", "queued", "discarded", "missing"]);
+    feed.start("rejected", { ...job, file: "rejected.ts" }, 0);
+    feed.finish("rejected", "success", 12_400);
+    feed.attach("rejected", ["rejected"]);
+    feed.start("mixed", { ...job, file: "mixed.ts" }, 0);
+    feed.finish("mixed", "success", 900);
+    feed.attach("mixed", Object.keys(views));
+    feed.start("live", { ...job, file: "live.ts", model: "" }, 19_000);
     const rendered = text(feed, 60, 80).join("\n");
     for (const expected of [
       "Live reviews · 1 running",
+      "live.ts",
       "reviewing…",
       "1.0s",
-      "review failed",
-      "timed out",
-      "superseded by a newer edit",
-      "cancelled",
-      "no findings",
-      "1 finding",
+      "rejected.ts",
       "12s",
-      "5 findings",
+      "1 rejected",
+      "mixed.ts",
+      "2 accepted · 1 rejected",
+      "Bare accept :4",
       "Duplicate helper :42",
-      "awaiting decision",
       "“Reuse the existing padding helper",
-      "queued",
-      "rejected",
+      "Rejected :2",
       "“No”",
-      "discarded",
       "gpt-5",
     ])
       expect(rendered).toContain(expected);
+    for (const hidden of [
+      ...outcomes.map((outcome) => `${outcome}.ts`),
+      "undecided.ts",
+      "Magic interval",
+      "Queued :1",
+      "Discarded",
+      "no findings",
+    ])
+      expect(rendered).not.toContain(hidden);
     expect(renderSidebar([], lookup, plain, 40, 10).join("")).toContain(
       "Live reviews",
     );
@@ -103,14 +112,14 @@ describe("renderSidebar", () => {
     for (let index = 0; index < 6; index += 1) {
       feed.start(String(index), { ...job, file: `f${String(index)}.ts` }, 0);
       feed.finish(String(index), "success", 1);
+      feed.attach(String(index), ["accepted"]);
     }
     const lines = text(feed, 40, 16);
     const joined = lines.join("\n");
     expect(lines.length).toBeLessThanOrEqual(16);
     expect(joined).toContain("f5.ts");
-    expect(joined).not.toContain("f2.ts");
-    expect(joined).toContain("f3.ts");
-    expect(joined).toContain("+3 earlier reviews");
+    expect(joined).not.toContain("f0.ts");
+    expect(joined).toMatch(/\+\d earlier reviews/u);
     const single = new ReviewFeed();
     single.start("a", job, 0);
     single.start("b", job, 0);
@@ -140,10 +149,10 @@ describe("renderSidebar", () => {
       },
       0,
     );
-    feed.finish("a", "success", 1);
     const lines = text(feed, 40, 40).map((line) => line.slice(2, -2));
-    expect(lines[5]).toContain("no findings");
-    expect(lines[5]?.trimEnd()).toMatch(/nam…$/u);
+    expect(lines[5]).toContain("reviewing…");
+    expect(lines[5]).toContain("a-very-long");
+    expect(lines[5]?.trimEnd()).toMatch(/…$/u);
     expect(lines[6]?.trim()).toBe("");
     for (const width of [38, 12])
       for (const line of text(feed, width, 40))
@@ -245,7 +254,7 @@ describe("ReviewSidebar", () => {
     });
     expect(tui.options().visible(MIN_COLUMNS - 1)).toBe(false);
     expect(tui.options().visible(MIN_COLUMNS)).toBe(true);
-    expect(tui.render(40)).toHaveLength(9);
+    expect(tui.render(40)).toHaveLength(10);
     vi.advanceTimersByTime(250);
     expect(tui.requestRender).not.toHaveBeenCalled();
     feed.start("a", job, Date.now());

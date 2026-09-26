@@ -51,60 +51,56 @@ function seconds(ms: number): string {
     : `${String(Math.round(ms / 1000))}s`;
 }
 
-function outcome(
-  entry: FeedEntry,
-  findings: number,
-  now: number,
-): { icon: string; color: Color; text: string } {
-  switch (entry.phase) {
-    case "running": {
-      const frame = SPINNER.charAt(Math.floor(now / 250) % SPINNER.length);
-      return { icon: frame, color: "accent", text: "reviewing…" };
-    }
-    case "success": {
-      if (findings === 0)
-        return { icon: "✓", color: "success", text: "no findings" };
-      const noun = findings === 1 ? "finding" : "findings";
-      return {
-        icon: "◆",
-        color: "warning",
-        text: `${String(findings)} ${noun}`,
-      };
-    }
-    case "failed":
-      return { icon: "✗", color: "error", text: "review failed" };
-    case "timeout":
-      return { icon: "✗", color: "error", text: "timed out" };
-    case "obsolete":
-      return { icon: "○", color: "dim", text: "superseded by a newer edit" };
-    case "cancelled":
-      return { icon: "○", color: "dim", text: "cancelled" };
-  }
+type Decided = FindingView & { status: "accepted" | "rejected" };
+
+const FINDING: Record<Decided["status"], { icon: string; color: Color }> = {
+  accepted: { icon: "✓", color: "success" },
+  rejected: { icon: "✗", color: "muted" },
+};
+
+/** Only accepted and rejected findings are worth surfacing. */
+function decided(entry: FeedEntry, lookup: Lookup): Decided[] {
+  return entry.findingIds.flatMap((id) => {
+    const view = lookup(id);
+    return view?.status === "accepted" || view?.status === "rejected"
+      ? [view as Decided]
+      : [];
+  });
 }
 
-const FINDING: Record<
-  FindingView["status"],
-  { icon: string; color: Color; label: string }
-> = {
-  queued: { icon: "·", color: "accent", label: "queued" },
-  awaiting: { icon: "?", color: "warning", label: "awaiting decision" },
-  accepted: { icon: "✓", color: "success", label: "accepted" },
-  rejected: { icon: "✗", color: "muted", label: "rejected" },
-  discarded: { icon: "○", color: "dim", label: "discarded" },
-};
+function summary(findings: readonly Decided[]): {
+  icon: string;
+  color: Color;
+  text: string;
+} {
+  const accepted = findings.filter((f) => f.status === "accepted").length;
+  const rejected = findings.length - accepted;
+  const text = [
+    accepted > 0 ? `${String(accepted)} accepted` : "",
+    rejected > 0 ? `${String(rejected)} rejected` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return accepted > 0
+    ? { icon: "◆", color: "warning", text }
+    : { icon: "✗", color: "muted", text };
+}
 
 function entryLines(
   entry: FeedEntry,
-  lookup: Lookup,
+  findings: readonly Decided[],
   theme: Painter,
   width: number,
   now: number,
 ): string[] {
-  const findings = entry.findingIds.flatMap((id) => {
-    const view = lookup(id);
-    return view === undefined ? [] : [view];
-  });
-  const state = outcome(entry, findings.length, now);
+  const state =
+    entry.phase === "running"
+      ? {
+          icon: SPINNER.charAt(Math.floor(now / 250) % SPINNER.length),
+          color: "accent" as const,
+          text: "reviewing…",
+        }
+      : summary(findings);
   const time = theme.fg(
     "dim",
     seconds(entry.durationMs ?? Math.max(0, now - entry.startedAt)),
@@ -129,7 +125,6 @@ function entryLines(
     const style = FINDING[finding.status];
     lines.push(
       `  ${theme.fg(style.color, style.icon)} ${finding.title}${theme.fg("dim", " :" + String(finding.line))}`,
-      `    ${theme.fg(style.color, style.label)}`,
     );
     if (finding.reason !== undefined)
       lines.push(
@@ -151,6 +146,12 @@ export function renderSidebar(
   now = Date.now(),
 ): string[] {
   const inner = Math.max(1, width - 4);
+  const visible = entries.flatMap((entry) => {
+    const findings = decided(entry, lookup);
+    return entry.phase === "running" || findings.length > 0
+      ? [{ entry, findings }]
+      : [];
+  });
   const row = (text: string): string => {
     const clipped = truncateToWidth(text, inner, "…");
     const pad = " ".repeat(Math.max(0, inner - visibleWidth(clipped)));
@@ -170,24 +171,25 @@ export function renderSidebar(
   const footer = ["", theme.fg("dim", "alt+r hide · /pair-stats totals")];
   const room = Math.max(0, height - 2 - header.length - footer.length);
   const body: string[] = [];
-  if (entries.length === 0)
+  if (visible.length === 0)
     body.push(
-      theme.fg("muted", "No reviews yet."),
-      theme.fg("dim", "They appear after each edit."),
+      theme.fg("muted", "Nothing to show yet."),
+      theme.fg("dim", "Running reviews and decided"),
+      theme.fg("dim", "findings appear here."),
     );
   let shown = 0;
-  for (const entry of entries) {
+  for (const { entry, findings } of visible) {
     const block = [
       ...(shown === 0 ? [] : [""]),
-      ...entryLines(entry, lookup, theme, inner, now),
+      ...entryLines(entry, findings, theme, inner, now),
     ];
-    const reserve = shown + 1 < entries.length ? 1 : 0;
+    const reserve = shown + 1 < visible.length ? 1 : 0;
     if (body.length + block.length + reserve > room) break;
     body.push(...block);
     shown += 1;
   }
-  if (shown < entries.length) {
-    const hidden = entries.length - shown;
+  if (shown < visible.length) {
+    const hidden = visible.length - shown;
     body.push(
       theme.fg(
         "dim",
