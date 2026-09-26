@@ -35,11 +35,12 @@ export function acceptedLines(
     details.file,
     Math.max(1, inner - visibleWidth(location)),
   );
-  const title = wrapTextWithAnsi(details.title, inner);
+  const title = wrapTextWithAnsi(details.title, Math.max(1, inner - 2));
+  const marker = theme.fg("dim", expanded ? " ▾" : " ▸");
   const lines = [
     ...title.map(
       (part, index) =>
-        `${index === 0 ? theme.fg("warning", "◆") : " "} ${theme.bold(part)}`,
+        `${index === 0 ? theme.fg("warning", "◆") : " "} ${theme.bold(part)}${index === title.length - 1 ? marker : ""}`,
     ),
     `  ${theme.fg("dim", path + location)}`,
   ];
@@ -55,19 +56,29 @@ export function acceptedLines(
   return lines.map((line) => sliceByColumn(indent + line, 0, width));
 }
 
+/**
+ * A card's own click toggle, remembered per message because Pi rebuilds the
+ * component on every expand or theme change. `base` records the global expand
+ * state when clicked, so a later ctrl+o overrides the local toggle.
+ */
+const toggled = new WeakMap<object, { open: boolean; base: boolean }>();
+
 /** Renders accepted findings as a compact card; unknown payloads fall back to Pi's default. */
 export const renderAccepted: MessageRenderer = (message, options, theme) => {
   const parsed = AcceptedDetails.safeParse(message.details);
   if (!parsed.success) return;
+  const open = (): boolean => {
+    const state = toggled.get(message);
+    return state?.base === options.expanded ? state.open : options.expanded;
+  };
   return {
     render: (width: number): string[] =>
-      acceptedLines(
-        parsed.data,
-        theme,
-        width,
-        options.expanded,
-        options.outputPad,
-      ),
+      acceptedLines(parsed.data, theme, width, open(), options.outputPad),
+    handleMouse(event) {
+      if (event.type !== "click" || event.button !== "left") return;
+      toggled.set(message, { open: !open(), base: options.expanded });
+      return { handled: true, render: true };
+    },
     invalidate(): void {
       return;
     },
