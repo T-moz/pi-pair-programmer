@@ -16,17 +16,21 @@ This extension lets you run multiple highly specialized reviewers, each focused 
 
 ## Install
 
+Install the published [npm package](https://www.npmjs.com/package/pi-pair-programmer).
+
 With Pi:
 
 ```sh
-pi install git:github.com/T-moz/pi-pair-programmer
+pi install npm:pi-pair-programmer
 ```
 
 With OMP:
 
 ```sh
-omp plugin install github:T-moz/pi-pair-programmer
+omp install pi-pair-programmer
 ```
+
+Restart Pi or OMP after installation to load the extension.
 
 For the Jev filter, set your TypeSafe API key before starting Pi or OMP:
 
