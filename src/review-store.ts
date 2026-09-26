@@ -23,12 +23,16 @@ const EventSchema = z.discriminatedUnion("action", [
   }),
   z.object({ action: z.literal("discard"), ids: z.array(z.string()) }),
   z.object({ action: z.literal("enabled"), enabled: z.boolean() }),
+  z.object({ action: z.literal("clear") }),
 ]);
-const EntrySchema = z.object({
-  type: z.literal("custom"),
-  customType: z.literal("pair-programmer"),
-  data: EventSchema,
-});
+const EntrySchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("custom"),
+    customType: z.literal("pair-programmer"),
+    data: EventSchema,
+  }),
+  z.object({ type: z.literal("reset_boundary") }),
+]);
 
 export type Finding = z.infer<typeof FindingSchema>;
 export type Verdict = z.infer<typeof VerdictSchema>;
@@ -58,7 +62,8 @@ export class ReviewStore {
     for (const entry of branchEntries) {
       const parsed = EntrySchema.safeParse(entry);
       if (!parsed.success) continue;
-      this.apply(parsed.data.data);
+      if (parsed.data.type === "reset_boundary") this.findings.clear();
+      else this.apply(parsed.data.data);
     }
   }
 
@@ -88,6 +93,10 @@ export class ReviewStore {
       else counts.pending += 1;
     }
     return counts;
+  }
+
+  clear(): void {
+    this.record({ action: "clear" });
   }
 
   setEnabled(enabled: boolean): void {
@@ -210,6 +219,9 @@ export class ReviewStore {
         break;
       case "enabled":
         this.applyEnabled(event.enabled);
+        break;
+      case "clear":
+        this.findings.clear();
         break;
     }
   }

@@ -193,8 +193,45 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   let wakeTimer: NodeJS.Timeout | undefined;
   let wakePending = false;
   const controllers = new Map<AbortController, string>();
+  let resetTimer: NodeJS.Timeout | undefined;
+  let checkReset: (() => void) | undefined;
 
-  function stop(reasonCode: "session_change" | "shutdown" | "disabled"): void {
+  function stopWatchingResets(): void {
+    clearInterval(resetTimer);
+    resetTimer = undefined;
+    checkReset = undefined;
+  }
+
+  function watchResets(ctx: ExtensionContext): void {
+    if (hostOf(ctx) !== "omp") return;
+    const manager = ctx.sessionManager;
+    let previousLeaf = manager.getLeafId();
+    checkReset = () => {
+      const leaf = manager.getLeafId();
+      let id = leaf;
+      let reset = false;
+      while (id !== null && id !== previousLeaf) {
+        const entry = manager.getEntry(id);
+        if (entry === undefined) break;
+        if ((entry.type as string) === "reset_boundary") {
+          reset = true;
+          break;
+        }
+        id = entry.parentId;
+      }
+      previousLeaf = leaf;
+      if (!reset) return;
+      stop("cleared");
+      store = new ReviewStore(appendReviewEntry, manager.getBranch());
+      admission = new FindingAdmission(store);
+    };
+    resetTimer = setInterval(checkReset, 100);
+    resetTimer.unref();
+  }
+
+  function stop(
+    reasonCode: "session_change" | "shutdown" | "disabled" | "cleared",
+  ): void {
     logger?.log("session.stop", { sessionId: stats.sessionId, reasonCode });
     statsView.close();
     for (const cancel of cancelJobs.values()) cancel();
@@ -215,6 +252,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   }
 
   function deliverable(): readonly Finding[] {
+    checkReset?.();
     return !store.enabled || unresolved > 0 || store.outstanding().length > 0
       ? []
       : store
@@ -257,6 +295,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   }
 
   function wake(ctx: ExtensionContext, ending: boolean): void {
+    checkReset?.();
     if (!store.enabled || wakePending) {
       logger?.log("delivery.wake", {
         sessionId: stats.sessionId,
@@ -380,6 +419,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   }
 
   function active(job: ReviewJob): boolean {
+    checkReset?.();
     return (
       store.enabled &&
       job.session === generation &&
@@ -519,6 +559,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     version: number,
     session: number,
   ): Promise<void> {
+    checkReset?.();
     try {
       if (
         (await realpath(fullPath)) !== fullPath ||
@@ -665,6 +706,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     event: { reason?: string },
     ctx: ExtensionContext,
   ): Promise<void> {
+    stopWatchingResets();
     activeContext = ctx;
     activeSessionId = undefined;
     stop("session_change");
@@ -688,6 +730,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     retainPending(stats);
     store = new ReviewStore(appendReviewEntry, ctx.sessionManager.getBranch());
     admission = new FindingAdmission(store);
+    watchResets(ctx);
     await logging;
     if (session !== generation) return;
     logger?.log("session.start", { sessionId });
@@ -709,6 +752,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
 
   pi.on("session_start", startSession);
   const beforeSessionChange = (): void => {
+    stopWatchingResets();
     stop("session_change");
   };
   pi.on("session_before_switch", beforeSessionChange);
@@ -734,6 +778,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   pi.on("session_tree", (_event, ctx) => startSession({ reason: "tree" }, ctx));
 
   pi.on("session_shutdown", () => {
+    stopWatchingResets();
     stop("shutdown");
     activeContext = undefined;
     activeSessionId = undefined;
@@ -749,6 +794,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   });
 
   pi.on("tool_result", (event, ctx) => {
+    checkReset?.();
     if (
       !store.enabled ||
       event.isError ||
@@ -770,6 +816,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   });
 
   pi.on("context", (event) => {
+    checkReset?.();
     if (
       event.messages.every(
         (message) =>
@@ -821,6 +868,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   });
 
   pi.on("tool_call", (event) => {
+    checkReset?.();
     if (!store.enabled || decisionInteraction(event.toolName, event.input))
       return;
     deliver();
@@ -837,6 +885,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       "Accept or reject one delivered review finding and explain why before coding continues",
     parameters: DecisionParameters,
     execute(_toolCallId, params) {
+      checkReset?.();
       if (!store.enabled) {
         return Promise.resolve({
           content: [{ type: "text" as const, text: "Pair Programmer is off." }],
@@ -883,6 +932,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   pi.registerCommand("pair-programmer", {
     description: "Toggle background peer review on or off",
     handler: (_args, ctx) => {
+      checkReset?.();
       const enabled = !store.enabled;
       if (!enabled) stop("disabled");
       store.setEnabled(enabled);
@@ -895,10 +945,23 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     },
   });
 
+  pi.registerCommand("pair-clear", {
+    description: "Cancel reviews and clear all review findings",
+    handler: (_args, ctx) => {
+      checkReset?.();
+      stop("cleared");
+      store.clear();
+      ctx.ui.notify("Pair Programmer reviews cleared.", "info");
+      return Promise.resolve();
+    },
+  });
+
   pi.registerCommand("pair-stats", {
     description:
       "Show on-demand Pair Programmer activity, findings and extension usage",
-    handler: (_args, ctx) =>
-      statsView.open(ctx, statsLines(stats.snapshot(), store)),
+    handler: (_args, ctx) => {
+      checkReset?.();
+      return statsView.open(ctx, statsLines(stats.snapshot(), store));
+    },
   });
 }

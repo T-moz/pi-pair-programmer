@@ -100,6 +100,7 @@ const reasonCodes = {
   session_change: true,
   shutdown: true,
   disabled: true,
+  cleared: true,
   superseded: true,
   stale: true,
   missing_model: true,
