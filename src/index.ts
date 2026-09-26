@@ -23,6 +23,8 @@ import {
 } from "./pair-stats.js";
 import { StatsView, statsLines, statsSummary } from "./stats-view.js";
 import { StatusOverlay, type StatusTone } from "./status-overlay.js";
+import { ReviewFeed } from "./review-feed.js";
+import { ReviewSidebar } from "./review-sidebar.js";
 import {
   isInherited,
   reviewFile,
@@ -145,6 +147,11 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   })();
   const statsView = new StatsView();
   const statusOverlay = new StatusOverlay();
+  const feed = new ReviewFeed();
+  const sidebar = new ReviewSidebar(
+    () => feed.list(),
+    (id) => store.lookup(id),
+  );
   const accounting = new SessionAccounting();
   let activeContext: ExtensionContext | undefined;
   const cancelJobs = new Map<AbortController, () => void>();
@@ -187,6 +194,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       state = `${String(findings.pending)} queued`;
     }
     statusOverlay.show(ctx, { tone, text: state });
+    sidebar.refresh(ctx);
   }
 
   function stopWatchingResets(): void {
@@ -246,6 +254,8 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     wakeTimer = undefined;
     wakePending = false;
     presented.clear();
+    if (reasonCode === "session_change" || reasonCode === "cleared")
+      feed.clear();
   }
 
   function deliverable(): readonly Finding[] {
@@ -353,6 +363,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       finished = true;
       const durationMs = performance.now() - started;
       job.stats.finish(job.id, result, durationMs, settled);
+      feed.finish(job.id, result, durationMs);
       logger?.log("review.finished", {
         ...fields,
         outcome: result,
@@ -396,6 +407,10 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       finish("cancelled", false);
     });
     job.stats.start(job.id);
+    feed.start(job.id, {
+      file: job.file,
+      model: job.model,
+    });
     showState(job.ctx);
     logger?.log("review.started", fields);
     void (async () => {
@@ -493,6 +508,9 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       count: judged.filter(({ inherited }) => inherited).length,
     });
     if (signal.aborted || !(await current(job))) return "obsolete";
+    const before = new Set(
+      store.history(job.file).map((stored) => stored.finding.id),
+    );
     const result = await admission.admit({
       file: job.file,
       reviewer,
@@ -510,7 +528,19 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       outcome: result,
     });
     if (result === "obsolete") return "obsolete";
-    if (result === "added") scheduleWake(job.ctx);
+    if (result === "added") {
+      feed.attach(
+        job.id,
+        store
+          .history(job.file)
+          .filter(
+            ({ finding }) =>
+              finding.reviewer === reviewer && !before.has(finding.id),
+          )
+          .map(({ finding }) => finding.id),
+      );
+      scheduleWake(job.ctx);
+    }
     reviewed.set(`${job.key}:${reviewer}:${job.model}`, job.revision);
     return "success";
   }
@@ -783,6 +813,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     stopWatchingResets();
     stop("shutdown");
     statusOverlay.dispose();
+    sidebar.dispose();
     activeContext = undefined;
     accounting.suspend();
     replaceBaseline(undefined);
@@ -961,6 +992,24 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       return Promise.resolve();
     },
   });
+
+  const toggleSidebar = (ctx: ExtensionContext): void => {
+    checkReset?.();
+    sidebar.toggle(ctx);
+  };
+  pi.registerCommand("pair-feed", {
+    description: "Toggle the live review sidebar",
+    handler: (_args, ctx) => {
+      toggleSidebar(ctx);
+      return Promise.resolve();
+    },
+  });
+  // OMP may not expose shortcuts; the command remains the portable toggle.
+  if (typeof pi.registerShortcut === "function")
+    pi.registerShortcut("alt+r", {
+      description: "Toggle the Pair Programmer review sidebar",
+      handler: toggleSidebar,
+    });
 
   pi.registerCommand("pair-stats", {
     description:

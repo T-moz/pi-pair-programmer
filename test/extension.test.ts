@@ -212,6 +212,7 @@ async function setup(
   sendMessage: Mock<ExtensionAPI["sendMessage"]>;
   isIdle: Mock<() => boolean>;
   notify: ReturnType<typeof vi.fn>;
+  shortcuts: Map<string, (ctx: ExtensionContext) => void>;
   setWidget: Mock<(key: string, content: string[] | undefined) => void>;
   status: () => string | undefined;
   entries: JournalEntry[];
@@ -249,6 +250,7 @@ async function setup(
     );
   }
   const hooks = new Map<string, Handler>();
+  const shortcuts = new Map<string, (ctx: ExtensionContext) => void>();
   const commands = new Map<
     string,
     Parameters<ExtensionAPI["registerCommand"]>[1]
@@ -283,6 +285,16 @@ async function setup(
       commands.set(name, command);
     },
     sendMessage,
+    ...(host === "pi"
+      ? {
+          registerShortcut(
+            key: string,
+            options: { handler: (ctx: ExtensionContext) => void },
+          ) {
+            shortcuts.set(key, options.handler);
+          },
+        }
+      : {}),
     appendEntry(customType: string, data: unknown) {
       if (customType === "pair-programmer-stats") {
         if (entryError !== undefined) throw entryError;
@@ -341,6 +353,7 @@ async function setup(
     isIdle,
     notify,
     setWidget,
+    shortcuts,
     status: () => setWidget.mock.lastCall?.[1]?.[0],
     entries,
     statsEntries,
@@ -2716,6 +2729,58 @@ it("styles the status widget with the active host theme", async () => {
   expect(environment.status()).toBe(
     "<success>\u{25C6} <muted>pair \u{B7} watching",
   );
+  await environment.emit("session_shutdown");
+});
+
+it("feeds each review's outcome and attributed findings into the toggled sidebar", async () => {
+  const environment = await setup();
+  const file = path.join(environment.cwd, "change.ts");
+  await fsPromises.writeFile(file, "export const broken = true;\n");
+  let render: ((width: number) => string[]) | undefined;
+  const plain = {
+    fg: (_color: string, text: string) => text,
+    bold: (text: string) => text,
+  };
+  environment.custom.mockImplementation(async (factory) => {
+    const component = await factory(
+      {
+        requestRender: vi.fn(),
+        terminal: { rows: 60 },
+      } as unknown as Parameters<StatsFactory>[0],
+      plain as unknown as Parameters<StatsFactory>[1],
+      {} as Parameters<StatsFactory>[2],
+      vi.fn(),
+    );
+    if (component.render(60).join("").includes("Live reviews"))
+      render = (width) => component.render(width);
+    return new Promise<never>(() => {
+      return;
+    });
+  });
+  environment.shortcuts.get("alt+r")?.(environment.ctx);
+  await Promise.resolve();
+  expect(render?.(60).join("\n")).toContain("No reviews yet.");
+  vi.mocked(reviewFile).mockResolvedValue([
+    { line: 1, title: "Sidebar issue", quote: "broken", evidence: "Why" },
+  ]);
+  await environment.emit("tool_result", {
+    toolName: "write",
+    input: { path: file },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(findings(environment.entries)).toHaveLength(2);
+  });
+  await vi.advanceTimersByTimeAsync(0);
+  const feed = render?.(60).join("\n") ?? "";
+  expect(feed).toContain("change.ts");
+  expect(feed).toContain("1 finding");
+  expect(feed).toContain("Sidebar issue :1");
+  expect(feed).toContain("queued");
+  await environment.command("pair-clear");
+  expect(render?.(60).join("\n")).toContain("No reviews yet.");
+  await environment.command("pair-feed");
+  await environment.command("pair-feed");
   await environment.emit("session_shutdown");
 });
 
