@@ -33,7 +33,9 @@ import {
 
 const MAX_DELIVERY = 4;
 const DECISION_TOOL = "pair_programmer_decide";
+const WAKE_COALESCE_MS = 250;
 const ToolPathSchema = z.string();
+const ContinuingRunSchema = z.object({ willContinue: z.literal(true) });
 
 const DecisionParameters = Type.Object({
   findingId: Type.String({ minLength: 1 }),
@@ -53,6 +55,7 @@ interface ReviewJob {
   key: string;
   host: Host;
   cwd: string;
+  ctx: ExtensionContext;
 }
 
 function isFreshSession(
@@ -94,6 +97,18 @@ function decisionInteraction(
   );
 }
 
+function hostOf(ctx: ExtensionContext): Host {
+  return typeof ctx.modelRegistry.streamSimple === "function" ? "pi" : "omp";
+}
+
+function idle(ctx: ExtensionContext): boolean {
+  try {
+    return ctx.isIdle();
+  } catch {
+    return false;
+  }
+}
+
 function revisionOf(source: string): string {
   return createHash("sha256").update(source).digest("hex");
 }
@@ -125,6 +140,9 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   const versions = new Map<string, number>();
   const reviewed = new Map<string, string>();
   const timers = new Map<string, NodeJS.Timeout>();
+  const presented = new Set<string>();
+  let wakeTimer: NodeJS.Timeout | undefined;
+  let wakePending = false;
   const controllers = new Map<AbortController, string>();
 
   function stop(): void {
@@ -136,25 +154,66 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     timers.clear();
     for (const controller of controllers.keys()) controller.abort();
     controllers.clear();
+    clearTimeout(wakeTimer);
+    wakeTimer = undefined;
+    wakePending = false;
+    presented.clear();
   }
 
-  function deliver(): void {
-    if (!store.enabled || unresolved > 0 || store.outstanding().length > 0)
-      return;
-    const batch = store
-      .ready()
-      .filter((finding) => !timers.has(finding.file))
-      .slice(0, MAX_DELIVERY);
-    if (batch.length === 0) return;
+  function deliverable(): readonly Finding[] {
+    return !store.enabled || unresolved > 0 || store.outstanding().length > 0
+      ? []
+      : store
+          .ready()
+          .filter((finding) => !timers.has(finding.file))
+          .slice(0, MAX_DELIVERY);
+  }
+
+  function send(batch: readonly Finding[], waking: Host | undefined): void {
+    let options: Parameters<ExtensionAPI["sendMessage"]>[1] = {
+      deliverAs: "nextTurn",
+      triggerTurn: false,
+    };
+    if (waking === "pi") options = { triggerTurn: true };
+    else if (waking === "omp")
+      options = { deliverAs: "nextTurn", triggerTurn: true };
     pi.sendMessage(
       {
         customType: "pair-programmer-findings",
         content: describe(batch),
         display: false,
       },
-      { deliverAs: "nextTurn", triggerTurn: false },
+      options,
     );
-    store.deliver(batch.map((finding) => finding.id));
+    const ids = batch.map((finding) => finding.id);
+    store.deliver(ids);
+    if (waking === undefined) return;
+    wakePending = true;
+    for (const id of ids) presented.add(id);
+  }
+
+  function deliver(): void {
+    const batch = deliverable();
+    if (batch.length > 0) send(batch, undefined);
+  }
+
+  function wake(ctx: ExtensionContext, ending: boolean): void {
+    if (!store.enabled || wakePending) return;
+    if (!ending && !idle(ctx)) return;
+    const outstanding = store.outstanding();
+    if (outstanding.length === 0) {
+      const batch = deliverable();
+      if (batch.length > 0) send(batch, hostOf(ctx));
+    } else if (outstanding.some((finding) => !presented.has(finding.id))) {
+      send(outstanding, hostOf(ctx));
+    }
+  }
+
+  function scheduleWake(ctx: ExtensionContext): void {
+    wakeTimer ??= setTimeout(() => {
+      wakeTimer = undefined;
+      wake(ctx, false);
+    }, WAKE_COALESCE_MS);
   }
 
   function start(job: ReviewJob): void {
@@ -285,7 +344,10 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       version = store.version;
       novel = await judge(novel, added, false, signal);
     }
-    for (const finding of novel) store.add(finding);
+    const ids = novel.flatMap((finding) =>
+      store.add(finding) ? [finding.id] : [],
+    );
+    if (ids.length > 0) scheduleWake(job.ctx);
     return true;
   }
 
@@ -339,8 +401,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
         return;
       const revision = revisionOf(source);
       store.discardStale(file, revision);
-      const host: Host =
-        typeof ctx.modelRegistry.streamSimple === "function" ? "pi" : "omp";
+      const host = hostOf(ctx);
       startReviews(
         {
           file,
@@ -352,6 +413,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
           key: file,
           host,
           cwd: ctx.cwd,
+          ctx,
         },
         ctx,
       );
@@ -539,6 +601,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
             typeof message.content === "string" &&
             message.content.includes(finding.id),
         );
+        for (const finding of relevant) presented.add(finding.id);
         return relevant.length === 0
           ? []
           : [{ ...message, content: describe(relevant) }];
@@ -554,14 +617,27 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     deliver();
   });
 
+  pi.on("agent_start", () => {
+    wakePending = false;
+  });
+
+  pi.on("agent_settled", (_event, ctx) => {
+    wake(ctx, false);
+  });
+
+  pi.on("agent_end", (event, ctx) => {
+    if (hostOf(ctx) === "omp" && !ContinuingRunSchema.safeParse(event).success)
+      wake(ctx, true);
+  });
+
   pi.on("tool_call", (event) => {
     if (!store.enabled || decisionInteraction(event.toolName, event.input))
       return;
     deliver();
     const outstanding = store.outstanding();
-    if (outstanding.length > 0) {
-      return { block: true, reason: describe(outstanding) };
-    }
+    if (outstanding.length === 0) return;
+    for (const finding of outstanding) presented.add(finding.id);
+    return { block: true, reason: describe(outstanding) };
   });
 
   pi.registerTool({
