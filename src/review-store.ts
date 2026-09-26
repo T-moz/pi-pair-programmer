@@ -44,6 +44,16 @@ export interface StoredFinding {
   reason?: string;
 }
 
+export type FindingStatus =
+  "queued" | "awaiting" | "accepted" | "rejected" | "discarded";
+
+export interface FindingView {
+  title: string;
+  line: number;
+  status: FindingStatus;
+  reason?: string;
+}
+
 interface FindingState extends StoredFinding {
   delivered: boolean;
   discarded: boolean;
@@ -161,6 +171,22 @@ export class ReviewStore {
       }
     }
     return result;
+  }
+
+  lookup(id: string): FindingView | undefined {
+    const state = this.findings.get(id);
+    if (state === undefined) return undefined;
+    let status: FindingStatus = "queued";
+    if (state.verdict === "accept") status = "accepted";
+    else if (state.verdict === "reject") status = "rejected";
+    else if (state.discarded) status = "discarded";
+    else if (state.delivered) status = "awaiting";
+    return {
+      title: state.finding.title,
+      line: state.finding.line,
+      status,
+      ...(state.reason === undefined ? {} : { reason: state.reason }),
+    };
   }
 
   deliveredFinding(id: string): Finding | undefined {

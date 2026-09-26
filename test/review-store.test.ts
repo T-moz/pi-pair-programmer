@@ -24,6 +24,34 @@ function session(): {
 }
 
 describe("ReviewStore", () => {
+  it("describes each finding's live status for the review feed", () => {
+    const { store } = session();
+    for (const id of ["queued", "awaiting", "accepted", "rejected", "stale"])
+      store.add(finding(id));
+    store.deliver(["awaiting", "accepted", "rejected"]);
+    store.decide("accepted", "accept", "Confirmed");
+    store.decide("rejected", "reject", "Intentional");
+    store.discardStale("src/a.ts", "two");
+    expect(store.lookup("missing")).toBeUndefined();
+    expect(store.lookup("awaiting")).toEqual({
+      title: "Issue awaiting",
+      line: 12,
+      status: "awaiting",
+    });
+    expect(store.lookup("accepted")).toMatchObject({
+      status: "accepted",
+      reason: "Confirmed",
+    });
+    expect(store.lookup("rejected")).toMatchObject({
+      status: "rejected",
+      reason: "Intentional",
+    });
+    expect(store.lookup("queued")?.status).toBe("discarded");
+    const fresh = session().store;
+    fresh.add(finding("new"));
+    expect(fresh.lookup("new")?.status).toBe("queued");
+  });
+
   it.each([true, false])(
     "clears finding history durably while preserving enabled=%s",
     (enabled) => {
