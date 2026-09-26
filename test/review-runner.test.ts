@@ -4,24 +4,30 @@ import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, expect, it, vi, type Mock } from "vitest";
 import {
   deduplicate,
+  isInherited,
   reviewFile,
   type Host,
   type ProposedFinding,
 } from "../src/review-runner.js";
+import type { ChangeEvidence } from "../src/change-evidence.js";
 import type { Finding, StoredFinding } from "../src/review-store.js";
 
 interface JudgmentRequest {
   model: string;
   state: {
-    candidate: Finding;
-    history: (Finding & {
+    candidate?: Finding;
+    finding?: ProposedFinding;
+    taskStartSource?: { file: string; source: string };
+    currentSource?: { file: string; source: string };
+    history?: (Finding & {
       verdict: "accept" | "reject" | null;
       reason: string | null;
     })[];
-    earlierCandidates: Finding[];
+    earlierCandidates?: Finding[];
   };
   questions: {
-    duplicate: { type: "noul"; instructions?: unknown; criteria?: unknown };
+    duplicate?: { type: "noul"; instructions?: unknown; criteria?: unknown };
+    category?: { type: "choice"; instructions?: unknown; criteria?: unknown };
   };
 }
 
@@ -37,10 +43,7 @@ interface JudgmentResponse {
 
 const systemOne = vi.hoisted(() =>
   vi.fn<
-    (
-      _input: JudgmentRequest,
-      _options: JudgmentOptions,
-    ) => Promise<JudgmentResponse>
+    (_input: JudgmentRequest, _options: JudgmentOptions) => Promise<unknown>
   >(),
 );
 
@@ -493,6 +496,200 @@ it("cancels an in-flight Jev judgment without retrying", async () => {
   controller.abort(new Error("review cancelled"));
   await expect(pending).rejects.toThrow("review cancelled");
   expect(systemOne).toHaveBeenCalledOnce();
+});
+
+const changeEvidence: ChangeEvidence = {
+  status: "available",
+  before: {
+    file: "old.ts",
+    source: "const user = null;\nconsole.log(user.name);\n",
+  },
+  after: {
+    file: "new.ts",
+    source: "const user = null;\nconsole.log(user.name);\n",
+  },
+  diff: "--- old.ts\n+++ new.ts\n const user = null;\n console.log(user.name);\n",
+  origins: [
+    { file: "old.ts", source: "const user = null;\nconsole.log(user.name);\n" },
+  ],
+  reason: null,
+};
+
+const inheritedAnswer = {
+  choice: "inherited",
+  confidence: 1,
+  probabilities: { inherited: 1, introduced: 0, unknown: 0 },
+};
+
+it.each([
+  [0, 1, false],
+  [0.5, 1, false],
+  [0.949999, 1, false],
+  [0.95, 1, true],
+  [1, 1, true],
+  [1, 0.949999, false],
+  [1, 0.95, true],
+] as const)(
+  "suppresses inherited evidence only at high confidence %s and probability %s",
+  async (confidence, inheritedProbability, suppressed) => {
+    systemOne.mockResolvedValueOnce({
+      answers: {
+        category: {
+          ...inheritedAnswer,
+          confidence,
+          probabilities: {
+            inherited: inheritedProbability,
+            introduced: 1 - inheritedProbability,
+            unknown: 0,
+          },
+        },
+      },
+    });
+    await expect(
+      isInherited({
+        finding: valid,
+        evidence: changeEvidence,
+        signal: new AbortController().signal,
+      }),
+    ).resolves.toBe(suppressed);
+  },
+);
+
+it.each([
+  {
+    ...inheritedAnswer,
+    choice: "introduced",
+    probabilities: { inherited: 0, introduced: 1, unknown: 0 },
+  },
+  {
+    ...inheritedAnswer,
+    choice: "unknown",
+    probabilities: { inherited: 0, introduced: 0, unknown: 1 },
+  },
+  {
+    ...inheritedAnswer,
+    probabilities: { inherited: 0.5, introduced: 0.5, unknown: 0 },
+  },
+])(
+  "retains introduced, uncertain, or inconsistent categories: %j",
+  async (category) => {
+    systemOne.mockResolvedValueOnce({ answers: { category } });
+    await expect(
+      isInherited({
+        finding: valid,
+        evidence: changeEvidence,
+        signal: new AbortController().signal,
+      }),
+    ).resolves.toBe(false);
+  },
+);
+
+it.each([
+  null,
+  {},
+  { answers: null },
+  { answers: { category: null } },
+  { answers: { category: { ...inheritedAnswer, choice: "other" } } },
+  { answers: { category: { ...inheritedAnswer, probabilities: null } } },
+  {
+    answers: {
+      category: { ...inheritedAnswer, probabilities: { inherited: 1 } },
+    },
+  },
+  {
+    answers: {
+      category: {
+        ...inheritedAnswer,
+        probabilities: { inherited: 1, introduced: 1, unknown: 1 },
+      },
+    },
+  },
+  ...[-1, 1.01, NaN, Infinity, -Infinity, "1", true].flatMap((value) => [
+    { answers: { category: { ...inheritedAnswer, confidence: value } } },
+    {
+      answers: {
+        category: {
+          ...inheritedAnswer,
+          probabilities: { ...inheritedAnswer.probabilities, inherited: value },
+        },
+      },
+    },
+  ]),
+])(
+  "retains findings on malformed attribution responses: %j",
+  async (response) => {
+    systemOne.mockResolvedValueOnce(response);
+    await expect(
+      isInherited({
+        finding: valid,
+        evidence: changeEvidence,
+        signal: new AbortController().signal,
+      }),
+    ).resolves.toBe(false);
+  },
+);
+
+it.each([
+  {
+    ...changeEvidence,
+    status: "unavailable" as const,
+    reason: "ambiguous context",
+  },
+  { ...changeEvidence, diff: null },
+  { ...changeEvidence, before: null, origins: [] },
+])(
+  "does not suppress without complete actual origin evidence: %j",
+  async (evidence) => {
+    await expect(
+      isInherited({
+        finding: valid,
+        evidence,
+        signal: new AbortController().signal,
+      }),
+    ).resolves.toBe(false);
+    expect(systemOne).not.toHaveBeenCalled();
+  },
+);
+
+it("judges a cross-file origin without requiring an old destination file", async () => {
+  systemOne.mockResolvedValueOnce({ answers: { category: inheritedAnswer } });
+  await expect(
+    isInherited({
+      finding: valid,
+      evidence: { ...changeEvidence, before: null },
+      signal: new AbortController().signal,
+    }),
+  ).resolves.toBe(true);
+});
+
+it("keeps findings when attribution is unavailable or cancelled", async () => {
+  systemOne.mockRejectedValueOnce(new Error("Jev unavailable"));
+  await expect(
+    isInherited({
+      finding: valid,
+      evidence: changeEvidence,
+      signal: new AbortController().signal,
+    }),
+  ).resolves.toBe(false);
+  const controller = new AbortController();
+  systemOne.mockImplementationOnce((_request, options) => {
+    const { promise, reject } = Promise.withResolvers<unknown>();
+    options.signal.addEventListener(
+      "abort",
+      () => {
+        reject(new Error("cancelled"));
+      },
+      { once: true },
+    );
+    return promise;
+  });
+  const pending = isInherited({
+    finding: valid,
+    evidence: changeEvidence,
+    signal: controller.signal,
+  });
+  controller.abort();
+  await expect(pending).resolves.toBe(false);
 });
 
 it("surfaces Jev failures for the host fallback instead of silently retaining findings", async () => {
