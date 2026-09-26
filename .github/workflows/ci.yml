@@ -72,8 +72,6 @@ jobs:
       - name: Install pinned npm CLI with trusted publishing support
         if: steps.release.outputs.publish == 'true'
         run: npm install --global npm@12.1.0 --ignore-scripts --no-audit --no-fund
-      # The checked-in TypeScript is the release artifact: no dependency install
-      # or package lifecycle scripts run in the OIDC-enabled job.
       - name: Publish to npm using OIDC and provenance
         if: steps.release.outputs.publish == 'true'
         run: npm publish --access public --provenance --ignore-scripts
