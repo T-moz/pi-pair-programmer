@@ -97,9 +97,15 @@ The default reviewer uses your current model and asks: _â€œDoes it add entropy?â
   "reviewers": [
     {
       "model": "current",
-      "prompt": "Does it add entropy?",
-      "include": ["src/**/*.ts"],
-      "exclude": ["**/*.test.ts"]
+      "prompt": "Does this code add entropy?",
+      "include": ["**/*.dart"],
+      "exclude": ["**/*.g.dart", "**/*_test.dart"]
+    },
+    {
+      "model": "current",
+      "prompt": "Does this code reinvent the wheel instead of reusing code or a library?",
+      "include": ["**/*.dart"],
+      "exclude": ["**/*.g.dart", "**/*_test.dart"]
     }
   ]
 }
