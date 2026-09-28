@@ -6,18 +6,13 @@
 
 **Background code review for [Pi](https://pi.dev/docs/extensions) and [OMP](https://omp.sh/docs/extension-authoring).**
 
-[![CI](https://img.shields.io/github/actions/workflow/status/T-moz/pi-pair-programmer/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=CI)](https://github.com/T-moz/pi-pair-programmer/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen?style=for-the-badge&logo=vitest&logoColor=white)](vitest.config.ts)
-[![npm](https://img.shields.io/npm/v/pi-pair-programmer?style=for-the-badge&logo=npm&logoColor=white&color=cb3837)](https://www.npmjs.com/package/pi-pair-programmer)
-[![Downloads](https://img.shields.io/npm/dm/pi-pair-programmer?style=for-the-badge&logo=npm&logoColor=white&color=cb3837)](https://www.npmjs.com/package/pi-pair-programmer)
-
-[![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6?style=flat-square&logo=typescript&logoColor=white)](tsconfig.json)
-[![Node](https://img.shields.io/node/v/pi-pair-programmer?style=flat-square&logo=nodedotjs&logoColor=white&color=339933)](package.json)
-[![Pi extension](https://img.shields.io/badge/Pi-extension-8a2be2?style=flat-square)](https://pi.dev/docs/extensions)
-[![OMP extension](https://img.shields.io/badge/OMP-extension-ff6f00?style=flat-square)](https://omp.sh/docs/extension-authoring)
-[![npm provenance](https://img.shields.io/badge/npm-provenance-2ea44f?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/pi-pair-programmer#provenance)
-[![License: MIT](https://img.shields.io/github/license/T-moz/pi-pair-programmer?style=flat-square&color=blue)](LICENSE)
-[![PRs welcome](https://img.shields.io/badge/PRs-welcome-ff69b4?style=flat-square)](CONTRIBUTING.md)
+[![CI](https://github.com/T-moz/pi-pair-programmer/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/T-moz/pi-pair-programmer/actions/workflows/ci.yml)
+[![Coverage: 100%](https://img.shields.io/badge/coverage-100%25-brightgreen)](vitest.config.ts)
+[![npm version](https://img.shields.io/npm/v/pi-pair-programmer)](https://www.npmjs.com/package/pi-pair-programmer)
+[![npm downloads](https://img.shields.io/npm/dm/pi-pair-programmer)](https://www.npmjs.com/package/pi-pair-programmer)
+[![Node](https://img.shields.io/node/v/pi-pair-programmer)](package.json)
+[![TypeScript](https://img.shields.io/badge/types-TypeScript-3178c6)](tsconfig.json)
+[![License](https://img.shields.io/npm/l/pi-pair-programmer)](LICENSE)
 
 [**Why**](#-why) · [**Install**](#-install) · [**Use**](#-use) · [**How it works**](#-how-it-works)
 
