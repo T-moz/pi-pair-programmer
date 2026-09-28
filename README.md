@@ -67,3 +67,15 @@ Use `current` or a `provider/model` identifier. File patterns are relative to yo
 
 - `/pair-stats`: view review activity, findings, tokens, and estimated costs on demand; missing usage stays unknown.
 - Diagnostics stay in files, never the terminal: OMP uses its native logs; Pi uses `~/.pi/agent/logs/pair-programmer/` (or `$PI_CODING_AGENT_DIR/logs/pair-programmer/`).
+
+## How it works
+
+![How pi-pair-programmer works: the coding agent's writes trigger background reviewers, Jev filters their findings, and the agent must accept or reject each finding before using other tools](assets/pair-programmer-workflow.svg)
+
+1. A successful `write` or `edit` starts reviews in the background; the coding agent keeps working.
+2. After 120 ms without further edits to the file, every reviewer whose patterns match it checks the edited file with its model. A newer edit cancels the older review.
+3. Two Jev filters keep the agent's context clean. They drop findings on moved code or code that already had the problem before the task, and duplicates of findings already raised or decided for that file. Without `TYPESAFE_API_KEY`, only exact duplicates are dropped.
+4. Findings that pass are stored in the session. An idle agent is woken; a busy one gets them on its next turn or tool call, up to four at a time.
+5. Until the agent accepts or rejects each delivered finding with a reason, its other tool calls are blocked. Verdicts are saved, so decided findings are not raised again.
+
+Edit the diagram in [Excalidraw](https://excalidraw.com) from [`assets/pair-programmer-workflow.excalidraw`](assets/pair-programmer-workflow.excalidraw).
