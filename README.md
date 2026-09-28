@@ -36,7 +36,7 @@ Code review happens too late in the code production pipeline.
   <img src="assets/cost-to-fix.svg" alt="Cost to fix rises from standards and static analysis to PR checks, AI PR review, and human PR review; Pi Pair Programmer reviews right after each write" />
 </p>
 
-This extension lets you run multiple highly specialized reviewers, each focused on a specific concern, to catch issues static analysis cannot detect as soon as code is generated. Without bloating the context window, thanks to a Jev-based filter that removes inherited and duplicate findings.
+This extension lets you run multiple highly specialized reviewers, each focused on a specific concern, to catch issues static analysis cannot detect, as soon as code is generated. Without bloating the context window, thanks to a Jev-based filter that removes inherited and duplicate findings.
 
 ---
 
