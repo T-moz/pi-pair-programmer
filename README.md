@@ -12,6 +12,8 @@ Agents optimize for local correctness instead of thinking about the global syste
 Turn-by-turn static analysis is necessary but not sufficient.
 Code review happens too late in the code production pipeline.
 
+![Cost to fix rises from standards and static analysis to MR checks, AI MR review, and human MR review; Pi Pair Programmer reviews right after each write](assets/cost-to-fix.svg)
+
 This extension lets you run multiple highly specialized reviewers, each focused on a specific concern, to catch issues static analysis cannot detect as soon as code is generated. Without bloating the context window, thanks to a Jev-based filter that removes inherited and duplicate findings.
 
 ## Install
