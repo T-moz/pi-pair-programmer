@@ -1,12 +1,20 @@
+<img src="assets/pair-programmer-overview.png" alt="Pi Pair Programmer workflow: coding agent writes code, focused reviewers filter findings, then the agent accepts or rejects feedback before continuing" />
+
 # Pi Pair Programmer
+
+[![CI](https://github.com/T-moz/pi-pair-programmer/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/T-moz/pi-pair-programmer/actions/workflows/ci.yml)
+[![Coverage: 100%](https://img.shields.io/badge/coverage-100%25-brightgreen)](vitest.config.ts)
+[![npm version](https://img.shields.io/npm/v/pi-pair-programmer)](https://www.npmjs.com/package/pi-pair-programmer)
+[![npm downloads](https://img.shields.io/npm/dm/pi-pair-programmer)](https://www.npmjs.com/package/pi-pair-programmer)
+[![Node](https://img.shields.io/node/v/pi-pair-programmer)](package.json)
+[![TypeScript](https://img.shields.io/badge/types-TypeScript-3178c6)](tsconfig.json)
+[![License](https://img.shields.io/npm/l/pi-pair-programmer)](LICENSE)
 
 Background code review for [Pi](https://pi.dev/docs/extensions) and [OMP](https://omp.sh/docs/extension-authoring).
 
-![Pi Pair Programmer workflow: coding agent writes code, focused reviewers filter findings, then the agent accepts or rejects feedback before continuing](assets/pair-programmer-overview.png)
-
 ## Why
 
-Coding with AI adds entropy to a codebase.
+**Coding with AI adds entropy to a codebase.**
 Agents optimize for local correctness instead of thinking about the global system. They repeat code and reinvent the wheel.
 
 Turn-by-turn static analysis is necessary but not sufficient.
@@ -20,15 +28,11 @@ This extension lets you run multiple highly specialized reviewers, each focused 
 
 Install the published [npm package](https://www.npmjs.com/package/pi-pair-programmer).
 
-With Pi:
-
 ```sh
+# With Pi
 pi install npm:pi-pair-programmer
-```
 
-With OMP:
-
-```sh
+# With OMP
 omp install pi-pair-programmer
 ```
 
@@ -40,15 +44,25 @@ For the Jev filter, set your TypeSafe API key before starting Pi or OMP:
 export TYPESAFE_API_KEY="your-api-key"
 ```
 
-Without it, reviews still run, but only exact duplicate findings are filtered.
+> [!NOTE]
+> Without it, reviews still run, but only exact duplicate findings are filtered.
 
 ## Use
 
-Reviews are on by default. After each successful `write` or `edit`, reviewers run in the background. The coding agent must accept or reject each finding with a reason before continuing with other tools. Only accepted findings appear in your transcript.
+Reviews are on by default. After each successful `write` or `edit`, reviewers run in the background. The coding agent must accept or reject each finding with a reason before continuing with other tools.
 
-Run `/pair-programmer` to toggle reviews.
+> [!IMPORTANT]
+> Only accepted findings appear in your transcript.
 
-Run `/pair-clear` to cancel reviews and clear all findings.
+### Commands
+
+| Command            | Description                                                                                         |
+| ------------------ | --------------------------------------------------------------------------------------------------- |
+| `/pair-programmer` | Toggle reviews.                                                                                     |
+| `/pair-clear`      | Cancel reviews and clear all findings.                                                              |
+| `/pair-stats`      | View review activity, findings, tokens, and estimated costs on demand; missing usage stays unknown. |
+
+### Reviewers
 
 The default reviewer uses your current model and asks: “Does it add entropy?” To change the prompt, model, or files reviewed, create `pair-programmer.reviewers.json` in your working directory:
 
@@ -65,10 +79,17 @@ The default reviewer uses your current model and asks: “Does it add entropy?�
 }
 ```
 
-Use `current` or a `provider/model` identifier. File patterns are relative to your working directory; exclusions take precedence. Add entries for more reviewers.
+| Field     | Value                                                 |
+| --------- | ----------------------------------------------------- |
+| `model`   | Use `current` or a `provider/model` identifier.       |
+| `include` | File patterns are relative to your working directory. |
+| `exclude` | Exclusions take precedence.                           |
 
-- `/pair-stats`: view review activity, findings, tokens, and estimated costs on demand; missing usage stays unknown.
-- Diagnostics stay in files, never the terminal: OMP uses its native logs; Pi uses `~/.pi/agent/logs/pair-programmer/` (or `$PI_CODING_AGENT_DIR/logs/pair-programmer/`).
+Add entries for more reviewers.
+
+### Diagnostics
+
+Diagnostics stay in files, never the terminal: OMP uses its native logs; Pi uses `~/.pi/agent/logs/pair-programmer/` (or `$PI_CODING_AGENT_DIR/logs/pair-programmer/`).
 
 ## How it works
 
