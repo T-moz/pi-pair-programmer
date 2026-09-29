@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, open, readdir, unlink } from "node:fs/promises";
-import { homedir } from "node:os";
 import path from "node:path";
 import { pino } from "pino";
+import { agentDirectory } from "./agent-directory.js";
 
 export type PairLogEvent =
   | "session.start"
@@ -379,12 +379,10 @@ export async function createPairLogger(
     if (native !== undefined) {
       return native;
     }
-    const stateDirectory =
-      process.env["PI_CODING_AGENT_DIR"] ??
-      path.join(homedir(), ".pi", "agent");
-    return await fileLogger(
-      options.directory ?? path.join(stateDirectory, "logs", "pair-programmer"),
-    );
+    const directory =
+      options.directory ??
+      path.join(agentDirectory(), "logs", "pair-programmer");
+    return await fileLogger(directory);
   } catch {
     return guardedLogger(
       () => {

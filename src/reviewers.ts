@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { minimatch } from "minimatch";
 import { z } from "zod";
+import { agentDirectory } from "./agent-directory.js";
 
 export interface ReviewerConfig {
   model: string;
@@ -78,16 +79,29 @@ const ReviewerSchema = z.strictObject({
 const ConfigSchema = z.strictObject({ reviewers: z.array(ReviewerSchema) });
 const MissingConfigErrorSchema = z.object({ code: z.literal("ENOENT") });
 
-export async function loadReviewers(
+const CONFIG_FILE = "pair-programmer.reviewers.json";
+
+export function loadReviewers(
   cwd: string,
+  globalDirectory: string = agentDirectory(),
 ): Promise<readonly ReviewerConfig[]> {
-  const file = path.join(cwd, "pair-programmer.reviewers.json");
+  return readConfig(path.join(cwd, CONFIG_FILE), () =>
+    readConfig(path.join(globalDirectory, CONFIG_FILE), () =>
+      Promise.resolve(DEFAULT_REVIEWERS),
+    ),
+  );
+}
+
+async function readConfig(
+  file: string,
+  whenMissing: () => Promise<readonly ReviewerConfig[]>,
+): Promise<readonly ReviewerConfig[]> {
   let contents: string;
   try {
     contents = await readFile(file, "utf8");
   } catch (error) {
     if (MissingConfigErrorSchema.safeParse(error).success) {
-      return DEFAULT_REVIEWERS;
+      return whenMissing();
     }
     throw new Error(`${file}: could not read reviewer configuration`, {
       cause: error,

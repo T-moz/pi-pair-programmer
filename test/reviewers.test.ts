@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import {
   DEFAULT_REVIEWERS,
   loadReviewers,
@@ -21,6 +21,7 @@ async function temporaryDirectory(): Promise<string> {
 }
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   await Promise.all(
     directories
       .splice(0)
@@ -59,6 +60,73 @@ it("loads exactly the configured reviewers and honors an explicitly empty list",
   const firstLoad = await loadReviewers(directory);
   const secondLoad = await loadReviewers(directory);
   expect(firstLoad.map(reviewerKey)).toEqual(secondLoad.map(reviewerKey));
+});
+
+it("falls back to the global config when the project has none", async () => {
+  const project = await temporaryDirectory();
+  const global = await temporaryDirectory();
+  const configured: ReviewerConfig = {
+    model: "provider/global",
+    prompt: "Global review",
+    include: ["**/*"],
+    exclude: [],
+  };
+  await writeFile(
+    path.join(global, "pair-programmer.reviewers.json"),
+    JSON.stringify({ reviewers: [configured] }),
+  );
+  expect(await loadReviewers(project, global)).toEqual([configured]);
+});
+
+it("lets the project config override the global config entirely", async () => {
+  const project = await temporaryDirectory();
+  const global = await temporaryDirectory();
+  const scoped: ReviewerConfig = {
+    model: "provider/project",
+    prompt: "Project review",
+    include: ["src/**/*.ts"],
+    exclude: [],
+  };
+  await writeFile(
+    path.join(global, "pair-programmer.reviewers.json"),
+    "not JSON",
+  );
+  await writeFile(
+    path.join(project, "pair-programmer.reviewers.json"),
+    JSON.stringify({ reviewers: [scoped] }),
+  );
+  expect(await loadReviewers(project, global)).toEqual([scoped]);
+
+  await writeFile(
+    path.join(project, "pair-programmer.reviewers.json"),
+    JSON.stringify({ reviewers: [] }),
+  );
+  expect(await loadReviewers(project, global)).toEqual([]);
+});
+
+it("reports an invalid global config with its path", async () => {
+  const project = await temporaryDirectory();
+  const global = await temporaryDirectory();
+  const file = path.join(global, "pair-programmer.reviewers.json");
+  await writeFile(file, "not JSON");
+  await expect(loadReviewers(project, global)).rejects.toThrow(file);
+});
+
+it("reads the global config from the Pi agent directory by default", async () => {
+  const project = await temporaryDirectory();
+  const global = await temporaryDirectory();
+  const configured: ReviewerConfig = {
+    model: "provider/global",
+    prompt: "Global review",
+    include: ["**/*"],
+    exclude: [],
+  };
+  await writeFile(
+    path.join(global, "pair-programmer.reviewers.json"),
+    JSON.stringify({ reviewers: [configured] }),
+  );
+  vi.stubEnv("PI_CODING_AGENT_DIR", global);
+  expect(await loadReviewers(project)).toEqual([configured]);
 });
 
 it("rejects invalid JSON with the configuration path", async () => {

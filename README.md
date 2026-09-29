@@ -113,6 +113,8 @@ The default reviewer uses your current model and asks: _â€œDoes it add entropy?â
 
 Use `current` or a `provider/model` identifier. File patterns are relative to your working directory; exclusions take precedence. Add entries for more reviewers.
 
+To use the same reviewers in every project, put the file in `~/.pi/agent/pair-programmer.reviewers.json` (or `$PI_CODING_AGENT_DIR/pair-programmer.reviewers.json`). A project config in your working directory replaces the global one entirely; the reviewers are not merged.
+
 > [!TIP]
 > Diagnostics stay in files, never the terminal: OMP uses its native logs; Pi uses `~/.pi/agent/logs/pair-programmer/` (or `$PI_CODING_AGENT_DIR/logs/pair-programmer/`).
 
