@@ -13,7 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { diffArrays } from "diff";
+import { createTwoFilesPatch, diffArrays, FILE_HEADERS_ONLY } from "diff";
 import { z } from "zod";
 
 const execute = promisify(execFile);
@@ -735,32 +735,20 @@ function matchingOrigins(
   return [...matches.values()];
 }
 
-function sourceDiff(before: SourceFile, after: SourceFile): string {
-  const oldLines = before.source.split("\n");
-  const newLines = after.source.split("\n");
-  let start = 0;
-  while (start < oldLines.length && oldLines.at(start) === newLines.at(start)) {
-    start += 1;
-  }
-  let oldEnd = oldLines.length;
-  let newEnd = newLines.length;
-  while (
-    oldEnd > start &&
-    newEnd > start &&
-    oldLines[oldEnd - 1] === newLines[newEnd - 1]
-  ) {
-    oldEnd -= 1;
-    newEnd -= 1;
-  }
-  const contextStart = Math.max(0, start - 3);
-  const contextEnd = Math.min(oldLines.length - oldEnd, 3);
-  const changes = [
-    ...oldLines.slice(contextStart, start).map((text) => ` ${text}`),
-    ...oldLines.slice(start, oldEnd).map((text) => `-${text}`),
-    ...newLines.slice(start, newEnd).map((text) => `+${text}`),
-    ...oldLines.slice(oldEnd, oldEnd + contextEnd).map((text) => ` ${text}`),
-  ];
-  return `--- ${before.file}\n+++ ${after.file}\n@@ -${String(contextStart + 1)},${String(oldEnd - contextStart + contextEnd)} +${String(contextStart + 1)},${String(newEnd - contextStart + contextEnd)} @@\n${changes.join("\n")}`;
+function sourceDiff(before: SourceFile, after: SourceFile): string | undefined {
+  return createTwoFilesPatch(
+    before.file,
+    after.file,
+    before.source,
+    after.source,
+    undefined,
+    undefined,
+    {
+      context: 3,
+      maxEditLength: MAX_EDIT_DISTANCE,
+      headerOptions: FILE_HEADERS_ONLY,
+    },
+  );
 }
 
 function baselineFile(
@@ -841,7 +829,12 @@ export async function buildChangeEvidence(
       "No substantial matching baseline block or same-file source";
     return evidence;
   }
-  evidence.diff = sourceDiff(original, evidence.after);
+  const diff = sourceDiff(original, evidence.after);
+  if (diff === undefined) {
+    evidence.reason = "Change exceeds the diff edit bound";
+    return evidence;
+  }
+  evidence.diff = diff;
   evidence.status = "available";
   evidence.reason = null;
   return evidence;

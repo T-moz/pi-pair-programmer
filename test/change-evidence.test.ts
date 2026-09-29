@@ -870,30 +870,136 @@ it("bounds non-Git enumeration but freezes a Git repository of any size", async 
   ).toBe("available");
 });
 
-it("keeps before and after evidence for insertion and removal near file boundaries", async () => {
+it("diffs changes at file boundaries as unified hunks", async () => {
   await writeFile(path.join(root, "original.ts"), legacy);
+  await writeFile(path.join(root, "empty.ts"), "");
   const baseline = await capture();
-  const insertion = `const publicRoute = true;\n${legacy}`;
-  const inserted = await buildChangeEvidence(
-    baseline,
-    "original.ts",
-    insertion,
-    5,
-    quote,
+  const lines = legacy.split("\n");
+  const kept = (from: number, to: number): string[] =>
+    lines.slice(from, to).map((text) => ` ${text}`);
+  const diff = async (
+    file: string,
+    source: string,
+    line: number,
+  ): Promise<string | null> =>
+    (await buildChangeEvidence(baseline, file, source, line, quote)).diff;
+  expect(
+    await diff("original.ts", `const publicRoute = true;\n${legacy}`, 5),
+  ).toBe(
+    [
+      "--- original.ts",
+      "+++ original.ts",
+      "@@ -1,3 +1,4 @@",
+      "+const publicRoute = true;",
+      ...kept(0, 3),
+      "",
+    ].join("\n"),
   );
-  expect(inserted.diff).toContain("+const publicRoute = true;");
-  const removal = legacy.split("\n").slice(1).join("\n");
-  const removed = await buildChangeEvidence(
-    baseline,
-    "original.ts",
-    removal,
-    3,
-    quote,
+  expect(await diff("original.ts", lines.slice(1).join("\n"), 3)).toBe(
+    [
+      "--- original.ts",
+      "+++ original.ts",
+      "@@ -1,4 +1,3 @@",
+      ...lines.slice(0, 1).map((text) => `-${text}`),
+      ...kept(1, 4),
+      "",
+    ].join("\n"),
   );
-  expect(removed.diff).toContain(
-    "-export function loadCustomer(customerId: string) {",
+  expect(await diff("original.ts", legacy.replace(/\}\n$/, "};\n"), 4)).toBe(
+    [
+      "--- original.ts",
+      "+++ original.ts",
+      "@@ -2,4 +2,4 @@",
+      ...kept(1, 4),
+      "-}",
+      "+};",
+      "",
+    ].join("\n"),
   );
-  expect(removed.before?.source).toBe(legacy);
+  expect(await diff("empty.ts", legacy, 4)).toBe(
+    [
+      "--- empty.ts",
+      "+++ empty.ts",
+      "@@ -0,0 +1,5 @@",
+      ...lines.slice(0, 5).map((text) => `+${text}`),
+      "",
+    ].join("\n"),
+  );
+});
+
+it("marks trailing newline differences in the diff", async () => {
+  await writeFile(path.join(root, "original.ts"), legacy);
+  await writeFile(path.join(root, "unterminated.ts"), legacy.trimEnd());
+  const baseline = await capture();
+  const context = legacy
+    .split("\n")
+    .slice(1, 4)
+    .map((text) => ` ${text}`);
+  expect(
+    (
+      await buildChangeEvidence(
+        baseline,
+        "original.ts",
+        legacy.trimEnd(),
+        4,
+        quote,
+      )
+    ).diff,
+  ).toBe(
+    [
+      "--- original.ts",
+      "+++ original.ts",
+      "@@ -2,4 +2,4 @@",
+      ...context,
+      "-}",
+      "+}",
+      String.raw`\ No newline at end of file`,
+      "",
+    ].join("\n"),
+  );
+  expect(
+    (await buildChangeEvidence(baseline, "unterminated.ts", legacy, 4, quote))
+      .diff,
+  ).toBe(
+    [
+      "--- unterminated.ts",
+      "+++ unterminated.ts",
+      "@@ -2,4 +2,4 @@",
+      ...context,
+      "-}",
+      String.raw`\ No newline at end of file`,
+      "+}",
+      "",
+    ].join("\n"),
+  );
+});
+
+it("reports a change whose edit distance exceeds the diff bound as unavailable", async () => {
+  const before = Array.from(
+    { length: 600 },
+    (_, index) => `old ${String(index)}`,
+  );
+  const after = Array.from(
+    { length: 600 },
+    (_, index) => `new ${String(index)}`,
+  );
+  const original = [quote, ...before].join("\n");
+  await writeFile(path.join(root, "rewrite.ts"), original);
+  const baseline = await capture();
+  expect(
+    await buildChangeEvidence(
+      baseline,
+      "rewrite.ts",
+      [quote, ...after].join("\n"),
+      1,
+      quote,
+    ),
+  ).toMatchObject({
+    status: "unavailable",
+    before: { file: "rewrite.ts", source: original },
+    diff: null,
+    reason: "Change exceeds the diff edit bound",
+  });
 });
 
 it("marks only current lines that differ from the task-start file", async () => {
