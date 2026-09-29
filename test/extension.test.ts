@@ -10,6 +10,7 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, expect, it, vi, type Mock } from "vitest";
+import { z } from "zod";
 import * as changeEvidence from "../src/change-evidence.js";
 import pairProgrammer from "../src/index.js";
 import { PairStats, type StatsSnapshot } from "../src/pair-stats.js";
@@ -561,6 +562,180 @@ it("keeps attribution fail-open while recording its failed call separately from 
   );
   expect(persistedStats(environment.statsEntries).usage).toMatchObject([
     { stage: "attribution", outcomes: { failed: 1 }, costUsd: { measured: 0 } },
+  ]);
+  await environment.emit("session_shutdown");
+});
+
+const StatsRecord = z.object({
+  data: z.object({
+    action: z.string(),
+    id: z.string(),
+    jobId: z.string().optional(),
+    judgment: z.unknown().optional(),
+  }),
+});
+
+function statsRecords(
+  entries: unknown[],
+  action: string,
+): z.infer<typeof StatsRecord>["data"][] {
+  return entries.flatMap((entry) => {
+    const parsed = StatsRecord.safeParse(entry);
+    return parsed.success && parsed.data.data.action === action
+      ? [parsed.data.data]
+      : [];
+  });
+}
+
+function judgedLogs(): unknown[] {
+  return lifecycleLog.mock.calls.flatMap((call: unknown[]) =>
+    call[0] === "finding.judged" ? [call[1]] : [],
+  );
+}
+
+it("joins every filter judgment to its job and admitted finding while logging only codes", async () => {
+  const environment = await setup("pi", false, true);
+  const kept = {
+    line: 1,
+    title: "Secret title",
+    quote: "broken()",
+    evidence: "Throws on invocation",
+  };
+  const unanchored = { ...kept, title: "Other secret" };
+  vi.mocked(reviewFile).mockImplementation((request) => {
+    request.onJudgment?.({
+      stage: "review",
+      decision: "drop",
+      reason: "quote_mismatch",
+      line: 2,
+      title: "Dropped secret",
+      quote: "secretQuote",
+      lineText: "secret line",
+      quoteLines: [],
+      invalidFields: [],
+    });
+    return Promise.resolve([kept, unanchored]);
+  });
+  vi.mocked(isInherited).mockImplementation(({ finding, onJudgment }) => {
+    const base = {
+      stage: "attribution" as const,
+      line: finding.line,
+      title: finding.title,
+      quote: finding.quote,
+    };
+    onJudgment?.(
+      finding === kept
+        ? {
+            ...base,
+            decision: "keep",
+            reason: "judged",
+            evidenceStatus: "available",
+            evidenceReason: null,
+            choice: "introduced",
+            confidence: 0.8,
+            probabilities: { inherited: 0.1, introduced: 0.8, unknown: 0.1 },
+            thresholds: { confidence: 0.95, inherited: 0.95 },
+          }
+        : {
+            ...base,
+            decision: "drop",
+            reason: "judged",
+            evidenceStatus: "available",
+            evidenceReason: null,
+          },
+    );
+    return Promise.resolve(finding !== kept);
+  });
+  await fsPromises.writeFile(
+    path.join(environment.cwd, "change.ts"),
+    "broken();\n",
+  );
+  await environment.emit("tool_result", {
+    toolName: "write",
+    input: { path: "change.ts" },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(persistedStats(environment.statsEntries).reviews.success).toBe(1);
+  });
+  const [admitted] = findings(environment.entries);
+  const jobId = statsRecords(environment.statsEntries, "finish")[0]?.id;
+  const judgments = statsRecords(environment.statsEntries, "judgment");
+  expect(judgments.map((entry) => entry.jobId)).toEqual(
+    Array.from({ length: 4 }, () => jobId),
+  );
+  expect(judgments.map(({ judgment }) => judgment)).toEqual([
+    expect.objectContaining({ stage: "review", reason: "quote_mismatch" }),
+    expect.objectContaining({
+      stage: "attribution",
+      decision: "keep",
+      findingId: admitted?.id,
+      confidence: 0.8,
+    }),
+    expect.objectContaining({ stage: "attribution", decision: "drop" }),
+    expect.objectContaining({
+      stage: "dedup",
+      decision: "keep",
+      reason: "first",
+      findingId: admitted?.id,
+    }),
+  ]);
+  expect(judgedLogs()).toMatchObject([
+    { jobId, stage: "review", outcome: "drop", reasonCode: "quote_mismatch" },
+    {
+      jobId,
+      stage: "attribution",
+      outcome: "keep",
+      reasonCode: "judged",
+      confidence: 0.8,
+      probability: 0.1,
+    },
+    { jobId, stage: "attribution", outcome: "drop", probability: undefined },
+    { jobId, stage: "dedup", outcome: "keep", reasonCode: "first" },
+  ]);
+  expect(JSON.stringify(judgedLogs())).not.toMatch(/secret/iu);
+  await environment.emit("session_shutdown");
+});
+
+it("records why reviewer output was rejected before the review fails", async () => {
+  const environment = await setup("pi", false, true);
+  vi.mocked(reviewFile).mockImplementation((request) => {
+    request.onJudgment?.({
+      stage: "review",
+      decision: "fail",
+      reason: "too_many_findings",
+      count: 6,
+    });
+    return Promise.reject(
+      new Error("Reviewer returned an invalid findings array"),
+    );
+  });
+  await fsPromises.writeFile(
+    path.join(environment.cwd, "change.ts"),
+    "broken();\n",
+  );
+  await environment.emit("tool_result", {
+    toolName: "write",
+    input: { path: "change.ts" },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(persistedStats(environment.statsEntries).reviews.failed).toBe(1);
+  });
+  expect(
+    statsRecords(environment.statsEntries, "judgment").map(
+      ({ judgment }) => judgment,
+    ),
+  ).toEqual([
+    {
+      stage: "review",
+      decision: "fail",
+      reason: "too_many_findings",
+      count: 6,
+    },
+  ]);
+  expect(judgedLogs()).toMatchObject([
+    { stage: "review", outcome: "invalid", reasonCode: "too_many_findings" },
   ]);
   await environment.emit("session_shutdown");
 });

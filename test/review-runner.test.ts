@@ -617,6 +617,248 @@ it("keeps findings when attribution is unavailable or cancelled", async () => {
   await expect(pending).resolves.toBe(false);
 });
 
+const attributionBase = {
+  stage: "attribution",
+  line: valid.line,
+  title: valid.title,
+  quote: valid.quote,
+};
+
+it.each([
+  [
+    { answers: { category: inheritedAnswer } },
+    true,
+    {
+      decision: "drop",
+      reason: "judged",
+      choice: "inherited",
+      confidence: 1,
+      probabilities: { inherited: 1, introduced: 0, unknown: 0 },
+    },
+  ],
+  [
+    {
+      answers: {
+        category: {
+          choice: "inherited",
+          confidence: 0.94,
+          probabilities: { inherited: 0.96, introduced: 0.04, unknown: 0 },
+        },
+      },
+    },
+    false,
+    {
+      decision: "keep",
+      reason: "judged",
+      choice: "inherited",
+      confidence: 0.94,
+      probabilities: { inherited: 0.96, introduced: 0.04, unknown: 0 },
+    },
+  ],
+] as const)(
+  "records the Jev attribution scores and thresholds behind each decision",
+  async (response, inherited, recorded) => {
+    systemOne.mockResolvedValueOnce(response);
+    const onJudgment = vi.fn();
+    await expect(
+      isInherited({
+        finding: valid,
+        evidence: changeEvidence,
+        signal: new AbortController().signal,
+        onJudgment,
+      }),
+    ).resolves.toBe(inherited);
+    expect(onJudgment).toHaveBeenCalledExactlyOnceWith({
+      ...attributionBase,
+      ...recorded,
+      evidenceStatus: "available",
+      evidenceReason: null,
+      thresholds: { confidence: 0.95, inherited: 0.95 },
+    });
+  },
+);
+
+it.each([
+  [
+    { ...changeEvidence, status: "unavailable" as const, reason: "ambiguous" },
+    "evidence_unavailable",
+  ],
+  [{ ...changeEvidence, diff: null }, "no_diff"],
+  [{ ...changeEvidence, before: null, origins: [] }, "no_origin"],
+] as const)(
+  "records a skipped attribution without calling Jev: %#",
+  async (evidence, reason) => {
+    const onJudgment = vi.fn();
+    await expect(
+      isInherited({
+        finding: valid,
+        evidence,
+        signal: new AbortController().signal,
+        onJudgment,
+      }),
+    ).resolves.toBe(false);
+    expect(systemOne).not.toHaveBeenCalled();
+    expect(onJudgment).toHaveBeenCalledExactlyOnceWith({
+      ...attributionBase,
+      decision: "keep",
+      reason,
+      evidenceStatus: evidence.status,
+      evidenceReason: evidence.reason,
+    });
+  },
+);
+
+it("records kept findings when the Jev response is malformed, fails, or is cancelled", async () => {
+  const onJudgment = vi.fn();
+  const input = {
+    finding: valid,
+    evidence: changeEvidence,
+    signal: new AbortController().signal,
+    onJudgment,
+  };
+  systemOne.mockResolvedValueOnce({
+    answers: {
+      category: {
+        ...inheritedAnswer,
+        probabilities: { inherited: 1, introduced: 1, unknown: 0 },
+      },
+    },
+  });
+  await expect(isInherited(input)).resolves.toBe(false);
+  systemOne.mockRejectedValueOnce(new Error("Jev unavailable"));
+  await expect(isInherited(input)).resolves.toBe(false);
+  const controller = new AbortController();
+  controller.abort();
+  systemOne.mockRejectedValueOnce(new Error("aborted"));
+  await expect(
+    isInherited({ ...input, signal: controller.signal }),
+  ).resolves.toBe(false);
+  const common = {
+    ...attributionBase,
+    decision: "keep",
+    evidenceStatus: "available",
+    evidenceReason: null,
+  };
+  expect(onJudgment.mock.calls).toEqual([
+    [
+      {
+        ...common,
+        reason: "response_invalid",
+        issues: ["answers.category.probabilities"],
+      },
+    ],
+    [{ ...common, reason: "request_failed" }],
+    [{ ...common, reason: "cancelled" }],
+  ]);
+});
+
+it("records each reviewer entry dropped by the local check with the cited line", async () => {
+  const onJudgment = vi.fn();
+  const drop = { stage: "review", decision: "drop", invalidFields: [] };
+  const { child } = subprocess();
+  const pending = reviewFile({ ...request(), onJudgment });
+  finish(child, [
+    { ...valid, line: 1 },
+    { ...valid, evidence: " " },
+    "not an object",
+    { ...valid, title: "t".repeat(600), quote: " " },
+    valid,
+  ]);
+  await expect(pending).resolves.toEqual([valid]);
+  expect(onJudgment.mock.calls).toEqual([
+    [
+      {
+        ...drop,
+        reason: "quote_mismatch",
+        line: 1,
+        title: valid.title,
+        quote: valid.quote,
+        lineText: "const user = null;",
+        quoteLines: [2],
+      },
+    ],
+    [
+      {
+        ...drop,
+        reason: "entry_invalid",
+        line: 2,
+        title: valid.title,
+        quote: valid.quote,
+        lineText: "console.log(user.name);",
+        quoteLines: [2],
+        invalidFields: ["evidence"],
+      },
+    ],
+    [
+      {
+        ...drop,
+        reason: "entry_invalid",
+        line: null,
+        title: null,
+        quote: null,
+        lineText: null,
+        quoteLines: [],
+        invalidFields: ["entry"],
+      },
+    ],
+    [
+      {
+        ...drop,
+        reason: "entry_invalid",
+        line: 2,
+        title: "t".repeat(500),
+        quote: " ",
+        lineText: "console.log(user.name);",
+        quoteLines: [],
+        invalidFields: ["title", "quote"],
+      },
+    ],
+  ]);
+});
+
+it("bounds the recorded lines where a misplaced quote occurs", async () => {
+  const onJudgment = vi.fn();
+  const { child } = subprocess();
+  const pending = reviewFile({
+    ...request("omp", "a\n".repeat(7)),
+    onJudgment,
+  });
+  finish(child, [{ ...valid, line: 99, quote: "a" }]);
+  await expect(pending).resolves.toEqual([]);
+  expect(onJudgment).toHaveBeenCalledExactlyOnceWith({
+    stage: "review",
+    decision: "drop",
+    reason: "line_out_of_range",
+    line: 99,
+    title: valid.title,
+    quote: "a",
+    lineText: null,
+    quoteLines: [1, 2, 3, 4, 5],
+    invalidFields: [],
+  });
+});
+
+it.each([
+  ["not json", "output_not_json", null],
+  ['{"findings":null}', "envelope_invalid", null],
+  ['{"findings":[{},{},{},{},{},{}]}', "too_many_findings", 6],
+] as const)(
+  "records why reviewer output %s failed before rejecting it",
+  async (output, reason, count) => {
+    const onJudgment = vi.fn();
+    const { child } = subprocess();
+    const pending = reviewFile({ ...request(), onJudgment });
+    finishText(child, output);
+    await expect(pending).rejects.toThrow();
+    expect(onJudgment).toHaveBeenCalledExactlyOnceWith({
+      stage: "review",
+      decision: "fail",
+      reason,
+      count,
+    });
+  },
+);
+
 it.each(["pi", "omp"] as const)(
   "returns %s findings alongside one redacted usage observation",
   async (host) => {

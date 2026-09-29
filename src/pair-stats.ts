@@ -34,6 +34,81 @@ const Observation = z.object({
     })
     .optional(),
 });
+const Probability = z.number().min(0).max(1);
+const Decision = z.enum(["keep", "drop"]);
+// Free text (titles, quotes, line text) lives only in session entries, which
+// already contain the reviewed code; the file logger receives reason codes.
+const ReviewDrop = z.object({
+  stage: z.literal("review"),
+  decision: z.literal("drop"),
+  reason: z.enum(["entry_invalid", "line_out_of_range", "quote_mismatch"]),
+  line: z.number().nullable(),
+  title: z.string().nullable(),
+  quote: z.string().nullable(),
+  lineText: z.string().nullable(),
+  quoteLines: z.array(z.number()),
+  invalidFields: z.array(z.string()),
+});
+const ReviewFailure = z.object({
+  stage: z.literal("review"),
+  decision: z.literal("fail"),
+  reason: z.enum(["output_not_json", "envelope_invalid", "too_many_findings"]),
+  count: Count.nullable(),
+});
+const Attribution = z.object({
+  stage: z.literal("attribution"),
+  decision: Decision,
+  reason: z.enum([
+    "judged",
+    "evidence_unavailable",
+    "no_diff",
+    "no_origin",
+    "response_invalid",
+    "request_failed",
+    "cancelled",
+  ]),
+  findingId: z.string(),
+  line: z.number(),
+  title: z.string(),
+  quote: z.string(),
+  evidenceStatus: z.enum(["available", "unavailable"]),
+  evidenceReason: z.string().nullable(),
+  choice: z.enum(["inherited", "introduced", "unknown"]).optional(),
+  confidence: Probability.optional(),
+  probabilities: z
+    .object({
+      inherited: Probability,
+      introduced: Probability,
+      unknown: Probability,
+    })
+    .optional(),
+  thresholds: z
+    .object({ confidence: Probability, inherited: Probability })
+    .optional(),
+  issues: z.array(z.string()).optional(),
+});
+const Dedup = z.object({
+  stage: z.literal("dedup"),
+  decision: Decision,
+  reason: z.enum([
+    "first",
+    "unchanged",
+    "judged",
+    "response_invalid",
+    "request_failed",
+    "cancelled",
+  ]),
+  findingId: z.string(),
+  duplicateKey: z.string(),
+  line: z.number(),
+  title: z.string(),
+  history: z.array(z.string()),
+  candidates: z.array(z.string()),
+  sameKey: z.array(z.string()),
+  score: Probability.optional(),
+  threshold: Probability.optional(),
+});
+const Judgment = z.union([ReviewDrop, ReviewFailure, Attribution, Dedup]);
 const Event = z.discriminatedUnion("action", [
   z.object({
     action: z.literal("start"),
@@ -60,6 +135,13 @@ const Event = z.discriminatedUnion("action", [
     jobId: z.string(),
     observation: Observation,
   }),
+  z.object({
+    action: z.literal("judgment"),
+    id: z.string(),
+    sessionId: z.string(),
+    jobId: z.string(),
+    judgment: Judgment,
+  }),
 ]);
 const Entry = z.object({
   type: z.literal("custom"),
@@ -69,6 +151,12 @@ const Entry = z.object({
 
 type StatsEvent = z.infer<typeof Event>;
 export type ReviewOutcome = z.infer<typeof Outcome>;
+export type ReviewDropJudgment = z.infer<typeof ReviewDrop>;
+export type ReviewFailureJudgment = z.infer<typeof ReviewFailure>;
+export type AttributionJudgment = z.infer<typeof Attribution>;
+export type DedupJudgment = z.infer<typeof Dedup>;
+export type Judgment = z.infer<typeof Judgment>;
+export type JudgmentObserver = (judgment: Judgment) => void;
 export interface MeasuredTotal {
   value: number;
   measured: number;
@@ -175,6 +263,16 @@ export class PairStats {
     });
   }
 
+  judge(jobId: string, judgment: Judgment): void {
+    this.record({
+      action: "judgment",
+      id: randomUUID(),
+      sessionId: this.sessionId,
+      jobId,
+      judgment,
+    });
+  }
+
   snapshot(): StatsSnapshot {
     const result: StatsSnapshot = {
       reviews: {
@@ -225,6 +323,7 @@ export class PairStats {
           break;
         }
         case "settled":
+        case "judgment":
           break;
       }
     }

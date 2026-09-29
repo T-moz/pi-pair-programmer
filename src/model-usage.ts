@@ -69,9 +69,10 @@ function metadata(value: unknown, judge = false): Metadata {
   return result;
 }
 
-function notify(
-  observer: ModelCallObserver | undefined,
-  event: ModelCallObservation,
+/** Delivers a diagnostic event; observer failures never alter a review. */
+export function notify<T>(
+  observer: ((event: T) => void) | undefined,
+  event: T,
 ): void {
   try {
     observer?.(event);
