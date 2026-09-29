@@ -16,6 +16,11 @@ interface AdmissionRequest {
 
 type Candidate = Finding & { duplicateKey: string };
 
+export interface AdmissionResult {
+  outcome: "obsolete" | "unchanged" | "added";
+  ids: readonly string[];
+}
+
 let jevClient: TypeSafeClient | undefined;
 
 function hash(parts: readonly string[]): string {
@@ -132,9 +137,8 @@ export class FindingAdmission {
     this.store = store;
   }
 
-  async admit(
-    request: AdmissionRequest,
-  ): Promise<"obsolete" | "unchanged" | "added"> {
+  /** Admits novel findings; `ids` lists exactly the findings this call added. */
+  async admit(request: AdmissionRequest): Promise<AdmissionResult> {
     const { file, signal } = request;
     let history = this.store.history(file);
     let novel = await novelFindings(
@@ -145,7 +149,8 @@ export class FindingAdmission {
       request.onModelCall,
     );
     for (;;) {
-      if (!(await request.isCurrent()) || signal.aborted) return "obsolete";
+      if (!(await request.isCurrent()) || signal.aborted)
+        return { outcome: "obsolete", ids: [] };
       const latest = this.store.history(file);
       const added = latest.slice(history.length);
       if (novel.length === 0 || added.length === 0) break;
@@ -158,10 +163,9 @@ export class FindingAdmission {
         request.onModelCall,
       );
     }
-    let result: "unchanged" | "added" = "unchanged";
-    for (const finding of novel) {
-      if (this.store.add(finding)) result = "added";
-    }
-    return result;
+    const ids = novel
+      .filter((finding) => this.store.add(finding))
+      .map((finding) => finding.id);
+    return { outcome: ids.length > 0 ? "added" : "unchanged", ids };
   }
 }

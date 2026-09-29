@@ -531,9 +531,6 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       count: judged.filter(({ inherited }) => inherited).length,
     });
     if (signal.aborted || !(await current(job))) return "obsolete";
-    const before = new Set(
-      store.history(job.file).map((stored) => stored.finding.id),
-    );
     const result = await admission.admit({
       file: job.file,
       reviewer,
@@ -548,20 +545,11 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     logger?.log("finding.admission", {
       sessionId: job.stats.sessionId,
       jobId: job.id,
-      outcome: result,
+      outcome: result.outcome,
     });
-    if (result === "obsolete") return "obsolete";
-    if (result === "added") {
-      feed.attach(
-        job.id,
-        store
-          .history(job.file)
-          .filter(
-            ({ finding }) =>
-              finding.reviewer === reviewer && !before.has(finding.id),
-          )
-          .map(({ finding }) => finding.id),
-      );
+    if (result.outcome === "obsolete") return "obsolete";
+    if (result.outcome === "added") {
+      feed.attach(job.id, result.ids);
       scheduleWake(job.ctx);
     }
     reviewed.set(`${job.key}:${reviewer}:${job.model}`, job.revision);

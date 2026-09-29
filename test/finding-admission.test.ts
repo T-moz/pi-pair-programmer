@@ -98,7 +98,7 @@ it.each(["accept", "reject"] as const)(
     );
     expect(
       await admission.admit({ ...request([changed]), revision: "revision-2" }),
-    ).toBe("added");
+    ).toHaveProperty("outcome", "added");
     const second = readyFinding(store);
     expect(second.id).not.toBe(first.id);
     store.deliver([second.id]);
@@ -121,7 +121,7 @@ it.each(["accept", "reject"] as const)(
         ...request([changed]),
         revision: "revision-3",
       }),
-    ).toBe("unchanged");
+    ).toHaveProperty("outcome", "unchanged");
     expect(restored.store.ready()).toEqual([]);
   },
 );
@@ -138,13 +138,13 @@ it("suppresses repeated evidence across revisions, lines, and a Jev outage", asy
       ...request([{ ...proposal, line: 20, title: " NULL DEREFERENCE " }]),
       revision: "revision-2",
     }),
-  ).toBe("unchanged");
+  ).toHaveProperty("outcome", "unchanged");
   expect(
     await admission.admit({
       ...request([{ ...proposal, evidence: "Reworded nullable access" }]),
       revision: "revision-3",
     }),
-  ).toBe("unchanged");
+  ).toHaveProperty("outcome", "unchanged");
   expect(systemOne).toHaveBeenCalledOnce();
   expect(store.ready()).toEqual([]);
   expect(store.history("src/example.ts")).toEqual([
@@ -214,9 +214,15 @@ it("retains legacy decisions and duplicate identity without rewriting historical
   const { admission, store } = session(entries);
   systemOne.mockRejectedValueOnce(new Error("Jev unavailable"));
   const changed = { ...proposal, evidence: "New caller triggers this access" };
-  expect(await admission.admit(request([changed]))).toBe("unchanged");
+  expect(await admission.admit(request([changed]))).toHaveProperty(
+    "outcome",
+    "unchanged",
+  );
   expect(entries.map(({ data }) => data)).toEqual(events);
-  expect(await admission.admit(request([changed]))).toBe("added");
+  expect(await admission.admit(request([changed]))).toHaveProperty(
+    "outcome",
+    "added",
+  );
   const second = readyFinding(store);
   expect(second.id).not.toBe(legacy.id);
   expect(store.history(legacy.file)[0]).toEqual({
@@ -240,14 +246,14 @@ it("rechecks concurrent equivalent findings and never serializes unrelated files
     reviewer: "risks",
     isCurrent: () => secondCheck.promise,
   });
-  expect(await admission.admit({ ...request(), file: "src/other.ts" })).toBe(
-    "added",
-  );
+  expect(
+    await admission.admit({ ...request(), file: "src/other.ts" }),
+  ).toHaveProperty("outcome", "added");
   firstCheck.resolve(true);
-  expect(await pendingFirst).toBe("added");
+  expect(await pendingFirst).toHaveProperty("outcome", "added");
   systemOne.mockResolvedValue(duplicate);
   secondCheck.resolve(true);
-  expect(await pendingSecond).toBe("unchanged");
+  expect(await pendingSecond).toHaveProperty("outcome", "unchanged");
   expect(store.ready().map(({ file, title }) => ({ file, title }))).toEqual([
     { file: "src/other.ts", title: proposal.title },
     { file: "src/example.ts", title: proposal.title },
@@ -264,7 +270,7 @@ it("keeps multiple distinct candidates after another review commits during judgm
   });
   await admission.admit(request([{ ...proposal, title: "Missing timeout" }]));
   check.resolve(true);
-  expect(await pending).toBe("added");
+  expect(await pending).toHaveProperty("outcome", "added");
   expect(store.ready().map(({ title }) => title)).toEqual([
     "Missing timeout",
     proposal.title,
@@ -291,7 +297,8 @@ it.each(["obsolete", "abort", "disabled"] as const)(
     else store.setEnabled(false);
     const previous = [...entries];
     judgment.resolve(novel);
-    expect(await pending).toBe(
+    expect(await pending).toHaveProperty(
+      "outcome",
       change === "disabled" ? "unchanged" : "obsolete",
     );
     expect(entries).toEqual(previous);
@@ -322,16 +329,19 @@ it("does not persist candidates after a judgment aborts and ignores already-abor
     signal: controller.signal,
   });
   controller.abort();
-  expect(await pending).toBe("obsolete");
+  expect(await pending).toHaveProperty("outcome", "obsolete");
   expect(
     await admission.admit({ ...request(), signal: controller.signal }),
-  ).toBe("obsolete");
+  ).toHaveProperty("outcome", "obsolete");
   expect(store.ready()).toEqual([first]);
 });
 
 it("leaves the queue unchanged when no findings survive review", async () => {
   const { admission, store, entries } = session();
-  expect(await admission.admit(request([]))).toBe("unchanged");
+  expect(await admission.admit(request([]))).toHaveProperty(
+    "outcome",
+    "unchanged",
+  );
   expect(store.ready()).toEqual([]);
   expect(entries).toEqual([]);
 });
@@ -339,12 +349,12 @@ it("leaves the queue unchanged when no findings survive review", async () => {
 it("accounts only real dedup calls and keeps deterministic duplicate fast paths silent", async () => {
   const { admission, store } = session();
   const onModelCall = vi.fn();
-  await expect(admission.admit({ ...request(), onModelCall })).resolves.toBe(
-    "added",
-  );
-  await expect(admission.admit({ ...request(), onModelCall })).resolves.toBe(
-    "unchanged",
-  );
+  await expect(
+    admission.admit({ ...request(), onModelCall }),
+  ).resolves.toHaveProperty("outcome", "added");
+  await expect(
+    admission.admit({ ...request(), onModelCall }),
+  ).resolves.toHaveProperty("outcome", "unchanged");
   expect(onModelCall).not.toHaveBeenCalled();
   systemOne.mockResolvedValueOnce({
     ...novel,
@@ -356,7 +366,7 @@ it("accounts only real dedup calls and keeps deterministic duplicate fast paths 
       ...request([{ ...proposal, title: "Other defect" }]),
       onModelCall,
     }),
-  ).resolves.toBe("added");
+  ).resolves.toHaveProperty("outcome", "added");
   expect(store.ready().map(({ title }) => title)).toEqual([
     proposal.title,
     "Other defect",
@@ -381,13 +391,13 @@ it("preserves deterministic fail-open decisions while recording unavailable judg
       ...request([{ ...proposal, evidence: "Changed wording" }]),
       onModelCall,
     }),
-  ).resolves.toBe("unchanged");
+  ).resolves.toHaveProperty("outcome", "unchanged");
   await expect(
     admission.admit({
       ...request([{ ...proposal, title: "Distinct defect" }]),
       onModelCall,
     }),
-  ).resolves.toBe("added");
+  ).resolves.toHaveProperty("outcome", "added");
   expect(store.ready().map(({ title }) => title)).toEqual([
     proposal.title,
     "Distinct defect",
@@ -416,7 +426,7 @@ it("does not let an accounting exception alter a semantic duplicate decision", a
         throw new Error("journal offline");
       },
     }),
-  ).resolves.toBe("unchanged");
+  ).resolves.toHaveProperty("outcome", "unchanged");
   expect(store.ready()).toEqual([original]);
 });
 
@@ -443,7 +453,7 @@ it("records one cancelled dedup call without admitting its findings", async () =
     onModelCall,
   });
   controller.abort();
-  await expect(pending).resolves.toBe("obsolete");
+  await expect(pending).resolves.toHaveProperty("outcome", "obsolete");
   expect(store.ready()).toEqual([original]);
   expect(onModelCall).toHaveBeenCalledExactlyOnceWith({
     stage: "dedup",
