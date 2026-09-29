@@ -36,8 +36,6 @@ const Observation = z.object({
 });
 const Probability = z.number().min(0).max(1);
 const Decision = z.enum(["keep", "drop"]);
-// Free text (titles, quotes, line text) lives only in session entries, which
-// already contain the reviewed code; the file logger receives reason codes.
 const ReviewDrop = z.object({
   stage: z.literal("review"),
   decision: z.literal("drop"),
