@@ -16,6 +16,7 @@ export type PairLogEvent =
   | "review.skipped"
   | "model.finished"
   | "finding.filtered"
+  | "finding.judged"
   | "finding.admission"
   | "finding.verdict"
   | "delivery.sent"
@@ -37,6 +38,9 @@ export interface PairLogFields {
   cacheWriteTokens?: number;
   totalTokens?: number;
   costUsd?: number;
+  confidence?: number | undefined;
+  probability?: number | undefined;
+  score?: number | undefined;
 }
 
 export interface PairLogger {
@@ -56,6 +60,7 @@ const events: Record<PairLogEvent, true> = {
   "review.skipped": true,
   "model.finished": true,
   "finding.filtered": true,
+  "finding.judged": true,
   "finding.admission": true,
   "finding.verdict": true,
   "delivery.sent": true,
@@ -70,6 +75,9 @@ const numericFields: Record<string, true> = {
   cacheWriteTokens: true,
   totalTokens: true,
   costUsd: true,
+  confidence: true,
+  probability: true,
+  score: true,
 };
 const identifierFields: Record<string, true> = {
   sessionId: true,
@@ -93,6 +101,8 @@ const outcomes = {
   accept: true,
   reject: true,
   invalid: true,
+  keep: true,
+  drop: true,
   on: true,
   off: true,
 };
@@ -123,6 +133,20 @@ const reasonCodes = {
   baseline_unavailable: true,
   configuration_failed: true,
   ui_unavailable: true,
+  entry_invalid: true,
+  line_out_of_range: true,
+  quote_mismatch: true,
+  output_not_json: true,
+  envelope_invalid: true,
+  too_many_findings: true,
+  judged: true,
+  evidence_unavailable: true,
+  no_diff: true,
+  no_origin: true,
+  response_invalid: true,
+  request_failed: true,
+  cancelled: true,
+  first: true,
 };
 const maxFileBytes = 1024 * 1024;
 const maxBufferedBytes = 64 * 1024;
@@ -163,6 +187,7 @@ const warningReasons: Record<string, true> = {
   missing_model: true,
   baseline_unavailable: true,
   ui_unavailable: true,
+  response_invalid: true,
 };
 
 function severity(
@@ -192,6 +217,7 @@ function severity(
     outcome === "obsolete" ||
     event === "review.skipped" ||
     event === "finding.filtered" ||
+    event === "finding.judged" ||
     (event === "delivery.wake" && reason !== "ready")
     ? "debug"
     : "info";

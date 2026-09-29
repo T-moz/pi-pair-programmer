@@ -1,5 +1,5 @@
 import { beforeEach, expect, it, vi } from "vitest";
-import { FindingAdmission } from "../src/finding-admission.js";
+import { FindingAdmission, findingId } from "../src/finding-admission.js";
 import type { ProposedFinding } from "../src/review-runner.js";
 import { ReviewStore, type Finding } from "../src/review-store.js";
 
@@ -451,6 +451,111 @@ it("records one cancelled dedup call without admitting its findings", async () =
     outcome: "cancelled",
     durationMs: expect.any(Number) as unknown,
   });
+});
+
+it("records each dedup decision with its score and the prior findings compared", async () => {
+  const { admission, store } = session();
+  const onJudgment = vi.fn();
+  const other = { ...proposal, title: "Other defect" };
+  const third = { ...proposal, title: "Third defect" };
+  const reworded = { ...proposal, evidence: "Reworded nullable access" };
+  const [firstId, otherId, thirdId, rewordedId] = [
+    proposal,
+    other,
+    third,
+    reworded,
+  ].map((finding) => findingId(request(), finding));
+  const admit = (findings: ProposedFinding[]): Promise<unknown> =>
+    admission.admit({ ...request(findings), onJudgment });
+
+  await admit([proposal, other]);
+  expect(store.ready().map(({ id }) => id)).toEqual([firstId, otherId]);
+  systemOne.mockResolvedValueOnce(duplicate);
+  await admit([proposal, third]);
+  systemOne.mockResolvedValueOnce({ answers: {} });
+  await admit([third]);
+  systemOne.mockRejectedValueOnce(new Error("Jev unavailable"));
+  await admit([reworded]);
+
+  const record = (
+    finding: ProposedFinding,
+    id: string | undefined,
+    fields: Record<string, unknown>,
+  ): unknown[] => [
+    {
+      stage: "dedup",
+      findingId: id,
+      duplicateKey: expect.any(String) as unknown,
+      line: finding.line,
+      title: finding.title,
+      candidates: [],
+      sameKey: [],
+      ...fields,
+    },
+  ];
+  const history = [firstId, otherId];
+  expect(onJudgment.mock.calls).toEqual([
+    record(proposal, firstId, {
+      decision: "keep",
+      reason: "first",
+      history: [],
+    }),
+    record(other, otherId, {
+      decision: "keep",
+      reason: "judged",
+      history: [],
+      candidates: [firstId],
+      score: 0.01,
+      threshold: 0.5,
+    }),
+    record(proposal, firstId, {
+      decision: "drop",
+      reason: "unchanged",
+      history,
+      sameKey: [firstId],
+    }),
+    record(third, thirdId, {
+      decision: "drop",
+      reason: "judged",
+      history,
+      candidates: [firstId],
+      sameKey: [],
+      score: 0.99,
+      threshold: 0.5,
+    }),
+    record(third, thirdId, {
+      decision: "keep",
+      reason: "response_invalid",
+      history,
+    }),
+    record(reworded, rewordedId, {
+      decision: "drop",
+      reason: "request_failed",
+      history: [...history, thirdId],
+      sameKey: [firstId],
+    }),
+  ]);
+});
+
+it("records a cancelled dedup judgment", async () => {
+  const { admission } = session();
+  await admission.admit(request());
+  const controller = new AbortController();
+  const onJudgment = vi.fn();
+  systemOne.mockImplementationOnce(() => {
+    controller.abort();
+    return Promise.reject(new Error("cancelled"));
+  });
+  await expect(
+    admission.admit({
+      ...request([{ ...proposal, title: "Distinct defect" }]),
+      signal: controller.signal,
+      onJudgment,
+    }),
+  ).resolves.toBe("obsolete");
+  expect(onJudgment).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ decision: "keep", reason: "cancelled" }),
+  );
 });
 
 it("propagates journal failure without making an unrecorded finding deliverable", async () => {

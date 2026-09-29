@@ -3,18 +3,33 @@ import { choice, TypeSafeClient } from "@typesafe-ai/sdk";
 import { z } from "zod";
 import type { ChangeEvidence } from "./change-evidence.js";
 import {
+  notify,
   observeJudgment,
   ReviewEventStream,
   type ModelCallObserver,
 } from "./model-usage.js";
+import type {
+  AttributionJudgment,
+  JudgmentObserver,
+  ReviewDropJudgment,
+  ReviewFailureJudgment,
+} from "./pair-stats.js";
 
 const MAX_SOURCE_CHARACTERS = 60_000;
 const MAX_FINDINGS = 5;
+const MAX_RECORDED_TEXT = 500;
+const MAX_QUOTE_LINES = 5;
+const ATTRIBUTION_THRESHOLDS = { confidence: 0.95, inherited: 0.95 } as const;
 const proposedFindingSchema = z.looseObject({
   line: z.number().int().positive(),
   title: z.string().min(1).max(160).regex(/\S/u),
   quote: z.string().min(1).max(240).regex(/\S/u),
   evidence: z.string().min(1).max(500).regex(/\S/u),
+});
+const rawFindingSchema = z.looseObject({
+  line: z.unknown(),
+  title: z.unknown(),
+  quote: z.unknown(),
 });
 const reviewResultSchema = z.object({
   findings: z.array(z.unknown()).max(MAX_FINDINGS),
@@ -71,6 +86,7 @@ interface ReviewRequest {
   source: string;
   signal: AbortSignal;
   onModelCall?: ModelCallObserver;
+  onJudgment?: JudgmentObserver;
 }
 
 function invoke(
@@ -152,7 +168,7 @@ async function complete(
   prompt: string,
   signal: AbortSignal,
   onModelCall: ModelCallObserver | undefined,
-): Promise<unknown> {
+): Promise<string> {
   const args = [
     "--no-session",
     "--no-tools",
@@ -177,11 +193,7 @@ async function complete(
     args.unshift(script);
   }
 
-  const stdout = (
-    await invoke(args, cwd, prompt, signal, model, onModelCall)
-  ).trim();
-  const fenced = /^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```$/iu.exec(stdout);
-  return JSON.parse(fenced?.[1] ?? stdout) as unknown;
+  return (await invoke(args, cwd, prompt, signal, model, onModelCall)).trim();
 }
 
 export async function reviewFile(
@@ -228,8 +240,36 @@ Reply with the JSON object alone, without any other text.`,
     request.onModelCall,
   );
 
-  const envelope = reviewResultSchema.safeParse(result);
+  return validFindings(result, lines, request.onJudgment);
+}
+
+function validFindings(
+  answer: string,
+  lines: readonly string[],
+  onJudgment: JudgmentObserver | undefined,
+): ProposedFinding[] {
+  const fail = (
+    reason: ReviewFailureJudgment["reason"],
+    count: number | null,
+  ): void => {
+    notify(onJudgment, { stage: "review", decision: "fail", reason, count });
+  };
+  const fenced = /^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```$/iu.exec(answer);
+  let output: unknown;
+  try {
+    output = JSON.parse(fenced?.[1] ?? answer);
+  } catch (error) {
+    fail("output_not_json", null);
+    throw error;
+  }
+  const envelope = reviewResultSchema.safeParse(output);
   if (!envelope.success) {
+    const entries = z
+      .object({ findings: z.array(z.unknown()) })
+      .safeParse(output);
+    if (entries.success)
+      fail("too_many_findings", entries.data.findings.length);
+    else fail("envelope_invalid", null);
     throw new Error("Reviewer returned an invalid findings array");
   }
   const findings: ProposedFinding[] = [];
@@ -240,28 +280,111 @@ Reply with the JSON object alone, without any other text.`,
       lines[parsed.data.line - 1]?.includes(parsed.data.quote) === true
     ) {
       findings.push(parsed.data);
+    } else {
+      notify(onJudgment, rejectedEntry(entry, parsed, lines));
     }
   }
   return findings;
 }
 
-export async function isInherited(request: {
+function rejectedEntry(
+  entry: unknown,
+  parsed: z.ZodSafeParseResult<z.infer<typeof proposedFindingSchema>>,
+  lines: readonly string[],
+): ReviewDropJudgment {
+  if (parsed.success) {
+    const { line, title, quote } = parsed.data;
+    const lineText = lines[line - 1];
+    return {
+      stage: "review",
+      decision: "drop",
+      reason: lineText === undefined ? "line_out_of_range" : "quote_mismatch",
+      line,
+      title,
+      quote,
+      lineText: recordedText(lineText),
+      quoteLines: linesContaining(lines, quote),
+      invalidFields: [],
+    };
+  }
+  const raw = rawFindingSchema.safeParse(entry);
+  const fields: { line?: unknown; title?: unknown; quote?: unknown } =
+    raw.success ? raw.data : {};
+  const line = Number.isSafeInteger(fields.line) ? Number(fields.line) : null;
+  const quote = typeof fields.quote === "string" ? fields.quote : null;
+  return {
+    stage: "review",
+    decision: "drop",
+    reason: "entry_invalid",
+    line,
+    title: recordedText(fields.title),
+    quote: recordedText(quote),
+    lineText: line === null ? null : recordedText(lines[line - 1]),
+    quoteLines:
+      quote === null || !/\S/u.test(quote) ? [] : linesContaining(lines, quote),
+    invalidFields: [
+      ...new Set(
+        parsed.error.issues.map((issue) =>
+          issue.path.length === 0 ? "entry" : String(issue.path[0]),
+        ),
+      ),
+    ],
+  };
+}
+
+function recordedText(value: unknown): string | null {
+  return typeof value === "string" ? value.slice(0, MAX_RECORDED_TEXT) : null;
+}
+
+function linesContaining(lines: readonly string[], quote: string): number[] {
+  const found: number[] = [];
+  for (const [index, line] of lines.entries()) {
+    if (found.length === MAX_QUOTE_LINES) break;
+    if (line.includes(quote)) found.push(index + 1);
+  }
+  return found;
+}
+
+/** Attribution judgment before runJob joins it to the finding id. */
+type Attribution = Omit<AttributionJudgment, "findingId">;
+
+interface AttributionRequest {
   finding: ProposedFinding;
   evidence: ChangeEvidence;
   signal: AbortSignal;
   onModelCall?: ModelCallObserver;
-}): Promise<boolean> {
-  const evidence = request.evidence;
-  if (
-    evidence.status !== "available" ||
-    evidence.diff === null ||
-    (evidence.before === null && evidence.origins.length === 0)
-  ) {
-    return false;
+  onJudgment?: (judgment: Attribution) => void;
+}
+
+export async function isInherited(
+  request: AttributionRequest,
+): Promise<boolean> {
+  const judgment = await attribute(request);
+  notify(request.onJudgment, judgment);
+  return judgment.decision === "drop";
+}
+
+async function attribute(request: AttributionRequest): Promise<Attribution> {
+  const { evidence, finding } = request;
+  const keep = (reason: Attribution["reason"]): Attribution => ({
+    stage: "attribution",
+    decision: "keep",
+    reason,
+    line: finding.line,
+    title: finding.title,
+    quote: finding.quote,
+    evidenceStatus: evidence.status,
+    evidenceReason: evidence.reason,
+  });
+  if (evidence.status !== "available") return keep("evidence_unavailable");
+  if (evidence.diff === null) return keep("no_diff");
+  if (evidence.before === null && evidence.origins.length === 0) {
+    return keep("no_origin");
   }
+  let response: unknown;
   try {
     const client = jev();
-    const response = await observeJudgment(
+    response = await observeJudgment(
       "attribution",
       request.signal,
       request.onModelCall,
@@ -295,14 +418,30 @@ export async function isInherited(request: {
           { signal: request.signal, timeout: 30_000, retry: { maxRetries: 0 } },
         ),
     );
-    const parsed = attributionSchema.safeParse(response);
-    return (
-      parsed.success &&
-      parsed.data.answers.category.choice === "inherited" &&
-      parsed.data.answers.category.confidence >= 0.95 &&
-      parsed.data.answers.category.probabilities.inherited >= 0.95
-    );
   } catch {
-    return false;
+    return keep(request.signal.aborted ? "cancelled" : "request_failed");
   }
+  const parsed = attributionSchema.safeParse(response);
+  if (!parsed.success) {
+    return {
+      ...keep("response_invalid"),
+      issues: [
+        ...new Set(parsed.error.issues.map((issue) => issue.path.join("."))),
+      ],
+    };
+  }
+  const category = parsed.data.answers.category;
+  const { confidence, probabilities } = category;
+  const inherited =
+    category.choice === "inherited" &&
+    confidence >= ATTRIBUTION_THRESHOLDS.confidence &&
+    probabilities.inherited >= ATTRIBUTION_THRESHOLDS.inherited;
+  return {
+    ...keep("judged"),
+    decision: inherited ? "drop" : "keep",
+    choice: category.choice,
+    confidence,
+    probabilities: { ...probabilities },
+    thresholds: { ...ATTRIBUTION_THRESHOLDS },
+  };
 }
