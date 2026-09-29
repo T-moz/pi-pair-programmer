@@ -831,3 +831,41 @@ it("retains fail-open attribution when accounting fails or the provider fails", 
     durationMs: expect.any(Number) as unknown,
   });
 });
+
+it.each([
+  ["pi", ["--tools", "web_search"], ["--no-tools", "--no-extensions"]],
+  ["omp", ["--tools", "web_search", "--no-extensions"], ["--no-tools"]],
+] as const)(
+  "grants only the configured tools to a %s reviewer",
+  async (host, expected, absent) => {
+    const original = [...process.argv];
+    process.argv[1] = path.join(process.cwd(), "pi-entry.mjs");
+    try {
+      const { child } = subprocess();
+      const pending = reviewFile({ ...request(host), tools: ["web_search"] });
+      const [, args, options] = vi.mocked(spawn).mock.calls[0] ?? [];
+      const joined = args?.join(" ") ?? "";
+      expect(joined).toContain(expected.join(" "));
+      for (const flag of absent) expect(args).not.toContain(flag);
+      const systemPrompt = args?.[args.indexOf("--system-prompt") + 1];
+      expect(systemPrompt).toContain("web_search");
+      expect(options?.env).toEqual(
+        expect.objectContaining({ PI_PAIR_PROGRAMMER_REVIEWER: "1" }),
+      );
+      finish(child, [valid]);
+      await expect(pending).resolves.toEqual([valid]);
+    } finally {
+      process.argv.splice(0, process.argv.length, ...original);
+    }
+  },
+);
+
+it("keeps tool guidance out of the prompt of a reviewer without tools", async () => {
+  const { child } = subprocess();
+  const pending = reviewFile({ ...request(), tools: [] });
+  const [, args] = vi.mocked(spawn).mock.calls[0] ?? [];
+  expect(args).toContain("--no-tools");
+  expect(args?.join(" ")).not.toContain("web_search");
+  finish(child, []);
+  await expect(pending).resolves.toEqual([]);
+});
