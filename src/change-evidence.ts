@@ -13,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { diffArrays } from "diff";
 import { z } from "zod";
 
 const execute = promisify(execFile);
@@ -846,7 +847,6 @@ export async function buildChangeEvidence(
   return evidence;
 }
 
-/** Current lines `start`..`start + added - 1` replace `removed` task-start lines. */
 export interface LineHunk {
   start: number;
   added: number;
@@ -856,82 +856,6 @@ export interface LineHunk {
 export type LineChanges =
   | { status: "available"; hunks: readonly LineHunk[] }
   | { status: "unavailable"; reason: string };
-
-interface MatchedLines {
-  before: Set<number>;
-  after: Set<number>;
-}
-
-// Myers indices always fall inside the preallocated rows.
-function cell(row: Int32Array, index: number): number {
-  return Number(row.at(index));
-}
-
-function towardPrevious(
-  row: Int32Array,
-  base: number,
-  k: number,
-  d: number,
-): boolean {
-  return (
-    k === -d || (k !== d && cell(row, base + k - 1) < cell(row, base + k + 1))
-  );
-}
-
-function matchedLines(
-  before: readonly string[],
-  after: readonly string[],
-): MatchedLines | undefined {
-  const offset = MAX_EDIT_DISTANCE + 1;
-  const frontier = new Int32Array(2 * offset + 1);
-  const trace: Int32Array[] = [];
-  for (let d = 0; d <= MAX_EDIT_DISTANCE; d += 1) {
-    trace.push(frontier.slice(offset - d - 1, offset + d + 2));
-    for (let k = -d; k <= d; k += 2) {
-      let x = towardPrevious(frontier, offset, k, d)
-        ? cell(frontier, offset + k + 1)
-        : cell(frontier, offset + k - 1) + 1;
-      let y = x - k;
-      while (
-        x < before.length &&
-        y < after.length &&
-        before.at(x) === after.at(y)
-      ) {
-        x += 1;
-        y += 1;
-      }
-      frontier[offset + k] = x;
-      if (x >= before.length && y >= after.length)
-        return backtrack(trace, before.length, after.length);
-    }
-  }
-  return undefined;
-}
-
-function backtrack(
-  trace: readonly Int32Array[],
-  beforeLength: number,
-  afterLength: number,
-): MatchedLines {
-  const kept: MatchedLines = { before: new Set(), after: new Set() };
-  let x = beforeLength;
-  let y = afterLength;
-  for (const [step, row] of [...trace.entries()].toReversed()) {
-    const k = x - y;
-    const previous = towardPrevious(row, step + 1, k, step) ? k + 1 : k - 1;
-    const previousX = cell(row, step + 1 + previous);
-    const previousY = previousX - previous;
-    while (x > previousX && y > previousY) {
-      x -= 1;
-      y -= 1;
-      kept.before.add(x);
-      kept.after.add(y);
-    }
-    x = previousX;
-    y = previousY;
-  }
-  return kept;
-}
 
 function lineHunks(before: string, after: string): LineHunk[] {
   const oldLines = before.split("\n");
@@ -956,28 +880,30 @@ function lineHunks(before: string, after: string): LineHunk[] {
   }
   const removed = oldLines.slice(start, oldEnd);
   const added = newLines.slice(start, newEnd);
-  const kept = matchedLines(removed, added) ?? {
-    before: new Set(),
-    after: new Set(),
-  };
+  const changes = diffArrays(removed, added, {
+    maxEditLength: MAX_EDIT_DISTANCE,
+  });
+  if (changes === undefined)
+    return [{ start: start + 1, added: added.length, removed }];
   const hunks: LineHunk[] = [];
-  let i = 0;
-  let j = 0;
-  while (i < removed.length || j < added.length) {
-    if (kept.before.has(i) && kept.after.has(j)) {
-      i += 1;
-      j += 1;
+  let line = start + 1;
+  let hunk: { start: number; added: number; removed: string[] } | undefined;
+  for (const change of changes) {
+    if (!change.added && !change.removed) {
+      hunk = undefined;
+      line += change.count;
       continue;
     }
-    const removedStart = i;
-    const addedStart = j;
-    while (i < removed.length && !kept.before.has(i)) i += 1;
-    while (j < added.length && !kept.after.has(j)) j += 1;
-    hunks.push({
-      start: start + addedStart + 1,
-      added: j - addedStart,
-      removed: removed.slice(removedStart, i),
-    });
+    if (hunk === undefined) {
+      hunk = { start: line, added: 0, removed: [] };
+      hunks.push(hunk);
+    }
+    if (change.added) {
+      hunk.added += change.count;
+      line += change.count;
+    } else {
+      hunk.removed.push(...change.value);
+    }
   }
   return hunks;
 }
