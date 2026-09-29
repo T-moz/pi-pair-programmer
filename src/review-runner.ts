@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { choice, TypeSafeClient } from "@typesafe-ai/sdk";
 import { z } from "zod";
 import type { ChangeEvidence } from "./change-evidence.js";
+import type { Host } from "./host.js";
 import {
   observeJudgment,
   ReviewEventStream,
@@ -49,7 +50,7 @@ function jev(): TypeSafeClient {
   return jevClient;
 }
 
-export type Host = "pi" | "omp";
+export type { Host } from "./host.js";
 
 export class ReviewTimeoutError extends Error {
   override name = "ReviewTimeoutError";
@@ -181,7 +182,12 @@ async function complete(
     await invoke(args, cwd, prompt, signal, model, onModelCall)
   ).trim();
   const fenced = /^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```$/iu.exec(stdout);
-  return JSON.parse(fenced?.[1] ?? stdout) as unknown;
+  try {
+    return JSON.parse(fenced?.[1] ?? stdout) as unknown;
+  } catch (error) {
+    // The job records a failed review; name the cause instead of a bare SyntaxError.
+    throw new Error("Reviewer returned malformed JSON", { cause: error });
+  }
 }
 
 export async function reviewFile(

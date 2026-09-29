@@ -12,6 +12,11 @@ import {
   captureBaseline,
   type TaskBaseline,
 } from "./change-evidence.js";
+import {
+  ACCEPTED_MESSAGE,
+  renderAccepted,
+  type CardDetails,
+} from "./finding-card.js";
 import { FindingAdmission } from "./finding-admission.js";
 import { createPairLogger, type PairLogger } from "./logger.js";
 import type { ModelCallObserver } from "./model-usage.js";
@@ -21,12 +26,21 @@ import {
   type PairStats,
   type ReviewOutcome,
 } from "./pair-stats.js";
-import { StatsView, statsLines } from "./stats-view.js";
+import {
+  StatsView,
+  statsHotspots,
+  type Tab,
+  statsLines,
+  statsSummary,
+} from "./stats-view.js";
+import { StatusOverlay, type StatusTone } from "./status-overlay.js";
+import { ReviewFeed } from "./review-feed.js";
+import { feedLines, ReviewSidebar } from "./review-sidebar.js";
+import { canFloat, hostOf, type Host } from "./host.js";
 import {
   isInherited,
   reviewFile,
   ReviewTimeoutError,
-  type Host,
 } from "./review-runner.js";
 import { ReviewStore, type Finding } from "./review-store.js";
 import {
@@ -34,6 +48,7 @@ import {
   loadReviewers,
   matchingReviewers,
   reviewerKey,
+  reviewerLabel,
   type ReviewerConfig,
 } from "./reviewers.js";
 
@@ -106,10 +121,6 @@ function decisionInteraction(
   );
 }
 
-function hostOf(ctx: ExtensionContext): Host {
-  return typeof ctx.modelRegistry.streamSimple === "function" ? "pi" : "omp";
-}
-
 function idle(ctx: ExtensionContext): boolean {
   try {
     return ctx.isIdle();
@@ -130,8 +141,12 @@ function describe(findings: readonly Finding[]): string {
   return `Review findings:\n${lines.join("\n")}\nAccept or reject every finding with pair_programmer_decide(findingId, decision, reason) before using another tool. Give a concrete reason for each decision.`;
 }
 
+function optionalReviewer(name: string | undefined): { reviewer?: string } {
+  return name === undefined ? {} : { reviewer: name };
+}
+
 function acceptedReview(finding: Finding, reason: string): string {
-  return `### Accepted review: ${finding.title}\n\n**${finding.file}:${String(finding.line)}**\n\n${finding.evidence}\n\n**Reason:** ${reason}`;
+  return `**Accepted review · ${finding.title}**\n\n\`${finding.file}:${String(finding.line)}\`\n\n${finding.evidence}\n\n**Why accepted:** ${reason}`;
 }
 
 export default function pairProgrammer(pi: ExtensionAPI): void {
@@ -143,6 +158,13 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     logger = await createPairLogger(pi);
   })();
   const statsView = new StatsView();
+  const statusOverlay = new StatusOverlay();
+  const feed = new ReviewFeed();
+  const reviewerNames = new Map<string, string>();
+  const sidebar = new ReviewSidebar(
+    () => feed.list(),
+    (id) => store.lookup(id),
+  );
   const accounting = new SessionAccounting();
   let activeContext: ExtensionContext | undefined;
   const cancelJobs = new Map<AbortController, () => void>();
@@ -165,11 +187,27 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   let resetTimer: NodeJS.Timeout | undefined;
   let checkReset: (() => void) | undefined;
 
-  function showState(ctx: ExtensionContext): void {
-    ctx.ui.setStatus(
-      "pair-programmer",
-      `Pair Programmer: ${store.enabled ? "on" : "off"}`,
-    );
+  function showState(ctx = activeContext): void {
+    if (ctx === undefined) return;
+    const findings = store.summary();
+    const running = accounting.stats.snapshot().reviews.running;
+    let tone: StatusTone = "success";
+    let state = "watching";
+    if (!store.enabled) {
+      tone = "dim";
+      state = "paused";
+    } else if (findings.outstanding > 0) {
+      tone = "warning";
+      state = `${String(findings.outstanding)} awaiting decision`;
+    } else if (running > 0) {
+      tone = "accent";
+      state = `reviewing · ${String(running)}`;
+    } else if (findings.pending > 0) {
+      tone = "accent";
+      state = `${String(findings.pending)} queued`;
+    }
+    statusOverlay.show(ctx, { tone, text: state });
+    sidebar.refresh(ctx);
   }
 
   function stopWatchingResets(): void {
@@ -229,6 +267,8 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     wakeTimer = undefined;
     wakePending = false;
     presented.clear();
+    if (reasonCode === "session_change" || reasonCode === "cleared")
+      feed.clear();
   }
 
   function deliverable(): readonly Finding[] {
@@ -259,6 +299,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     );
     const ids = batch.map((finding) => finding.id);
     store.deliver(ids);
+    showState();
     logger?.log("delivery.sent", {
       sessionId: accounting.stats.sessionId,
       count: ids.length,
@@ -335,6 +376,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       finished = true;
       const durationMs = performance.now() - started;
       job.stats.finish(job.id, result, durationMs, settled);
+      feed.finish(job.id, result, durationMs);
       logger?.log("review.finished", {
         ...fields,
         outcome: result,
@@ -378,6 +420,16 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       finish("cancelled", false);
     });
     job.stats.start(job.id);
+    reviewerNames.set(
+      reviewerKey(job.reviewer),
+      reviewerLabel(job.reviewer, job.model),
+    );
+    feed.start(job.id, {
+      file: job.file,
+      reviewer: reviewerLabel(job.reviewer, job.model),
+      model: job.model,
+    });
+    showState(job.ctx);
     logger?.log("review.started", fields);
     void (async () => {
       try {
@@ -394,6 +446,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
         accounting.retain(job.stats);
         controllers.delete(controller);
         cancelJobs.delete(controller);
+        if (job.session === generation) showState(job.ctx);
       }
     })();
   }
@@ -487,10 +540,13 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     logger?.log("finding.admission", {
       sessionId: job.stats.sessionId,
       jobId: job.id,
-      outcome: result,
+      outcome: result.outcome,
     });
-    if (result === "obsolete") return "obsolete";
-    if (result === "added") scheduleWake(job.ctx);
+    if (result.outcome === "obsolete") return "obsolete";
+    if (result.outcome === "added") {
+      feed.attach(job.id, result.ids);
+      scheduleWake(job.ctx);
+    }
     reviewed.set(`${job.key}:${reviewer}:${job.model}`, job.revision);
     return "success";
   }
@@ -738,11 +794,13 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   pi.on("session_before_switch", beforeSessionChange);
   pi.on("session_before_fork", beforeSessionChange);
   pi.on("session_before_tree", beforeSessionChange);
+  // SAFETY: OMP emits this event; Pi's event map omits it and never calls the handler.
   const onOmpBeforeBranch = pi.on.bind(pi) as unknown as (
     name: "session_before_branch",
     handler: () => void,
   ) => void;
   onOmpBeforeBranch("session_before_branch", beforeSessionChange);
+  // SAFETY: OMP emits these session events with Pi-compatible contexts; Pi never calls them.
   const onOmpSession = pi.on.bind(pi) as unknown as (
     name: "session_switch" | "session_branch",
     handler: (
@@ -760,7 +818,8 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   pi.on("session_shutdown", () => {
     stopWatchingResets();
     stop("shutdown");
-    activeContext?.ui.setStatus("pair-programmer", undefined);
+    statusOverlay.dispose();
+    sidebar.dispose();
     activeContext = undefined;
     accounting.suspend();
     replaceBaseline(undefined);
@@ -873,28 +932,37 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
           details: { saved: false },
         });
       }
-      const finding =
-        params.decision === "accept"
-          ? store.deliveredFinding(params.findingId)
-          : undefined;
+      const finding = store.deliveredFinding(params.findingId);
       const saved = store.decide(
         params.findingId,
         params.decision,
         params.reason,
       );
+      showState();
       logger?.log("finding.verdict", {
         sessionId: accounting.stats.sessionId,
         outcome: saved ? params.decision : "invalid",
       });
-      if (saved && params.decision === "accept" && finding !== undefined) {
-        pi.sendMessage(
-          {
-            customType: "pair-programmer-accepted",
-            content: acceptedReview(finding, params.reason),
-            display: true,
-          },
-          { triggerTurn: false },
-        );
+      if (saved && finding !== undefined) {
+        const details = {
+          title: finding.title,
+          file: finding.file,
+          line: finding.line,
+          evidence: finding.evidence,
+          reason: params.reason,
+          ...optionalReviewer(reviewerNames.get(finding.reviewer)),
+        } satisfies CardDetails;
+        // Only accepted findings reach the transcript; rejections stay in the feed.
+        if (params.decision === "accept")
+          pi.sendMessage(
+            {
+              customType: ACCEPTED_MESSAGE,
+              content: acceptedReview(finding, params.reason),
+              display: true,
+              details,
+            },
+            { triggerTurn: false },
+          );
       }
       return Promise.resolve({
         content: [
@@ -933,20 +1001,56 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       checkReset?.();
       stop("cleared");
       store.clear();
+      showState(ctx);
       ctx.ui.notify("Pair Programmer reviews cleared.", "info");
       return Promise.resolve();
     },
   });
 
+  const openStats = (ctx: ExtensionContext, tab?: Tab): Promise<void> => {
+    checkReset?.();
+    return statsView.open(
+      ctx,
+      () => {
+        const snapshot = accounting.stats.snapshot();
+        return {
+          summary: statsSummary(snapshot, store),
+          details: statsLines(snapshot, store),
+          hotspots: (width: number) => statsHotspots(store, width),
+          feed: (width: number) =>
+            feedLines(feed.list(), (id) => store.lookup(id), width),
+        };
+      },
+      tab,
+    );
+  };
+  // Hosts without non-capturing overlays (OMP) get the feed on demand instead.
+  const toggleFeed = (ctx: ExtensionContext): Promise<void> => {
+    checkReset?.();
+    if (!sidebar.open && !canFloat(ctx)) return openStats(ctx, "feed");
+    sidebar.toggle(ctx);
+    return Promise.resolve();
+  };
+  // OMP may not expose message renderers; its default rendering stays readable.
+  if (typeof pi.registerMessageRenderer === "function")
+    pi.registerMessageRenderer(ACCEPTED_MESSAGE, renderAccepted);
+
+  pi.registerCommand("pair-feed", {
+    description: "Toggle the live review sidebar (a feed view on OMP)",
+    handler: (_args, ctx) => toggleFeed(ctx),
+  });
+  // OMP may not expose shortcuts; the command remains the portable toggle.
+  if (typeof pi.registerShortcut === "function")
+    pi.registerShortcut("alt+r", {
+      description: "Toggle the Pair Programmer review sidebar",
+      handler: (ctx) => {
+        void toggleFeed(ctx);
+      },
+    });
+
   pi.registerCommand("pair-stats", {
     description:
       "Show on-demand Pair Programmer activity, findings and extension usage",
-    handler: (_args, ctx) => {
-      checkReset?.();
-      return statsView.open(
-        ctx,
-        statsLines(accounting.stats.snapshot(), store),
-      );
-    },
+    handler: (_args, ctx) => openStats(ctx),
   });
 }
