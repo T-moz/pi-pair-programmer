@@ -81,30 +81,27 @@ const MissingConfigErrorSchema = z.object({ code: z.literal("ENOENT") });
 
 const CONFIG_FILE = "pair-programmer.reviewers.json";
 
-/**
- * Loads the project config from `cwd`, else the global config from the agent
- * directory, else the default reviewers. The first config found wins whole.
- */
-export async function loadReviewers(
+export function loadReviewers(
   cwd: string,
   globalDirectory: string = agentDirectory(),
 ): Promise<readonly ReviewerConfig[]> {
-  return (
-    (await readConfig(path.join(cwd, CONFIG_FILE))) ??
-    (await readConfig(path.join(globalDirectory, CONFIG_FILE))) ??
-    DEFAULT_REVIEWERS
+  return readConfig(path.join(cwd, CONFIG_FILE), () =>
+    readConfig(path.join(globalDirectory, CONFIG_FILE), () =>
+      Promise.resolve(DEFAULT_REVIEWERS),
+    ),
   );
 }
 
 async function readConfig(
   file: string,
-): Promise<readonly ReviewerConfig[] | undefined> {
+  whenMissing: () => Promise<readonly ReviewerConfig[]>,
+): Promise<readonly ReviewerConfig[]> {
   let contents: string;
   try {
     contents = await readFile(file, "utf8");
   } catch (error) {
     if (MissingConfigErrorSchema.safeParse(error).success) {
-      return undefined;
+      return whenMissing();
     }
     throw new Error(`${file}: could not read reviewer configuration`, {
       cause: error,
