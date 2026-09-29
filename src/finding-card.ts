@@ -10,7 +10,7 @@ import {
   type Component,
 } from "@earendil-works/pi-tui";
 import { z } from "zod";
-import { truncatePath } from "./review-sidebar.js";
+import { truncatePath } from "./format.js";
 
 export const ACCEPTED_MESSAGE = "pair-programmer-accepted";
 /** Custom entry type: rendered in the transcript, never sent to the model. */

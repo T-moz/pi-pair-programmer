@@ -1,10 +1,10 @@
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import {
   sliceByColumn,
-  truncateToWidth,
   visibleWidth,
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import { frame, truncatePath } from "./format.js";
 import type { FeedEntry } from "./review-feed.js";
 import type { FindingView } from "./review-store.js";
 
@@ -16,24 +16,6 @@ const SPINNER = "◐◓◑◒";
 export const MIN_COLUMNS = 90;
 // Rows kept clear under the card for the editor and footer.
 const EDITOR_RESERVE = 8;
-
-/** Keeps the end of a path: drop whole leading directories first, then characters. */
-export function truncatePath(file: string, width: number): string {
-  if (visibleWidth(file) <= width) return file;
-  const parts = file.split("/");
-  for (let index = 1; index < parts.length; index += 1) {
-    const tail = `…/${parts.slice(index).join("/")}`;
-    if (visibleWidth(tail) <= width) return tail;
-  }
-  const graphemes = Array.from(
-    new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(file),
-    ({ segment }) => segment,
-  );
-  const start = graphemes.findIndex(
-    (_, index) => visibleWidth(`…${graphemes.slice(index).join("")}`) <= width,
-  );
-  return start === -1 ? "…" : `…${graphemes.slice(start).join("")}`;
-}
 
 /** Cuts text to `width` columns with a plain ellipsis (no stray reset codes). */
 function clip(text: string, width: number): string {
@@ -162,18 +144,14 @@ export function layoutSidebar(
   now = Date.now(),
   expanded: ReadonlySet<string> = new Set(),
 ): SidebarLayout {
-  const inner = Math.max(1, width - 4);
   const visible = entries.flatMap((entry) => {
     const findings = decided(entry, lookup);
     return entry.phase === "running" || findings.length > 0
       ? [{ entry, findings }]
       : [];
   });
-  const row = (text: string): string => {
-    const clipped = truncateToWidth(text, inner, "…");
-    const pad = " ".repeat(Math.max(0, inner - visibleWidth(clipped)));
-    return `${theme.fg("borderMuted", "│")} ${clipped}${pad} ${theme.fg("borderMuted", "│")}`;
-  };
+  const box = frame(theme, width, 1);
+  const inner = box.inner;
   const running = entries.filter((entry) => entry.phase === "running").length;
   const header = [
     theme.bold(theme.fg("accent", "Pair Programmer")),
@@ -225,11 +203,7 @@ export function layoutSidebar(
   }
   const content = [...header, ...body].slice(0, room + header.length);
   return {
-    lines: [
-      theme.fg("borderMuted", `╭${"─".repeat(Math.max(0, width - 2))}╮`),
-      ...[...content, ...footer].map(row),
-      theme.fg("borderMuted", `╰${"─".repeat(Math.max(0, width - 2))}╯`),
-    ],
+    lines: box.render([...content, ...footer]),
     rows: [
       ...Array.from<undefined>({ length: 1 + header.length }),
       ...owners.slice(0, content.length - header.length),

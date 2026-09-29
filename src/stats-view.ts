@@ -1,12 +1,8 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import {
-  truncateToWidth,
-  visibleWidth,
-  wrapTextWithAnsi,
-} from "@earendil-works/pi-tui";
+import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { MeasuredTotal, StatsSnapshot } from "./pair-stats.js";
 import type { ReviewStore } from "./review-store.js";
-import { truncatePath } from "./review-sidebar.js";
+import { frame, truncatePath } from "./format.js";
 
 function measured(
   total: MeasuredTotal,
@@ -205,8 +201,8 @@ export class StatsView {
           return {
             render(width: number): string[] {
               const columns = Math.max(1, width);
-              const framed = columns >= 12;
-              const inner = Math.max(1, columns - (framed ? 6 : 0));
+              const box = columns >= 12 ? frame(theme, columns, 2) : undefined;
+              const inner = box?.inner ?? columns;
               const tab = spec[1];
               let lines = report.summary;
               if (tab === "details") lines = report.details;
@@ -228,17 +224,6 @@ export class StatsView {
               );
               offset = Math.min(offset, Math.max(0, wrapped.length - pageSize));
               if (compact) return wrapped.slice(offset, offset + pageSize);
-              const row = (text: string): string => {
-                const clipped = truncateToWidth(text, inner, "…");
-                return framed
-                  ? theme.fg("borderMuted", "│") +
-                      "  " +
-                      clipped +
-                      " ".repeat(Math.max(0, inner - visibleWidth(clipped))) +
-                      "  " +
-                      theme.fg("borderMuted", "│")
-                  : clipped;
-              };
               const title = theme.bold(theme.fg("accent", "Pair Programmer"));
               const position = `${String(offset + 1)}–${String(Math.min(offset + pageSize, wrapped.length))}/${String(wrapped.length)}`;
               const others = TABS.filter(([, name]) => name !== tab);
@@ -250,20 +235,16 @@ export class StatsView {
                   ? `↑↓ scroll  ${tabs}  r refresh  esc  ${position}`
                   : `↑↓  ${others.map(([key]) => key).join(" ")}  r  q close`;
               const body = [
-                row(title),
-                row(theme.fg("dim", spec[2])),
-                row(""),
-                ...wrapped.slice(offset, offset + pageSize).map(row),
-                row(""),
-                row(theme.fg("dim", hint)),
+                title,
+                theme.fg("dim", spec[2]),
+                "",
+                ...wrapped.slice(offset, offset + pageSize),
+                "",
+                theme.fg("dim", hint),
               ];
-              return framed
-                ? [
-                    theme.fg("borderMuted", `╭${"─".repeat(columns - 2)}╮`),
-                    ...body,
-                    theme.fg("borderMuted", `╰${"─".repeat(columns - 2)}╯`),
-                  ]
-                : body;
+              return box === undefined
+                ? body.map((line) => truncateToWidth(line, inner, "…"))
+                : box.render(body);
             },
             handleInput(data: string): void {
               if (
