@@ -5,6 +5,8 @@ import {
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { frame, truncatePath } from "./format.js";
+import { canFloat } from "./host.js";
+import { OverlaySlot } from "./overlay-slot.js";
 import type { FeedEntry } from "./review-feed.js";
 import type { FindingView } from "./review-store.js";
 
@@ -223,9 +225,7 @@ export function renderSidebar(
 export class ReviewSidebar {
   private readonly entries: () => readonly FeedEntry[];
   private readonly lookup: Lookup;
-  private ctx: ExtensionContext | undefined;
-  private close: (() => void) | undefined;
-  private requestRender: (() => void) | undefined;
+  private readonly slot = new OverlaySlot();
   private ticker: NodeJS.Timeout | undefined;
   /** Reviews the user expanded by click; ids are unique per review. */
   private readonly expanded = new Set<string>();
@@ -236,7 +236,7 @@ export class ReviewSidebar {
   }
 
   get open(): boolean {
-    return this.ctx !== undefined;
+    return this.slot.ui !== undefined;
   }
 
   toggle(ctx: ExtensionContext): void {
@@ -244,7 +244,7 @@ export class ReviewSidebar {
       this.dispose();
       return;
     }
-    if (!ctx.hasUI || (ctx as Partial<ExtensionContext>).mode !== "tui") {
+    if (!canFloat(ctx)) {
       ctx.ui.notify("The review sidebar requires Pi's terminal UI.", "warning");
       return;
     }
@@ -253,88 +253,74 @@ export class ReviewSidebar {
 
   /** Re-render after feed or verdict changes; follows session replacement. */
   refresh(ctx?: ExtensionContext): void {
-    if (ctx !== undefined && this.open && ctx !== this.ctx) this.mount(ctx);
-    this.requestRender?.();
+    if (ctx !== undefined && this.open && ctx.ui !== this.slot.ui) {
+      if (canFloat(ctx)) this.mount(ctx);
+      else this.dispose();
+    }
+    this.slot.requestRender();
   }
 
   dispose(): void {
+    this.stopTicker();
+    this.slot.close();
+  }
+
+  private stopTicker(): void {
     clearInterval(this.ticker);
     this.ticker = undefined;
-    this.close?.();
-    this.close = undefined;
-    this.requestRender = undefined;
-    this.ctx = undefined;
   }
 
   private mount(ctx: ExtensionContext): void {
-    this.dispose();
-    this.ctx = ctx;
-    let active = true;
-    this.close = () => {
-      active = false;
-    };
-    const release = (): void => {
-      if (this.ctx === ctx) this.dispose();
-    };
-    void Promise.resolve(
-      ctx.ui.custom<undefined>(
-        (tui, theme, _keys, done) => {
-          const finish = (): void => {
-            active = false;
-            done(undefined);
-          };
-          if (active) this.close = finish;
-          else queueMicrotask(finish);
-          this.requestRender = () => {
-            tui.requestRender();
-          };
-          this.ticker = setInterval(() => {
-            if (this.entries().some((entry) => entry.phase === "running"))
-              tui.requestRender();
-          }, 250);
-          this.ticker.unref();
-          let rows: SidebarLayout["rows"] = [];
-          return {
-            render: (width: number): string[] => {
-              const layout = layoutSidebar(
-                this.entries(),
-                this.lookup,
-                theme,
-                width,
-                Math.max(8, tui.terminal.rows - EDITOR_RESERVE),
-                Date.now(),
-                this.expanded,
-              );
-              rows = layout.rows;
-              return layout.lines;
-            },
-            handleMouse: (event) => {
-              if (event.type !== "click" || event.button !== "left") return;
-              const id = rows[event.y];
-              const entry = this.entries().find(
-                (candidate) => candidate.id === id,
-              );
-              if (entry === undefined || entry.phase === "running") return;
-              if (!this.expanded.delete(entry.id)) this.expanded.add(entry.id);
-              return { handled: true, render: true };
-            },
-            invalidate(): void {
-              return;
-            },
-          };
-        },
-        {
-          overlay: true,
-          overlayOptions: {
-            anchor: "top-right",
-            width: "34%",
-            minWidth: 38,
-            margin: { top: 1, right: 1 },
-            nonCapturing: true,
-            visible: (columns: number) => columns >= MIN_COLUMNS,
+    this.stopTicker();
+    this.slot.open(
+      ctx,
+      (tui, theme) => {
+        let rows: SidebarLayout["rows"] = [];
+        return {
+          render: (width: number): string[] => {
+            const layout = layoutSidebar(
+              this.entries(),
+              this.lookup,
+              theme,
+              width,
+              Math.max(8, tui.terminal.rows - EDITOR_RESERVE),
+              Date.now(),
+              this.expanded,
+            );
+            rows = layout.rows;
+            return layout.lines;
           },
-        },
-      ),
-    ).then(release, release);
+          handleMouse: (event) => {
+            if (event.type !== "click" || event.button !== "left") return;
+            const id = rows[event.y];
+            const entry = this.entries().find(
+              (candidate) => candidate.id === id,
+            );
+            if (entry === undefined || entry.phase === "running") return;
+            if (!this.expanded.delete(entry.id)) this.expanded.add(entry.id);
+            return { handled: true, render: true };
+          },
+          invalidate(): void {
+            return;
+          },
+        };
+      },
+      {
+        anchor: "top-right",
+        width: "34%",
+        minWidth: 38,
+        margin: { top: 1, right: 1 },
+        nonCapturing: true,
+        visible: (columns: number) => columns >= MIN_COLUMNS,
+      },
+      () => {
+        this.stopTicker();
+      },
+    );
+    this.ticker = setInterval(() => {
+      if (this.entries().some((entry) => entry.phase === "running"))
+        this.slot.requestRender();
+    }, 250);
+    this.ticker.unref();
   }
 }

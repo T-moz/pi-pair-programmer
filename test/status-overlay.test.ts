@@ -1,185 +1,185 @@
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { describe, expect, it, vi, type Mock } from "vitest";
+import { describe, expect, it } from "vitest";
 import { StatusOverlay } from "../src/status-overlay.js";
+import { fakeHost, flush, openCapturing } from "./fake-host.js";
 
-type Factory = Parameters<ExtensionContext["ui"]["custom"]>[0];
-interface Options {
-  overlayOptions: () => {
-    anchor: string;
-    width: number;
-    nonCapturing: boolean;
-    visible: (columns: number) => boolean;
-  };
-}
-
-interface Host {
-  ctx: ExtensionContext;
-  custom: Mock<(factory: Factory, opts: Options) => Promise<undefined>>;
-  setWidget: ReturnType<typeof vi.fn>;
-  requestRender: ReturnType<typeof vi.fn>;
-  closed: ReturnType<typeof vi.fn>;
-  render: (width: number) => string[] | undefined;
-  options: () => ReturnType<Options["overlayOptions"]> | undefined;
-}
-
-function host(mode: string | undefined = "tui"): Host {
-  const requestRender = vi.fn();
-  const setWidget = vi.fn();
-  const closed = vi.fn();
-  let render: ((width: number) => string[]) | undefined;
-  let options: Options | undefined;
-  const custom = vi.fn(
-    async (factory: Factory, opts: Options): Promise<undefined> => {
-      options = opts;
-      const done = Promise.withResolvers<undefined>();
-      const component = await factory(
-        { requestRender } as unknown as Parameters<Factory>[0],
-        {
-          fg: (color: string, text: string) => `<${color}>${text}`,
-        } as unknown as Parameters<Factory>[1],
-        {} as Parameters<Factory>[2],
-        () => {
-          closed();
-          done.resolve(undefined);
-        },
-      );
-      render = (width) => component.render(width);
-      component.invalidate();
-      return done.promise;
-    },
-  );
-  const ctx = {
-    hasUI: true,
-    mode,
-    ui: { custom, setWidget },
-  } as unknown as ExtensionContext;
-  return {
-    ctx,
-    custom,
-    setWidget,
-    requestRender,
-    closed,
-    render: (width: number) => render?.(width),
-    options: () => options?.overlayOptions(),
-  };
-}
+const colored = {
+  fg: (color: string, text: string) => `<${color}>${text}`,
+  bold: (text: string) => text,
+};
 
 describe("StatusOverlay", () => {
   it("pins a non-capturing badge to the top-right and updates in place", async () => {
-    const tui = host();
+    const tui = fakeHost({ theme: colored });
     const overlay = new StatusOverlay();
     overlay.show(tui.ctx, { tone: "success", text: "watching" });
-    await Promise.resolve();
-    expect(tui.options()).toMatchObject({
+    await flush();
+    const badge = tui.top();
+    expect(badge?.options).toMatchObject({
       anchor: "top-right",
       width: 19,
       nonCapturing: true,
     });
-    expect(tui.options()?.visible(39)).toBe(false);
-    expect(tui.options()?.visible(40)).toBe(true);
-    expect(tui.render(80)).toEqual([" <success>◆ <muted>pair · watching "]);
-    overlay.show(tui.ctx, { tone: "warning", text: "2 awaiting decision" });
+    expect(badge?.options?.visible?.(39, 20)).toBe(false);
+    expect(badge?.options?.visible?.(40, 20)).toBe(true);
+    expect(tui.render(badge, 80)).toEqual([
+      " <success>◆ <muted>pair · watching ",
+    ]);
+    overlay.show(tui.event(), {
+      tone: "warning",
+      text: "2 awaiting decision",
+    });
     expect(tui.custom).toHaveBeenCalledTimes(1);
-    expect(tui.requestRender).toHaveBeenCalledTimes(2);
-    expect(tui.render(80)?.[0]).toContain("<warning>◆");
-    expect(tui.options()?.width).toBe(30);
-    expect(tui.render(5)?.[0]).toContain("…");
+    expect(tui.requestRender).toHaveBeenCalledTimes(1);
+    expect(tui.render(badge, 80)[0]).toContain("<warning>◆");
+    expect(tui.render(badge, 5)[0]).toContain("…");
     expect(tui.setWidget).not.toHaveBeenCalledWith(
       "pair-programmer",
       expect.anything(),
     );
     overlay.dispose();
-    expect(tui.closed).toHaveBeenCalledTimes(1);
-    expect(tui.setWidget).toHaveBeenLastCalledWith(
-      "pair-programmer",
-      undefined,
-    );
+    expect(tui.stack).toEqual([]);
+    badge?.component.invalidate();
+  });
+
+  it("never dismisses another overlay or remounts for fresh event contexts", async () => {
+    const tui = fakeHost();
+    const overlay = new StatusOverlay();
+    overlay.show(tui.ctx, { tone: "success", text: "watching" });
+    await flush();
+    const badge = tui.top();
+    const stats = openCapturing(tui);
+    await flush();
+    overlay.show(tui.event(), { tone: "accent", text: "reviewing · 1" });
+    await flush();
+    expect(tui.custom).toHaveBeenCalledTimes(2);
+    expect(tui.stack).toHaveLength(2);
+    overlay.dispose();
+    await flush();
+    expect(tui.stack.map((entry) => tui.render(entry, 40))).toEqual([
+      ["stats"],
+    ]);
+    expect(stats.closed()).toBe(false);
+    stats.close();
+    await flush();
+    expect(stats.closed()).toBe(true);
+    expect(badge?.settled).toBe(false);
   });
 
   it("closes a badge disposed before the host mounts it", async () => {
-    const tui = host();
-    let mount: (() => void) | undefined;
-    tui.custom.mockImplementationOnce(
-      (factory: Factory): Promise<undefined> => {
-        return new Promise<undefined>((resolve) => {
-          mount = () => {
-            const component = factory(
-              { requestRender: vi.fn() } as unknown as Parameters<Factory>[0],
-              {} as Parameters<Factory>[1],
-              {} as Parameters<Factory>[2],
-              () => {
-                resolve(undefined);
-              },
-            );
-            expect(component).toBeDefined();
-          };
-        });
-      },
-    );
+    const tui = fakeHost();
+    tui.defer();
     const overlay = new StatusOverlay();
     overlay.show(tui.ctx, { tone: "dim", text: "paused" });
     overlay.dispose();
-    mount?.();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(tui.setWidget).toHaveBeenLastCalledWith(
+    const stats = openCapturing(tui);
+    tui.release();
+    await flush();
+    await flush();
+    expect(tui.stack.map((entry) => tui.render(entry, 40))).toEqual([
+      ["stats"],
+    ]);
+    expect(stats.closed()).toBe(false);
+  });
+
+  it("closes through done() on hosts that provide no overlay handle", async () => {
+    const tui = fakeHost({ handles: false });
+    const overlay = new StatusOverlay();
+    overlay.show(tui.ctx, { tone: "dim", text: "paused" });
+    await flush();
+    expect(tui.stack).toHaveLength(1);
+    overlay.dispose();
+    await flush();
+    expect(tui.stack).toEqual([]);
+    expect(tui.setWidget).not.toHaveBeenCalledWith(
       "pair-programmer",
-      undefined,
+      expect.anything(),
     );
   });
 
-  it.each(["rpc", "print"])(
-    "falls back to a widget in %s mode without mounting an overlay",
-    (mode) => {
-      const tui = host(mode);
+  it.each([
+    { host: "pi", mode: "rpc" },
+    { host: "pi", mode: "print" },
+    // OMP reports "tui" but ignores nonCapturing, so a badge would eat typing.
+    { host: "omp", mode: "tui" },
+  ] as const)(
+    "uses a widget line on $host in $mode mode without mounting an overlay",
+    ({ host, mode }) => {
+      const tui = fakeHost({ host, mode });
       const overlay = new StatusOverlay();
       overlay.show(tui.ctx, { tone: "dim", text: "paused" });
       expect(tui.custom).not.toHaveBeenCalled();
       expect(tui.setWidget).toHaveBeenLastCalledWith("pair-programmer", [
         "◆ pair · paused",
       ]);
-      Object.assign(tui.ctx.ui, {
-        theme: { fg: (color: string, text: string) => `<${color}>${text}` },
-      });
-      overlay.show(tui.ctx, { tone: "accent", text: "1 queued" });
+      Object.assign(tui.ctx.ui, { theme: colored });
+      overlay.show(tui.event(), { tone: "accent", text: "1 queued" });
       expect(tui.setWidget).toHaveBeenLastCalledWith("pair-programmer", [
         "<accent>◆ <muted>pair · 1 queued",
       ]);
+      overlay.dispose();
+      expect(tui.setWidget).toHaveBeenLastCalledWith(
+        "pair-programmer",
+        undefined,
+      );
     },
   );
 
   it("falls back to a widget when the host cannot keep the overlay", async () => {
     for (const fail of [false, true]) {
-      const tui = host();
-      tui.custom.mockImplementationOnce((): Promise<undefined> =>
+      const tui = fakeHost();
+      tui.custom.mockImplementationOnce(() =>
         fail ? Promise.reject(new Error("no")) : Promise.resolve(undefined),
       );
       const overlay = new StatusOverlay();
       overlay.show(tui.ctx, { tone: "success", text: "watching" });
-      await new Promise((resolve) => setTimeout(resolve, 0));
+      await flush();
       expect(tui.setWidget).toHaveBeenLastCalledWith("pair-programmer", [
         "◆ pair · watching",
       ]);
-      overlay.show(tui.ctx, { tone: "dim", text: "paused" });
+      overlay.show(tui.event(), { tone: "dim", text: "paused" });
+      expect(tui.custom).toHaveBeenCalledTimes(1);
       expect(tui.setWidget).toHaveBeenLastCalledWith("pair-programmer", [
         "◆ pair · paused",
       ]);
     }
   });
 
-  it("ignores stale host completions after moving to a new session", async () => {
-    const first = host();
-    const pending = Promise.withResolvers<undefined>();
-    first.custom.mockReturnValueOnce(pending.promise);
+  it("moves between host UIs and ignores the old one's completions", async () => {
+    const first = fakeHost();
     const overlay = new StatusOverlay();
     overlay.show(first.ctx, { tone: "success", text: "watching" });
-    const second = host("rpc");
-    overlay.show(second.ctx, { tone: "success", text: "watching" });
-    pending.resolve(undefined);
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await flush();
+    const rpc = fakeHost({ mode: "rpc" });
+    overlay.show(rpc.ctx, { tone: "success", text: "watching" });
+    await flush();
+    expect(first.stack).toEqual([]);
+    expect(rpc.setWidget).toHaveBeenLastCalledWith("pair-programmer", [
+      "◆ pair · watching",
+    ]);
+    const second = fakeHost();
+    overlay.show(second.ctx, { tone: "dim", text: "paused" });
+    await flush();
+    expect(rpc.setWidget).toHaveBeenLastCalledWith(
+      "pair-programmer",
+      undefined,
+    );
+    expect(second.stack).toHaveLength(1);
+    overlay.dispose();
+  });
+
+  it("clears the previous widget line when moving between widget hosts", () => {
+    const first = fakeHost({ mode: "rpc" });
+    const second = fakeHost({ host: "omp" });
+    const overlay = new StatusOverlay();
+    overlay.show(first.ctx, { tone: "dim", text: "paused" });
+    overlay.show(second.ctx, { tone: "dim", text: "paused" });
     expect(first.setWidget).toHaveBeenLastCalledWith(
       "pair-programmer",
       undefined,
     );
+    expect(second.setWidget).toHaveBeenLastCalledWith("pair-programmer", [
+      "◆ pair · paused",
+    ]);
   });
 
   it("does nothing on dispose before any session", () => {
@@ -189,8 +189,7 @@ describe("StatusOverlay", () => {
   });
 
   it("skips overlays for headless contexts", () => {
-    const tui = host();
-    tui.ctx.hasUI = false;
+    const tui = fakeHost({ hasUI: false });
     new StatusOverlay().show(tui.ctx, { tone: "dim", text: "paused" });
     expect(tui.custom).not.toHaveBeenCalled();
   });

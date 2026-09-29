@@ -35,11 +35,11 @@ import {
 import { StatusOverlay, type StatusTone } from "./status-overlay.js";
 import { ReviewFeed } from "./review-feed.js";
 import { ReviewSidebar } from "./review-sidebar.js";
+import { hostOf, type Host } from "./host.js";
 import {
   isInherited,
   reviewFile,
   ReviewTimeoutError,
-  type Host,
 } from "./review-runner.js";
 import { ReviewStore, type Finding } from "./review-store.js";
 import {
@@ -118,10 +118,6 @@ function decisionInteraction(
     device.slice(0, 5).toLowerCase() === "xd://" &&
     device.slice(5) === DECISION_TOOL
   );
-}
-
-function hostOf(ctx: ExtensionContext): Host {
-  return typeof ctx.modelRegistry.streamSimple === "function" ? "pi" : "omp";
 }
 
 function idle(ctx: ExtensionContext): boolean {

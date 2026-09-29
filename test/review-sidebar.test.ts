@@ -1,7 +1,7 @@
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
-import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ReviewFeed } from "../src/review-feed.js";
+import { fakeHost, flush, openCapturing } from "./fake-host.js";
 import {
   MIN_COLUMNS,
   renderSidebar,
@@ -176,74 +176,6 @@ describe("renderSidebar", () => {
   });
 });
 
-type Factory = Parameters<ExtensionContext["ui"]["custom"]>[0];
-interface Host {
-  ctx: ExtensionContext;
-  custom: Mock;
-  notify: Mock;
-  requestRender: Mock;
-  closed: Mock;
-  options: () => {
-    anchor: string;
-    nonCapturing: boolean;
-    visible: (columns: number) => boolean;
-  };
-  render: (width: number) => string[] | undefined;
-  click: (y: number, button?: string, type?: string) => unknown;
-}
-
-function host(mode = "tui", rows = 20): Host {
-  const requestRender = vi.fn();
-  const notify = vi.fn();
-  const closed = vi.fn();
-  let options: ReturnType<Host["options"]> | undefined;
-  let render: ((width: number) => string[]) | undefined;
-  let mouse: ((event: TuiMouseEvent) => unknown) | undefined;
-  const custom = vi.fn(
-    async (
-      factory: Factory,
-      opts: { overlayOptions: ReturnType<Host["options"]> },
-    ): Promise<undefined> => {
-      options = opts.overlayOptions;
-      const done = Promise.withResolvers<undefined>();
-      const component = await factory(
-        {
-          requestRender,
-          terminal: { rows },
-        } as unknown as Parameters<Factory>[0],
-        plain as unknown as Parameters<Factory>[1],
-        {} as Parameters<Factory>[2],
-        () => {
-          closed();
-          done.resolve(undefined);
-        },
-      );
-      component.invalidate();
-      render = (width) => component.render(width);
-      mouse = (event) => component.handleMouse?.(event);
-      return done.promise;
-    },
-  );
-  return {
-    ctx: {
-      hasUI: true,
-      mode,
-      ui: { custom, notify },
-    } as unknown as ExtensionContext,
-    custom,
-    notify,
-    requestRender,
-    closed,
-    options: () => {
-      if (options === undefined) throw new Error("not mounted");
-      return options;
-    },
-    render: (width) => render?.(width),
-    click: (y, button = "left", type = "click") =>
-      mouse?.({ type, button, y } as TuiMouseEvent),
-  };
-}
-
 afterEach(() => {
   vi.useRealTimers();
 });
@@ -252,31 +184,33 @@ describe("ReviewSidebar", () => {
   it("toggles a non-capturing right-hand overlay that renders the live feed", async () => {
     vi.useFakeTimers();
     const feed = new ReviewFeed();
-    const tui = host();
+    const tui = fakeHost();
     const sidebar = new ReviewSidebar(() => feed.list(), lookup);
     sidebar.refresh(tui.ctx);
     expect(tui.custom).not.toHaveBeenCalled();
     sidebar.toggle(tui.ctx);
-    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(0);
     expect(sidebar.open).toBe(true);
-    expect(tui.options()).toMatchObject({
+    const panel = tui.top();
+    expect(panel?.options).toMatchObject({
       anchor: "top-right",
       nonCapturing: true,
     });
-    expect(tui.options().visible(MIN_COLUMNS - 1)).toBe(false);
-    expect(tui.options().visible(MIN_COLUMNS)).toBe(true);
-    expect(tui.render(40)).toHaveLength(10);
+    expect(panel?.options?.visible?.(MIN_COLUMNS - 1, 20)).toBe(false);
+    expect(panel?.options?.visible?.(MIN_COLUMNS, 20)).toBe(true);
+    expect(tui.render(panel, 40)).toHaveLength(10);
+    panel?.component.invalidate();
     vi.advanceTimersByTime(250);
     expect(tui.requestRender).not.toHaveBeenCalled();
     feed.start("a", job, Date.now());
     vi.advanceTimersByTime(250);
     expect(tui.requestRender).toHaveBeenCalledTimes(1);
-    sidebar.refresh();
+    sidebar.refresh(tui.event());
     expect(tui.requestRender).toHaveBeenCalledTimes(2);
+    expect(tui.custom).toHaveBeenCalledTimes(1);
     sidebar.toggle(tui.ctx);
     expect(sidebar.open).toBe(false);
-    await Promise.resolve();
-    expect(tui.closed).toHaveBeenCalledTimes(1);
+    expect(tui.stack).toEqual([]);
     vi.advanceTimersByTime(1000);
     expect(tui.requestRender).toHaveBeenCalledTimes(2);
   });
@@ -287,48 +221,100 @@ describe("ReviewSidebar", () => {
     feed.finish("done", "success", 1);
     feed.attach("done", ["accepted"]);
     feed.start("live", { ...job, file: "live.ts" }, Date.now());
-    const tui = host("tui", 40);
+    const tui = fakeHost({ rows: 40 });
     const sidebar = new ReviewSidebar(() => feed.list(), lookup);
     sidebar.toggle(tui.ctx);
-    await Promise.resolve();
-    const rows = (): string[] => tui.render(40) ?? [];
+    await flush();
+    const panel = tui.top();
+    const rows = (): string[] => tui.render(panel, 40);
     const at = (name: string): number =>
       rows().findIndex((line) => line.includes(name));
     expect(rows().join("\n")).not.toContain("Duplicate helper");
+    const mouse = (event: Partial<TuiMouseEvent>): unknown =>
+      panel?.component.handleMouse?.({
+        type: "click",
+        button: "left",
+        ...event,
+      } as TuiMouseEvent);
     for (const ignored of [
-      tui.click(0),
-      tui.click(at("live.ts")),
-      tui.click(at("done.ts"), "right"),
-      tui.click(at("done.ts"), "left", "press"),
-      tui.click(99),
+      mouse({ y: 0 }),
+      mouse({ y: at("live.ts") }),
+      mouse({ y: at("done.ts"), button: "right" }),
+      mouse({ y: at("done.ts"), type: "press" }),
+      mouse({ y: 99 }),
     ])
       expect(ignored).toBeUndefined();
-    expect(tui.click(at("done.ts"))).toEqual({ handled: true, render: true });
+    expect(tui.click(panel, at("done.ts"))).toEqual({
+      handled: true,
+      render: true,
+    });
     expect(rows().join("\n")).toContain("Duplicate helper :42");
-    expect(tui.click(at("Duplicate helper"))).toMatchObject({ handled: true });
+    expect(tui.click(panel, at("Duplicate helper"))).toMatchObject({
+      handled: true,
+    });
     expect(rows().join("\n")).not.toContain("Duplicate helper");
     sidebar.dispose();
   });
 
-  it("follows session replacement while open", async () => {
-    const first = host();
-    const second = host();
+  it("follows session replacement while open, and closes if it cannot float", async () => {
+    const first = fakeHost();
+    const second = fakeHost();
     const sidebar = new ReviewSidebar(() => [], lookup);
     sidebar.toggle(first.ctx);
-    sidebar.refresh(first.ctx);
+    sidebar.refresh(first.event());
     expect(first.custom).toHaveBeenCalledTimes(1);
     sidebar.refresh(second.ctx);
-    await Promise.resolve();
-    expect(first.closed).toHaveBeenCalledTimes(1);
-    expect(second.custom).toHaveBeenCalledTimes(1);
+    await flush();
+    expect(first.stack).toEqual([]);
+    expect(second.stack).toHaveLength(1);
     expect(sidebar.open).toBe(true);
-    sidebar.dispose();
+    sidebar.refresh(fakeHost({ host: "omp" }).ctx);
+    expect(sidebar.open).toBe(false);
+    expect(second.stack).toEqual([]);
   });
 
-  it("explains that the sidebar needs Pi's terminal UI", () => {
-    const headless = host();
-    headless.ctx.hasUI = false;
-    for (const unsupported of [host("rpc"), headless]) {
+  it("keeps the newest mount when an older one's cleanup lands late (A → B → A)", async () => {
+    const a = fakeHost();
+    const b = fakeHost();
+    const sidebar = new ReviewSidebar(() => [], lookup);
+    a.defer();
+    sidebar.toggle(a.ctx);
+    sidebar.refresh(b.ctx);
+    sidebar.refresh(a.event());
+    a.release();
+    await flush();
+    await flush();
+    expect(sidebar.open).toBe(true);
+    expect(a.stack).toHaveLength(1);
+    expect(b.stack).toEqual([]);
+    sidebar.dispose();
+    await flush();
+    expect(a.stack).toEqual([]);
+  });
+
+  it("never dismisses an overlay stacked above it", async () => {
+    const tui = fakeHost();
+    const sidebar = new ReviewSidebar(() => [], lookup);
+    sidebar.toggle(tui.ctx);
+    await flush();
+    const stats = openCapturing(tui);
+    await flush();
+    sidebar.toggle(tui.ctx);
+    await flush();
+    expect(tui.stack.map((entry) => tui.render(entry, 40))).toEqual([
+      ["stats"],
+    ]);
+    expect(stats.closed()).toBe(false);
+  });
+
+  it.each([
+    { host: "pi", mode: "rpc", hasUI: true },
+    { host: "pi", mode: "tui", hasUI: false },
+    { host: "omp", mode: "tui", hasUI: true },
+  ] as const)(
+    "refuses to float on $host in $mode mode (UI: $hasUI)",
+    (options) => {
+      const unsupported = fakeHost(options);
       const sidebar = new ReviewSidebar(() => [], lookup);
       sidebar.toggle(unsupported.ctx);
       expect(sidebar.open).toBe(false);
@@ -337,50 +323,32 @@ describe("ReviewSidebar", () => {
         expect.stringContaining("terminal UI"),
         "warning",
       );
-    }
-  });
+    },
+  );
 
   it("closes when the host ends the overlay or disposes it before mounting", async () => {
-    const ended = host();
+    const ended = fakeHost();
     ended.custom.mockReturnValueOnce(Promise.resolve(undefined));
     const sidebar = new ReviewSidebar(() => [], lookup);
     sidebar.toggle(ended.ctx);
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await flush();
     expect(sidebar.open).toBe(false);
 
-    const failed = host();
+    const failed = fakeHost();
     failed.custom.mockReturnValueOnce(Promise.reject(new Error("no")));
     sidebar.toggle(failed.ctx);
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await flush();
     expect(sidebar.open).toBe(false);
 
-    const late = host();
-    let mount: (() => void) | undefined;
-    late.custom.mockImplementationOnce(
-      (factory: Factory): Promise<undefined> => {
-        return new Promise<undefined>((resolve) => {
-          mount = () => {
-            const component = factory(
-              {
-                requestRender: vi.fn(),
-                terminal: { rows: 20 },
-              } as unknown as Parameters<Factory>[0],
-              plain as unknown as Parameters<Factory>[1],
-              {} as Parameters<Factory>[2],
-              () => {
-                resolve(undefined);
-              },
-            );
-            expect(component).toBeDefined();
-          };
-        });
-      },
-    );
+    const late = fakeHost();
+    late.defer();
     sidebar.toggle(late.ctx);
     sidebar.toggle(late.ctx);
-    mount?.();
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    late.release();
+    await flush();
+    await flush();
     expect(sidebar.open).toBe(false);
+    expect(late.stack).toEqual([]);
     sidebar.toggle(late.ctx);
     expect(sidebar.open).toBe(true);
     sidebar.dispose();

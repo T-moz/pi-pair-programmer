@@ -343,7 +343,8 @@ async function setup(
       getEntries: vi.fn(() => transcript),
     },
     hasUI: true,
-    mode: host === "pi" ? "tui" : undefined,
+    // OMP 18.4.2 reports "tui" too, but ignores non-capturing overlays.
+    mode: "tui",
     ui: { notify, custom, setWidget },
   } as unknown as ExtensionContext;
   const emit = async (name: string, event: unknown = {}): Promise<unknown> => {
