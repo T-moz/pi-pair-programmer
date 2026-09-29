@@ -119,6 +119,17 @@ describe("accepted finding card", () => {
     ).toHaveLength(4);
   });
 
+  it("lets ctrl+o collapse a card that was clicked open", () => {
+    const card = cardFor({ details } as Args[0]);
+    card(false)?.handleMouse?.({
+      type: "click",
+      button: "left",
+    } as TuiMouseEvent);
+    expect(card(false)?.render(120)).toHaveLength(4);
+    expect(card(true)?.render(120)).toHaveLength(4);
+    expect(card(false)?.render(120)).toHaveLength(2);
+  });
+
   it("falls back to Pi's default rendering for older or malformed messages", () => {
     expect(render({}, false)).toBeUndefined();
     expect(

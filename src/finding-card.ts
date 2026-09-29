@@ -65,13 +65,17 @@ export function cardLines(
 /**
  * A card's own click toggle, remembered per message because Pi rebuilds the
  * component on every expand or theme change. `base` records the global expand
- * state when clicked, so a later ctrl+o overrides the toggle.
+ * state when clicked; once ctrl+o changes it, the toggle is dropped so the
+ * global state wins from then on.
  */
 const toggled = new WeakMap<CardKey, { open: boolean; base: boolean }>();
 
 function isOpen(key: CardKey, expanded: boolean): boolean {
   const state = toggled.get(key);
-  return state?.base === expanded ? state.open : expanded;
+  if (state === undefined) return expanded;
+  if (state.base === expanded) return state.open;
+  toggled.delete(key);
+  return expanded;
 }
 
 /** Accepted findings; unknown payloads fall back to Pi's default rendering. */
