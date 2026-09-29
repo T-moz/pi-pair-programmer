@@ -18,6 +18,7 @@ import { z } from "zod";
 const execute = promisify(execFile);
 const NoMatchSchema = z.object({ code: z.literal(1), stderr: z.string() });
 const MAX_FILE_BYTES = 64_000;
+const MAX_EDIT_DISTANCE = 1000;
 const MAX_ENTRIES = 10_000;
 const MAX_LISTING_BYTES = 256_000_000;
 const CAPTURE_TIMEOUT_MS = 5000;
@@ -761,6 +762,16 @@ function sourceDiff(before: SourceFile, after: SourceFile): string {
   return `--- ${before.file}\n+++ ${after.file}\n@@ -${String(contextStart + 1)},${String(oldEnd - contextStart + contextEnd)} +${String(contextStart + 1)},${String(newEnd - contextStart + contextEnd)} @@\n${changes.join("\n")}`;
 }
 
+function baselineFile(
+  baseline: TaskBaseline | undefined,
+  file: string,
+): string | undefined {
+  return baseline === undefined
+    ? undefined
+    : (relativeFile(baseline.root, file) ??
+        relativeFile(baseline.requestedRoot, file));
+}
+
 export async function buildChangeEvidence(
   baseline: TaskBaseline | undefined,
   file: string,
@@ -769,11 +780,7 @@ export async function buildChangeEvidence(
   quote: string,
   signal?: AbortSignal,
 ): Promise<ChangeEvidence> {
-  const relative =
-    baseline === undefined
-      ? undefined
-      : (relativeFile(baseline.root, file) ??
-        relativeFile(baseline.requestedRoot, file));
+  const relative = baselineFile(baseline, file);
   const evidence: ChangeEvidence = {
     status: "unavailable",
     before: null,
@@ -837,4 +844,180 @@ export async function buildChangeEvidence(
   evidence.status = "available";
   evidence.reason = null;
   return evidence;
+}
+
+/** Current lines `start`..`start + added - 1` replace `removed` task-start lines. */
+export interface LineHunk {
+  start: number;
+  added: number;
+  removed: readonly string[];
+}
+
+export type LineChanges =
+  | { status: "available"; hunks: readonly LineHunk[] }
+  | { status: "unavailable"; reason: string };
+
+interface MatchedLines {
+  before: Set<number>;
+  after: Set<number>;
+}
+
+// Myers indices always fall inside the preallocated rows.
+function cell(row: Int32Array, index: number): number {
+  return Number(row.at(index));
+}
+
+function towardPrevious(
+  row: Int32Array,
+  base: number,
+  k: number,
+  d: number,
+): boolean {
+  return (
+    k === -d || (k !== d && cell(row, base + k - 1) < cell(row, base + k + 1))
+  );
+}
+
+function matchedLines(
+  before: readonly string[],
+  after: readonly string[],
+): MatchedLines | undefined {
+  const offset = MAX_EDIT_DISTANCE + 1;
+  const frontier = new Int32Array(2 * offset + 1);
+  const trace: Int32Array[] = [];
+  for (let d = 0; d <= MAX_EDIT_DISTANCE; d += 1) {
+    trace.push(frontier.slice(offset - d - 1, offset + d + 2));
+    for (let k = -d; k <= d; k += 2) {
+      let x = towardPrevious(frontier, offset, k, d)
+        ? cell(frontier, offset + k + 1)
+        : cell(frontier, offset + k - 1) + 1;
+      let y = x - k;
+      while (
+        x < before.length &&
+        y < after.length &&
+        before.at(x) === after.at(y)
+      ) {
+        x += 1;
+        y += 1;
+      }
+      frontier[offset + k] = x;
+      if (x >= before.length && y >= after.length)
+        return backtrack(trace, before.length, after.length);
+    }
+  }
+  return undefined;
+}
+
+function backtrack(
+  trace: readonly Int32Array[],
+  beforeLength: number,
+  afterLength: number,
+): MatchedLines {
+  const kept: MatchedLines = { before: new Set(), after: new Set() };
+  let x = beforeLength;
+  let y = afterLength;
+  for (const [step, row] of [...trace.entries()].toReversed()) {
+    const k = x - y;
+    const previous = towardPrevious(row, step + 1, k, step) ? k + 1 : k - 1;
+    const previousX = cell(row, step + 1 + previous);
+    const previousY = previousX - previous;
+    while (x > previousX && y > previousY) {
+      x -= 1;
+      y -= 1;
+      kept.before.add(x);
+      kept.after.add(y);
+    }
+    x = previousX;
+    y = previousY;
+  }
+  return kept;
+}
+
+function lineHunks(before: string, after: string): LineHunk[] {
+  const oldLines = before.split("\n");
+  const newLines = after.split("\n");
+  let start = 0;
+  while (
+    start < oldLines.length &&
+    start < newLines.length &&
+    oldLines.at(start) === newLines.at(start)
+  ) {
+    start += 1;
+  }
+  let oldEnd = oldLines.length;
+  let newEnd = newLines.length;
+  while (
+    oldEnd > start &&
+    newEnd > start &&
+    oldLines[oldEnd - 1] === newLines[newEnd - 1]
+  ) {
+    oldEnd -= 1;
+    newEnd -= 1;
+  }
+  const removed = oldLines.slice(start, oldEnd);
+  const added = newLines.slice(start, newEnd);
+  const kept = matchedLines(removed, added) ?? {
+    before: new Set(),
+    after: new Set(),
+  };
+  const hunks: LineHunk[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < removed.length || j < added.length) {
+    if (kept.before.has(i) && kept.after.has(j)) {
+      i += 1;
+      j += 1;
+      continue;
+    }
+    const removedStart = i;
+    const addedStart = j;
+    while (i < removed.length && !kept.before.has(i)) i += 1;
+    while (j < added.length && !kept.after.has(j)) j += 1;
+    hunks.push({
+      start: start + addedStart + 1,
+      added: j - addedStart,
+      removed: removed.slice(removedStart, i),
+    });
+  }
+  return hunks;
+}
+
+export async function lineChanges(
+  baseline: TaskBaseline | undefined,
+  file: string,
+  source: string,
+  signal?: AbortSignal,
+): Promise<LineChanges> {
+  if (baseline === undefined)
+    return { status: "unavailable", reason: "Task baseline is unavailable" };
+  const relative = baselineFile(baseline, file);
+  if (
+    relative === undefined ||
+    !eligible(relative) ||
+    baseline.unattributable(relative)
+  )
+    return {
+      status: "unavailable",
+      reason: "File is not covered by the task baseline",
+    };
+  if (Buffer.byteLength(source) > MAX_FILE_BYTES)
+    return { status: "unavailable", reason: "Current source is oversized" };
+  let before: BeforeState;
+  try {
+    before = await baseline.before(relative, signal);
+  } catch {
+    return { status: "unavailable", reason: "Task baseline could not be read" };
+  }
+  if (before.state === "unknown")
+    return {
+      status: "unavailable",
+      reason: "Task-start state of this file is unknown",
+    };
+  return {
+    status: "available",
+    hunks:
+      before.state === "absent"
+        ? [{ start: 1, added: source.split("\n").length, removed: [] }]
+        : lineHunks(before.source, source),
+  };
 }

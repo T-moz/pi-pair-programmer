@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { choice, TypeSafeClient } from "@typesafe-ai/sdk";
 import { z } from "zod";
-import type { ChangeEvidence } from "./change-evidence.js";
+import type { ChangeEvidence, LineChanges } from "./change-evidence.js";
 import {
   notify,
   observeJudgment,
@@ -84,9 +84,58 @@ interface ReviewRequest {
   prompt: string;
   file: string;
   source: string;
+  changes: LineChanges;
   signal: AbortSignal;
   onModelCall?: ModelCallObserver;
   onJudgment?: JudgmentObserver;
+}
+
+function numberedExcerpt(
+  lines: readonly string[],
+  changes: LineChanges,
+  truncated: boolean,
+): string {
+  const changed = new Set<number>();
+  const removed = new Map<number, readonly string[]>();
+  if (changes.status === "available") {
+    for (const hunk of changes.hunks) {
+      for (let line = hunk.start; line < hunk.start + hunk.added; line += 1)
+        changed.add(line);
+      removed.set(hunk.start, hunk.removed);
+    }
+  }
+  const rows: string[] = [];
+  const pushRemoved = (line: number): void => {
+    for (const text of removed.get(line) ?? []) rows.push(`-: ${text}`);
+  };
+  for (const [index, text] of lines.entries()) {
+    const line = index + 1;
+    pushRemoved(line);
+    rows.push(`${String(line)}${changed.has(line) ? "+" : ""}: ${text}`);
+  }
+  if (!truncated) pushRemoved(lines.length + 1);
+  return rows.join("\n");
+}
+
+function changeScope(file: string, changes: LineChanges): string {
+  if (changes.status === "unavailable")
+    return `Review ${file} against the criterion. Which lines changed since task start is unknown, so evaluate the whole file.`;
+  const legend = `Review the changes made to ${file} since the task started against the criterion. The excerpt below is the current file. A gutter of "N+:" marks line N as added or changed since task start, "N:" marks an unchanged line, and "-:" shows a task-start line removed at that position. Removed lines no longer exist, so never cite them.`;
+  return changes.hunks.length === 0
+    ? `${legend} No line has changed since task start.`
+    : `${legend} Report only violations the changes cause. That includes violations on changed lines, and unchanged code the changes left inconsistent: code that changed lines now duplicate, contradict, or break, or code the changes updated elsewhere but missed here (cite whichever line shows it best). Violations already present at task start that the changes neither create nor worsen are out of scope, even next to changed lines.`;
+}
+
+function reviewInstructions(
+  file: string,
+  changes: LineChanges,
+  lastLine: number | undefined,
+): string {
+  const truncation =
+    lastLine === undefined
+      ? ""
+      : ` The excerpt stops at line ${String(lastLine)}; the rest of the file is omitted.`;
+  return `${changeScope(file, changes)} Line numbers refer to the numbered excerpt below; cite the line number and quote code text only, never the gutter.${truncation}`;
 }
 
 function invoke(
@@ -200,10 +249,9 @@ export async function reviewFile(
   request: ReviewRequest,
 ): Promise<ProposedFinding[]> {
   const excerpt = request.source.slice(0, MAX_SOURCE_CHARACTERS);
+  const truncated = excerpt.length < request.source.length;
   const lines = excerpt.split("\n");
-  const numbered = lines
-    .map((line, index) => `${String(index + 1)}: ${line}`)
-    .join("\n");
+  const numbered = numberedExcerpt(lines, request.changes, truncated);
   const result = await complete(
     request.host,
     request.cwd,
@@ -235,7 +283,7 @@ Return only JSON: {"findings":[{"line":1,"title":"specific criterion violation",
 Return at most ${String(MAX_FINDINGS)} findings.
 Return {"findings":[]} when the criterion is satisfied or the evidence is insufficient. An empty result is a successful review.
 Reply with the JSON object alone, without any other text.`,
-    `Evaluate the current edit to ${request.file} against the criterion. Line numbers refer to the numbered excerpt below. Report only criterion violations introduced by the current edit.\n\n${numbered}`,
+    `${reviewInstructions(request.file, request.changes, truncated ? lines.length : undefined)}\n\n${numbered}`,
     request.signal,
     request.onModelCall,
   );

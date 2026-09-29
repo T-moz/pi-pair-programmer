@@ -9,7 +9,7 @@ import {
   type Host,
   type ProposedFinding,
 } from "../src/review-runner.js";
-import type { ChangeEvidence } from "../src/change-evidence.js";
+import type { ChangeEvidence, LineChanges } from "../src/change-evidence.js";
 import type { ModelCallObservation } from "../src/model-usage.js";
 
 interface JudgmentRequest {
@@ -79,6 +79,7 @@ interface TestReviewRequest {
   prompt: string;
   file: string;
   source: string;
+  changes: LineChanges;
   signal: AbortSignal;
 }
 
@@ -93,6 +94,7 @@ function request(
     prompt: "Find concrete runtime errors",
     file: "src/example.ts",
     source,
+    changes: { status: "unavailable", reason: "Task baseline is unavailable" },
     signal: new AbortController().signal,
   };
 }
@@ -321,6 +323,71 @@ it("rejects non-JSON output and omits source beyond the excerpt limit", async ()
   child.stdout.write("not json");
   child.emit("close", 0);
   await expect(pending).rejects.toThrow();
+});
+
+it("marks changed lines in the gutter and still verifies quotes against source text", async () => {
+  const { child, input } = subprocess();
+  const pending = reviewFile({
+    ...request("omp", "const user = null;\nconsole.log(user.name);\n"),
+    changes: {
+      status: "available",
+      hunks: [
+        { start: 2, added: 1, removed: ["console.log(user?.name);"] },
+        { start: 3, added: 0, removed: ["export {};"] },
+      ],
+    },
+  });
+  const excerpt = input.join("").split("\n\n").at(-1);
+  expect(excerpt).toBe(
+    [
+      "1: const user = null;",
+      "-: console.log(user?.name);",
+      "2+: console.log(user.name);",
+      "-: export {};",
+      "3: ",
+    ].join("\n"),
+  );
+  finish(child, [
+    valid,
+    { ...valid, quote: "2+: console.log" },
+    { ...valid, quote: "user?.name" },
+  ]);
+  await expect(pending).resolves.toEqual([valid]);
+});
+
+it("renders unchanged files without markers and keeps markers inside a truncated excerpt", async () => {
+  const unchanged = subprocess();
+  const plain = reviewFile({
+    ...request(),
+    changes: { status: "available", hunks: [] },
+  });
+  expect(unchanged.input.join("").split("\n\n").at(-1)).toBe(
+    "1: const user = null;\n2: console.log(user.name);\n3: ",
+  );
+  finish(unchanged.child, []);
+  await expect(plain).resolves.toEqual([]);
+
+  const hidden = "removed-after-excerpt";
+  const { child, input } = subprocess();
+  const pending = reviewFile({
+    ...request("omp", `changed\n${"x".repeat(60_000)}\ntail`),
+    changes: {
+      status: "available",
+      hunks: [
+        { start: 1, added: 1, removed: ["previous"] },
+        { start: 3, added: 1, removed: [hidden] },
+      ],
+    },
+  });
+  const excerpt = input.join("").split("\n\n").at(-1);
+  expect(excerpt?.split("\n").map((row) => row.slice(0, 12))).toEqual([
+    "-: previous",
+    "1+: changed",
+    "2: xxxxxxxxx",
+  ]);
+  expect(input.join("")).not.toContain(hidden);
+  finish(child, []);
+  await expect(pending).resolves.toEqual([]);
 });
 
 it("bounds unframed stdout, drains late data, and terminates a noisy reviewer", async () => {
