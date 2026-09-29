@@ -390,6 +390,38 @@ it("renders unchanged files without markers and keeps markers inside a truncated
   await expect(pending).resolves.toEqual([]);
 });
 
+it("presents an approximate change region as possibly unchanged rather than changed", async () => {
+  const { child, input } = subprocess();
+  const pending = reviewFile({
+    ...request("omp", "const user = null;\nconsole.log(user.name);\nexit();"),
+    changes: {
+      status: "approximate",
+      region: {
+        start: 2,
+        added: 2,
+        removed: ["console.log(user.name);", "quit();"],
+      },
+    },
+  });
+  const [instructions, excerpt] = input.join("").split("\n\n").slice(-2);
+  expect(excerpt).toBe(
+    [
+      "1: const user = null;",
+      "-: console.log(user.name);",
+      "-: quit();",
+      "2~: console.log(user.name);",
+      "3~: exit();",
+    ].join("\n"),
+  );
+  expect(excerpt).not.toContain("+:");
+  expect(instructions).toContain(
+    'a line is not changed merely because it is marked "N~:"',
+  );
+  expect(instructions).not.toContain('"N+:"');
+  finish(child, [valid]);
+  await expect(pending).resolves.toEqual([valid]);
+});
+
 it("bounds unframed stdout, drains late data, and terminates a noisy reviewer", async () => {
   const { child } = subprocess();
   const pending = reviewFile(request());
@@ -627,7 +659,6 @@ it.each([
     status: "unavailable" as const,
     reason: "ambiguous context",
   },
-  { ...changeEvidence, diff: null },
   { ...changeEvidence, before: null, origins: [] },
 ])(
   "does not suppress without complete actual origin evidence: %j",
@@ -652,6 +683,36 @@ it("judges a cross-file origin without requiring an old destination file", async
       signal: new AbortController().signal,
     }),
   ).resolves.toBe(true);
+});
+
+it("still judges attribution from full sources when the line diff exceeded its bound", async () => {
+  const reason =
+    "The line diff was too large to compute; compare taskStartSource with currentSource directly";
+  const evidence = { ...changeEvidence, diff: null, reason };
+  const onJudgment = vi.fn();
+  systemOne.mockResolvedValueOnce({ answers: { category: inheritedAnswer } });
+  await expect(
+    isInherited({
+      finding: valid,
+      evidence,
+      signal: new AbortController().signal,
+      onJudgment,
+    }),
+  ).resolves.toBe(true);
+  expect(systemOne.mock.lastCall?.[0].state).toMatchObject({
+    taskStartSource: changeEvidence.before,
+    currentSource: changeEvidence.after,
+    diff: null,
+    reason,
+  });
+  expect(onJudgment).toHaveBeenCalledWith(
+    expect.objectContaining({
+      decision: "drop",
+      reason: "judged",
+      evidenceStatus: "available",
+      evidenceReason: reason,
+    }),
+  );
 });
 
 it("keeps findings when attribution is unavailable or cancelled", async () => {
@@ -750,7 +811,6 @@ it.each([
     { ...changeEvidence, status: "unavailable" as const, reason: "ambiguous" },
     "evidence_unavailable",
   ],
-  [{ ...changeEvidence, diff: null }, "no_diff"],
   [{ ...changeEvidence, before: null, origins: [] }, "no_origin"],
 ] as const)(
   "records a skipped attribution without calling Jev: %#",
@@ -1106,7 +1166,10 @@ it("keeps attribution decisions while accounting real SDK usage and ignoring una
     usage: { inputTokens: 81, outputTokens: 3 },
   });
   await expect(
-    isInherited({ ...input, evidence: { ...changeEvidence, diff: null } }),
+    isInherited({
+      ...input,
+      evidence: { ...changeEvidence, status: "unavailable" },
+    }),
   ).resolves.toBe(false);
   expect(onModelCall).toHaveBeenCalledOnce();
 });

@@ -141,7 +141,6 @@ const reasonCodes = {
   too_many_findings: true,
   judged: true,
   evidence_unavailable: true,
-  no_diff: true,
   no_origin: true,
   response_invalid: true,
   request_failed: true,

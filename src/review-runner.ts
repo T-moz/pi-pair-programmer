@@ -1,7 +1,11 @@
 import { spawn } from "node:child_process";
 import { choice, TypeSafeClient } from "@typesafe-ai/sdk";
 import { z } from "zod";
-import type { ChangeEvidence, LineChanges } from "./change-evidence.js";
+import type {
+  ChangeEvidence,
+  LineChanges,
+  LineHunk,
+} from "./change-evidence.js";
 import {
   notify,
   observeJudgment,
@@ -97,13 +101,12 @@ function numberedExcerpt(
 ): string {
   const changed = new Set<number>();
   const removed = new Map<number, readonly string[]>();
-  if (changes.status === "available") {
-    for (const hunk of changes.hunks) {
-      for (let line = hunk.start; line < hunk.start + hunk.added; line += 1)
-        changed.add(line);
-      removed.set(hunk.start, hunk.removed);
-    }
+  for (const hunk of markedHunks(changes)) {
+    for (let line = hunk.start; line < hunk.start + hunk.added; line += 1)
+      changed.add(line);
+    removed.set(hunk.start, hunk.removed);
   }
+  const marker = changes.status === "approximate" ? "~" : "+";
   const rows: string[] = [];
   const pushRemoved = (line: number): void => {
     for (const text of removed.get(line) ?? []) rows.push(`-: ${text}`);
@@ -111,19 +114,29 @@ function numberedExcerpt(
   for (const [index, text] of lines.entries()) {
     const line = index + 1;
     pushRemoved(line);
-    rows.push(`${String(line)}${changed.has(line) ? "+" : ""}: ${text}`);
+    rows.push(`${String(line)}${changed.has(line) ? marker : ""}: ${text}`);
   }
   if (!truncated) pushRemoved(lines.length + 1);
   return rows.join("\n");
 }
 
+function markedHunks(changes: LineChanges): readonly LineHunk[] {
+  if (changes.status === "available") return changes.hunks;
+  return changes.status === "approximate" ? [changes.region] : [];
+}
+
+const changeOnlyScope = `Report only violations the changes cause. That includes violations on changed lines, and unchanged code the changes left inconsistent: code that changed lines now duplicate, contradict, or break, or code the changes updated elsewhere but missed here (cite whichever line shows it best). Violations already present at task start that the changes neither create nor worsen are out of scope, even next to changed lines.`;
+
 function changeScope(file: string, changes: LineChanges): string {
   if (changes.status === "unavailable")
     return `Review ${file} against the criterion. Which lines changed since task start is unknown, so evaluate the whole file.`;
-  const legend = `Review the changes made to ${file} since the task started against the criterion. The excerpt below is the current file. A gutter of "N+:" marks line N as added or changed since task start, "N:" marks an unchanged line, and "-:" shows a task-start line removed at that position. Removed lines no longer exist, so never cite them.`;
+  const review = `Review the changes made to ${file} since the task started against the criterion. The excerpt below is the current file.`;
+  if (changes.status === "approximate")
+    return `${review} The exact changed lines could not be computed. A gutter of "N~:" marks line N inside one region that contains every change since task start but may also contain unchanged lines, "N:" marks an unchanged line outside that region, and "-:" lists the task-start lines that region replaced. Removed lines no longer exist, so never cite them. Compare the "N~:" lines with the "-:" lines to tell which of them changed; a line is not changed merely because it is marked "N~:". ${changeOnlyScope}`;
+  const legend = `${review} A gutter of "N+:" marks line N as added or changed since task start, "N:" marks an unchanged line, and "-:" shows a task-start line removed at that position. Removed lines no longer exist, so never cite them.`;
   return changes.hunks.length === 0
     ? `${legend} No line has changed since task start.`
-    : `${legend} Report only violations the changes cause. That includes violations on changed lines, and unchanged code the changes left inconsistent: code that changed lines now duplicate, contradict, or break, or code the changes updated elsewhere but missed here (cite whichever line shows it best). Violations already present at task start that the changes neither create nor worsen are out of scope, even next to changed lines.`;
+    : `${legend} ${changeOnlyScope}`;
 }
 
 function reviewInstructions(
@@ -424,7 +437,6 @@ async function attribute(request: AttributionRequest): Promise<Attribution> {
     evidenceReason: evidence.reason,
   });
   if (evidence.status !== "available") return keep("evidence_unavailable");
-  if (evidence.diff === null) return keep("no_diff");
   if (evidence.before === null && evidence.origins.length === 0) {
     return keep("no_origin");
   }
