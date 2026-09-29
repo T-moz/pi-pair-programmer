@@ -14,9 +14,7 @@ import {
 } from "./change-evidence.js";
 import {
   ACCEPTED_MESSAGE,
-  REJECTED_ENTRY,
   renderAccepted,
-  renderRejected,
   type CardDetails,
 } from "./finding-card.js";
 import { FindingAdmission } from "./finding-admission.js";
@@ -957,6 +955,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
           reason: params.reason,
           ...optionalReviewer(reviewerNames.get(finding.reviewer)),
         } satisfies CardDetails;
+        // Only accepted findings reach the transcript; rejections stay in the feed.
         if (params.decision === "accept")
           pi.sendMessage(
             {
@@ -967,8 +966,6 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
             },
             { triggerTurn: false },
           );
-        // Rejections are transcript-only: rendered for the user, never sent to the model.
-        else pi.appendEntry(REJECTED_ENTRY, details);
       }
       return Promise.resolve({
         content: [
@@ -1020,8 +1017,6 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   // OMP may not expose message renderers; its default rendering stays readable.
   if (typeof pi.registerMessageRenderer === "function")
     pi.registerMessageRenderer(ACCEPTED_MESSAGE, renderAccepted);
-  if (typeof pi.registerEntryRenderer === "function")
-    pi.registerEntryRenderer(REJECTED_ENTRY, renderRejected);
 
   pi.registerCommand("pair-feed", {
     description: "Toggle the live review sidebar",

@@ -1,8 +1,4 @@
-import type {
-  EntryRenderer,
-  MessageRenderer,
-  Theme,
-} from "@earendil-works/pi-coding-agent";
+import type { MessageRenderer, Theme } from "@earendil-works/pi-coding-agent";
 import {
   sliceByColumn,
   visibleWidth,
@@ -13,8 +9,6 @@ import { z } from "zod";
 import { truncatePath } from "./format.js";
 
 export const ACCEPTED_MESSAGE = "pair-programmer-accepted";
-/** Custom entry type: rendered in the transcript, never sent to the model. */
-export const REJECTED_ENTRY = "pair-programmer-rejected";
 
 const CardDetails = z.object({
   title: z.string(),
@@ -25,19 +19,17 @@ const CardDetails = z.object({
   reviewer: z.string().optional(),
 });
 export type CardDetails = z.infer<typeof CardDetails>;
-export type Verdict = "accepted" | "rejected";
 
 type Painter = Pick<Theme, "fg" | "bold">;
-/** The transcript object a card renders; stable across Pi's rebuilds. */
-type CardKey = Parameters<MessageRenderer>[0] | Parameters<EntryRenderer>[0];
+/** The transcript message a card renders; stable across Pi's rebuilds. */
+type CardKey = Parameters<MessageRenderer>[0];
 
 /**
- * Accepted: bold title plus location; rejected: one dimmed line. Expanding
- * either reveals the location, evidence and the agent's reason.
+ * An accepted finding: bold title plus location. Expanding reveals the
+ * evidence and the agent's reason.
  */
 export function cardLines(
   details: CardDetails,
-  verdict: Verdict,
   theme: Painter,
   width: number,
   expanded: boolean,
@@ -45,28 +37,19 @@ export function cardLines(
 ): string[] {
   const indent = " ".repeat(Math.max(0, Math.min(pad, width - 4)));
   const inner = Math.max(1, width - visibleWidth(indent) - 2);
-  const accepted = verdict === "accepted";
-  const suffix = accepted ? "" : " · rejected";
-  const marker = theme.fg("dim", `${suffix}${expanded ? " ▾" : " ▸"}`);
-  const title = wrapTextWithAnsi(
-    details.title,
-    Math.max(1, inner - visibleWidth(suffix) - 2),
-  );
-  const icon = accepted ? theme.fg("warning", "◆") : theme.fg("muted", "✗");
+  const marker = theme.fg("dim", expanded ? " ▾" : " ▸");
+  const title = wrapTextWithAnsi(details.title, Math.max(1, inner - 2));
   const lines = title.map((part, index) => {
-    const text = accepted ? theme.bold(part) : theme.fg("muted", part);
-    const first = index === 0 ? icon : " ";
-    return `${first} ${text}${index === title.length - 1 ? marker : ""}`;
+    const first = index === 0 ? theme.fg("warning", "◆") : " ";
+    return `${first} ${theme.bold(part)}${index === title.length - 1 ? marker : ""}`;
   });
-  if (accepted || expanded) {
-    const location = `:${String(details.line)}`;
-    const by = details.reviewer === undefined ? "" : ` · ${details.reviewer}`;
-    const path = truncatePath(
-      details.file,
-      Math.max(1, inner - visibleWidth(location + by)),
-    );
-    lines.push(`  ${theme.fg("dim", path + location + by)}`);
-  }
+  const location = `:${String(details.line)}`;
+  const by = details.reviewer === undefined ? "" : ` · ${details.reviewer}`;
+  const path = truncatePath(
+    details.file,
+    Math.max(1, inner - visibleWidth(location + by)),
+  );
+  lines.push(`  ${theme.fg("dim", path + location + by)}`);
   if (expanded)
     lines.push(
       ...wrapTextWithAnsi(details.evidence, inner).map(
@@ -80,51 +63,45 @@ export function cardLines(
 }
 
 /**
- * A card's own click toggle, remembered per message or entry because Pi
- * rebuilds the component on every expand or theme change. `base` records the
- * global expand state when clicked, so a later ctrl+o overrides the toggle.
+ * A card's own click toggle, remembered per message because Pi rebuilds the
+ * component on every expand or theme change. `base` records the global expand
+ * state when clicked, so a later ctrl+o overrides the toggle.
  */
 const toggled = new WeakMap<CardKey, { open: boolean; base: boolean }>();
 
-function card(
-  key: CardKey,
-  payload: unknown,
-  verdict: Verdict,
-  theme: Painter,
-  expanded: boolean,
-  pad: number,
-): Component | undefined {
-  const parsed = CardDetails.safeParse(payload);
+function isOpen(key: CardKey, expanded: boolean): boolean {
+  const state = toggled.get(key);
+  return state?.base === expanded ? state.open : expanded;
+}
+
+/** Accepted findings; unknown payloads fall back to Pi's default rendering. */
+export const renderAccepted: MessageRenderer = (
+  message,
+  options,
+  theme,
+): Component | undefined => {
+  const parsed = CardDetails.safeParse(message.details);
   if (!parsed.success) return;
-  const open = (): boolean => {
-    const state = toggled.get(key);
-    return state?.base === expanded ? state.open : expanded;
-  };
+  const { expanded, outputPad } = options;
   return {
     render: (width: number): string[] =>
-      cardLines(parsed.data, verdict, theme, width, open(), pad),
+      cardLines(
+        parsed.data,
+        theme,
+        width,
+        isOpen(message, expanded),
+        outputPad,
+      ),
     handleMouse(event) {
       if (event.type !== "click" || event.button !== "left") return;
-      toggled.set(key, { open: !open(), base: expanded });
+      toggled.set(message, {
+        open: !isOpen(message, expanded),
+        base: expanded,
+      });
       return { handled: true, render: true };
     },
     invalidate(): void {
       return;
     },
   };
-}
-
-/** Accepted findings; unknown payloads fall back to Pi's default rendering. */
-export const renderAccepted: MessageRenderer = (message, options, theme) =>
-  card(
-    message,
-    message.details,
-    "accepted",
-    theme,
-    options.expanded,
-    options.outputPad,
-  );
-
-/** Rejected findings, stored as transcript-only entries. */
-export const renderRejected: EntryRenderer = (entry, options, theme) =>
-  card(entry, entry.data, "rejected", theme, options.expanded, 1);
+};

@@ -2874,27 +2874,14 @@ it("narrates review progress above the editor without surfacing finding contents
       decision: "reject",
       reason: "Intentional",
     });
-  expect(
-    environment.rejectedCards.map((card) =>
-      JSON.stringify(card, ["title", "reason", "reviewer"]),
-    ),
-  ).toEqual(
-    findings(environment.entries).map((finding) =>
-      JSON.stringify({
-        title: finding.title,
-        reason: "Intentional",
-        reviewer: "gpt-5",
-      }),
-    ),
-  );
+  // Rejections stay in the opt-in review feed, never the transcript.
+  expect(environment.rejectedCards).toEqual([]);
   expect(
     environment.sendMessage.mock.calls.some(
       ([message]) => message.customType === "pair-programmer-accepted",
     ),
   ).toBe(false);
-  expect(environment.renderers.get("pair-programmer-rejected")).toBeTypeOf(
-    "function",
-  );
+  expect(environment.renderers.has("pair-programmer-rejected")).toBe(false);
   expect(environment.status()).toBe("◆ pair · watching");
   await environment.emit("session_shutdown");
   await environment.decide("late", {
