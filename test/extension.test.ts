@@ -4043,3 +4043,66 @@ it("reviews identical reviewer configurations once per revision", async () => {
   expect(environment.sendMessage).toHaveBeenCalledOnce();
   await environment.emit("session_shutdown");
 });
+
+it("passes each reviewer's configured tools to its review", async () => {
+  const environment = await setup("pi", false, false, async (cwd) => {
+    await fsPromises.writeFile(
+      path.join(cwd, "pair-programmer.reviewers.json"),
+      JSON.stringify({
+        reviewers: [
+          {
+            model: "current",
+            prompt: "Check current library APIs",
+            include: ["**/*"],
+            exclude: [],
+            tools: ["web_search"],
+          },
+          {
+            model: "current",
+            prompt: "Review behavior",
+            include: ["**/*"],
+            exclude: [],
+          },
+        ],
+      }),
+    );
+  });
+  vi.mocked(reviewFile).mockResolvedValue([]);
+  await fsPromises.writeFile(path.join(environment.cwd, "change.ts"), "x\n");
+  await environment.emit("tool_result", {
+    toolName: "write",
+    input: { path: "change.ts" },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(reviewFile).toHaveBeenCalledTimes(2);
+  });
+  const calls = vi
+    .mocked(reviewFile)
+    .mock.calls.map(([request]) => [request.prompt, request.tools]);
+  expect(calls).toEqual(
+    expect.arrayContaining([
+      ["Check current library APIs", ["web_search"]],
+      ["Review behavior", []],
+    ]),
+  );
+});
+
+it("stays inert inside a reviewer subprocess", () => {
+  vi.stubEnv("PI_PAIR_PROGRAMMER_REVIEWER", "1");
+  try {
+    const on = vi.fn();
+    const registerTool = vi.fn();
+    const registerCommand = vi.fn();
+    pairProgrammer({
+      on,
+      registerTool,
+      registerCommand,
+    } as unknown as ExtensionAPI);
+    expect(on).not.toHaveBeenCalled();
+    expect(registerTool).not.toHaveBeenCalled();
+    expect(registerCommand).not.toHaveBeenCalled();
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});

@@ -4,11 +4,16 @@ import path from "node:path";
 import { minimatch } from "minimatch";
 import { z } from "zod";
 
+/** Tools a reviewer may be granted. Each one must be read-only. */
+export const REVIEWER_TOOLS = ["web_search"] as const;
+export type ReviewerTool = (typeof REVIEWER_TOOLS)[number];
+
 export interface ReviewerConfig {
   model: string;
   prompt: string;
   include: readonly string[];
   exclude: readonly string[];
+  tools?: readonly ReviewerTool[] | undefined;
 }
 
 export const DEFAULT_REVIEWERS: readonly ReviewerConfig[] = [
@@ -74,6 +79,12 @@ const ReviewerSchema = z.strictObject({
   prompt: z.string().refine((value) => value.trim().length > 0),
   include: z.array(PatternSchema).min(1),
   exclude: z.array(PatternSchema),
+  tools: z
+    .array(z.enum(REVIEWER_TOOLS))
+    .refine((tools) => new Set(tools).size === tools.length, {
+      message: "must not repeat a tool",
+    })
+    .optional(),
 });
 const ConfigSchema = z.strictObject({ reviewers: z.array(ReviewerSchema) });
 const MissingConfigErrorSchema = z.object({ code: z.literal("ENOENT") });
@@ -152,14 +163,16 @@ export function matchingReviewers(
 }
 
 export function reviewerKey(reviewer: ReviewerConfig): string {
-  return createHash("sha256")
-    .update(
-      JSON.stringify([
-        reviewer.model,
-        reviewer.prompt,
-        reviewer.include.toSorted((left, right) => left.localeCompare(right)),
-        reviewer.exclude.toSorted((left, right) => left.localeCompare(right)),
-      ]),
-    )
-    .digest("hex");
+  const sorted = (values: readonly string[]): string[] =>
+    values.toSorted((left, right) => left.localeCompare(right));
+  const identity: unknown[] = [
+    reviewer.model,
+    reviewer.prompt,
+    sorted(reviewer.include),
+    sorted(reviewer.exclude),
+  ];
+  // Reviewers without tools keep the identity they had before tools existed.
+  const tools = reviewer.tools ?? [];
+  if (tools.length > 0) identity.push(sorted(tools));
+  return createHash("sha256").update(JSON.stringify(identity)).digest("hex");
 }

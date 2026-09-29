@@ -135,6 +135,8 @@ function acceptedReview(finding: Finding, reason: string): string {
 }
 
 export default function pairProgrammer(pi: ExtensionAPI): void {
+  // Reviewers granted tools on Pi load extensions, including this one.
+  if (process.env["PI_PAIR_PROGRAMMER_REVIEWER"] === "1") return;
   const appendReviewEntry = (data: unknown): void => {
     pi.appendEntry("pair-programmer", data);
   };
@@ -433,6 +435,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       file: job.file,
       source: job.source,
       signal,
+      tools: job.reviewer.tools ?? [],
       onModelCall,
     });
     if (!(await current(job))) {
