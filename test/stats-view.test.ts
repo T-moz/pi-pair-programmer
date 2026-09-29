@@ -9,6 +9,7 @@ import {
   statsHotspots,
   statsSummary,
   type StatsReport,
+  type Tab,
 } from "../src/stats-view.js";
 
 const report =
@@ -17,6 +18,7 @@ const report =
     summary: lines,
     details: [`detail ${lines.join(" ")}`],
     hotspots: (width: number) => [`hot ${String(width)}`],
+    feed: (width: number) => [`feed ${String(width)}`],
   });
 
 type Factory = Parameters<ExtensionContext["ui"]["custom"]>[0];
@@ -259,12 +261,12 @@ describe("StatsView", () => {
       "USAGE  /",
       "now",
       "",
-      "↑↓  d h  r\u{1B}[0m…\u{1B}[0m",
+      "↑↓  d h f \u{1B}[0m…\u{1B}[0m",
     ]);
     const framed = component.render(24);
     expect(framed[0]).toBe(`╭${"─".repeat(22)}╮`);
     expect(framed[4]).toBe(`│  Review counts${" ".repeat(5)}  │`);
-    expect(framed.at(-2)).toContain("↑↓  d h  r  q clo");
+    expect(framed.at(-2)).toContain("↑↓  d h f  r  q c");
     expect(framed.at(-1)).toBe(`╰${"─".repeat(22)}╯`);
     component.invalidate();
     component.handleInput?.(key);
@@ -272,6 +274,31 @@ describe("StatsView", () => {
     await opened;
     view.close();
     component.dispose?.();
+  });
+
+  it("opens on a requested tab and toggles back to the overview", async () => {
+    const host = ui(40);
+    const view = new StatsView();
+    const opened = view.open(host.ctx, report(["Summary"]), "feed");
+    await host.mounted;
+    const component = host.component();
+    expect(component.render(80).join("\n")).toContain("feed 74");
+    expect(component.render(80).join("\n")).toContain("Review feed");
+    component.handleInput?.("f");
+    expect(component.render(80).join("\n")).toContain("Summary");
+    component.handleInput?.("q");
+    await opened;
+    // Runtime (untyped) callers asking for an unknown tab get the overview.
+    const other = ui(40);
+    const fallback = view.open(
+      other.ctx,
+      report(["Summary"]),
+      "unknown" as Tab,
+    );
+    await other.mounted;
+    expect(other.component().render(80).join("\n")).toContain("Summary");
+    view.close();
+    await fallback;
   });
 
   it("scrolls within snapshot bounds and closes on session disposal", async () => {
@@ -287,7 +314,7 @@ describe("StatsView", () => {
     const first = (): string | undefined => component.render(80)[4];
     expect(first()).toContain("Row 0");
     expect(component.render(80).at(-2)).toContain(
-      "d details  h hotspots  r refresh  esc  1–9/12",
+      "d details  h hotspots  f feed  r refresh  esc  1–9/12",
     );
     component.handleInput?.("\u{1B}[B");
     expect(first()).toContain("Row 1");
@@ -326,6 +353,7 @@ describe("StatsView", () => {
       summary: [value],
       details: [value],
       hotspots: () => [value],
+      feed: () => [value],
     }));
     const view = new StatsView();
     const opened = view.open(host.ctx, read);

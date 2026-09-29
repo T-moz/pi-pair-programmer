@@ -150,9 +150,10 @@ export interface StatsReport {
   summary: readonly string[];
   details: readonly string[];
   hotspots: (width: number) => readonly string[];
+  feed: (width: number) => readonly string[];
 }
 
-type Tab = "overview" | "details" | "hotspots";
+export type Tab = "overview" | "details" | "hotspots" | "feed";
 type TabSpec = readonly [key: string, tab: Tab, subtitle: string];
 const OVERVIEW: TabSpec = ["o", "overview", "Session overview"];
 /** Tabs in hint order. */
@@ -160,6 +161,7 @@ const TABS: readonly TabSpec[] = [
   OVERVIEW,
   ["d", "details", "Detailed accounting"],
   ["h", "hotspots", "Hotspots · accepted findings by file"],
+  ["f", "feed", "Review feed · recent reviews, newest first"],
 ];
 const TAB_BY_KEY = new Map(TABS.map((spec) => [spec[0], spec]));
 
@@ -171,7 +173,11 @@ export class StatsView {
     this.closeCurrent = undefined;
   }
 
-  async open(ctx: ExtensionContext, read: () => StatsReport): Promise<void> {
+  async open(
+    ctx: ExtensionContext,
+    read: () => StatsReport,
+    initial: Tab = "overview",
+  ): Promise<void> {
     this.close();
     const unavailable = "/pair-stats requires an interactive terminal (TUI).";
     if (!ctx.hasUI) throw new Error(unavailable);
@@ -188,7 +194,7 @@ export class StatsView {
         (tui, theme, keys, done) => {
           state.mounted = true;
           let report = read();
-          let spec = OVERVIEW;
+          let spec = TABS.find(([, name]) => name === initial) ?? OVERVIEW;
           let offset = 0;
           let pageSize = 1;
           let disposed = false;
@@ -205,8 +211,19 @@ export class StatsView {
               const inner = box?.inner ?? columns;
               const tab = spec[1];
               let lines = report.summary;
-              if (tab === "details") lines = report.details;
-              else if (tab === "hotspots") lines = report.hotspots(inner);
+              switch (tab) {
+                case "details":
+                  lines = report.details;
+                  break;
+                case "hotspots":
+                  lines = report.hotspots(inner);
+                  break;
+                case "feed":
+                  lines = report.feed(inner);
+                  break;
+                case "overview":
+                  break;
+              }
               const wrapped = lines.flatMap((line) => {
                 let tone: "warning" | "accent" | "text" = "text";
                 if (line.startsWith("!")) tone = "warning";

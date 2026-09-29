@@ -29,13 +29,14 @@ import {
 import {
   StatsView,
   statsHotspots,
+  type Tab,
   statsLines,
   statsSummary,
 } from "./stats-view.js";
 import { StatusOverlay, type StatusTone } from "./status-overlay.js";
 import { ReviewFeed } from "./review-feed.js";
-import { ReviewSidebar } from "./review-sidebar.js";
-import { hostOf, type Host } from "./host.js";
+import { feedLines, ReviewSidebar } from "./review-sidebar.js";
+import { canFloat, hostOf, type Host } from "./host.js";
 import {
   isInherited,
   reviewFile,
@@ -1006,41 +1007,50 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     },
   });
 
-  const toggleSidebar = (ctx: ExtensionContext): void => {
+  const openStats = (ctx: ExtensionContext, tab?: Tab): Promise<void> => {
     checkReset?.();
+    return statsView.open(
+      ctx,
+      () => {
+        const snapshot = accounting.stats.snapshot();
+        return {
+          summary: statsSummary(snapshot, store),
+          details: statsLines(snapshot, store),
+          hotspots: (width: number) => statsHotspots(store, width),
+          feed: (width: number) =>
+            feedLines(feed.list(), (id) => store.lookup(id), width),
+        };
+      },
+      tab,
+    );
+  };
+  // Hosts without non-capturing overlays (OMP) get the feed on demand instead.
+  const toggleFeed = (ctx: ExtensionContext): Promise<void> => {
+    checkReset?.();
+    if (!sidebar.open && !canFloat(ctx)) return openStats(ctx, "feed");
     sidebar.toggle(ctx);
+    return Promise.resolve();
   };
   // OMP may not expose message renderers; its default rendering stays readable.
   if (typeof pi.registerMessageRenderer === "function")
     pi.registerMessageRenderer(ACCEPTED_MESSAGE, renderAccepted);
 
   pi.registerCommand("pair-feed", {
-    description: "Toggle the live review sidebar",
-    handler: (_args, ctx) => {
-      toggleSidebar(ctx);
-      return Promise.resolve();
-    },
+    description: "Toggle the live review sidebar (a feed view on OMP)",
+    handler: (_args, ctx) => toggleFeed(ctx),
   });
   // OMP may not expose shortcuts; the command remains the portable toggle.
   if (typeof pi.registerShortcut === "function")
     pi.registerShortcut("alt+r", {
       description: "Toggle the Pair Programmer review sidebar",
-      handler: toggleSidebar,
+      handler: (ctx) => {
+        void toggleFeed(ctx);
+      },
     });
 
   pi.registerCommand("pair-stats", {
     description:
       "Show on-demand Pair Programmer activity, findings and extension usage",
-    handler: (_args, ctx) => {
-      checkReset?.();
-      return statsView.open(ctx, () => {
-        const snapshot = accounting.stats.snapshot();
-        return {
-          summary: statsSummary(snapshot, store),
-          details: statsLines(snapshot, store),
-          hotspots: (width: number) => statsHotspots(store, width),
-        };
-      });
-    },
+    handler: (_args, ctx) => openStats(ctx),
   });
 }

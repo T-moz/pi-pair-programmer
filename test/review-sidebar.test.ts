@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ReviewFeed } from "../src/review-feed.js";
 import { fakeHost, flush, openCapturing } from "./fake-host.js";
 import {
+  feedLines,
   MIN_COLUMNS,
   renderSidebar,
   ReviewSidebar,
@@ -352,5 +353,30 @@ describe("ReviewSidebar", () => {
     sidebar.toggle(late.ctx);
     expect(sidebar.open).toBe(true);
     sidebar.dispose();
+  });
+});
+
+describe("feedLines", () => {
+  it("lists surfaced reviews fully expanded, without a frame", () => {
+    expect(feedLines([], lookup, 40)).toEqual([
+      "Nothing to show yet.",
+      "Running reviews and decided findings appear here.",
+    ]);
+    const feed = new ReviewFeed();
+    feed.start("a", { ...job, file: "a.ts" }, 0);
+    feed.finish("a", "success", 1);
+    feed.attach("a", ["accepted", "rejected"]);
+    feed.start("b", { ...job, file: "b.ts" }, 0);
+    feed.finish("b", "success", 1);
+    feed.start("c", { ...job, file: "c.ts" }, 0);
+    const lines = feedLines(feed.list(), lookup, 50, 1000);
+    const joined = lines.join("\n");
+    expect(lines[0]).toContain("c.ts");
+    expect(lines[1]).toBe("");
+    expect(joined).toContain("Duplicate helper :42");
+    expect(joined).toContain("Rejected :2");
+    expect(joined).not.toContain("b.ts");
+    expect(joined).not.toContain("│");
+    expect(feedLines(feed.list(), lookup, 50)[0]).toContain("c.ts");
   });
 });

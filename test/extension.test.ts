@@ -2811,6 +2811,61 @@ it("feeds each review's outcome and attributed findings into the toggled sidebar
   await environment.emit("session_shutdown");
 });
 
+it("gives OMP a widget badge and an on-demand review feed instead of floating overlays", async () => {
+  const environment = await setup("omp");
+  const file = path.join(environment.cwd, "change.ts");
+  await fsPromises.writeFile(file, "export const broken = true;\n");
+  expect(environment.custom).not.toHaveBeenCalled();
+  expect(environment.status()).toBe("◆ pair · watching");
+  vi.mocked(reviewFile).mockResolvedValue([
+    { line: 1, title: "Feed issue", quote: "broken", evidence: "Why" },
+  ]);
+  await environment.emit("tool_result", {
+    toolName: "write",
+    input: { path: file },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(findings(environment.entries)).toHaveLength(2);
+  });
+  await environment.emit("turn_end");
+  for (const [index, finding] of findings(environment.entries).entries())
+    await environment.decide(finding.id, {
+      findingId: finding.id,
+      decision: index === 0 ? "accept" : "reject",
+      reason: index === 0 ? "Real issue" : "Intentional",
+    });
+  expect(environment.custom).not.toHaveBeenCalled();
+  let view = "";
+  environment.custom.mockImplementation(async (factory) => {
+    const component = await factory(
+      {
+        requestRender: vi.fn(),
+        terminal: { rows: 60 },
+      } as unknown as Parameters<StatsFactory>[0],
+      {
+        fg: (_color: string, text: string) => text,
+        bold: (text: string) => text,
+      } as unknown as Parameters<StatsFactory>[1],
+      { matches: () => false } as unknown as Parameters<StatsFactory>[2],
+      vi.fn(),
+    );
+    view = component.render(78).join("\n");
+  });
+  await environment.command("pair-feed");
+  expect(environment.custom).toHaveBeenCalledTimes(1);
+  expect(view).toContain("Review feed");
+  expect(view).toContain("change.ts");
+  expect(view).toContain("Feed issue :1");
+  expect(view).toContain("1 accepted");
+  expect(view).toContain("“Intentional”");
+  expect(environment.notify).not.toHaveBeenCalledWith(
+    expect.stringContaining("terminal UI"),
+    "warning",
+  );
+  await environment.emit("session_shutdown");
+});
+
 it("omits the reviewer name from cards for findings restored from an earlier process", async () => {
   const environment = await setup();
   const restored: Finding = {

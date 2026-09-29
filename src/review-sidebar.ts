@@ -55,6 +55,19 @@ function decided(entry: FeedEntry, lookup: Lookup): Decided[] {
   });
 }
 
+/** Running reviews and reviews with decided findings; the rest are noise. */
+function surfaced(
+  entries: readonly FeedEntry[],
+  lookup: Lookup,
+): { entry: FeedEntry; findings: Decided[] }[] {
+  return entries.flatMap((entry) => {
+    const findings = decided(entry, lookup);
+    return entry.phase === "running" || findings.length > 0
+      ? [{ entry, findings }]
+      : [];
+  });
+}
+
 function summary(findings: readonly Decided[]): {
   icon: string;
   color: Color;
@@ -146,12 +159,7 @@ export function layoutSidebar(
   now = Date.now(),
   expanded: ReadonlySet<string> = new Set(),
 ): SidebarLayout {
-  const visible = entries.flatMap((entry) => {
-    const findings = decided(entry, lookup);
-    return entry.phase === "running" || findings.length > 0
-      ? [{ entry, findings }]
-      : [];
-  });
+  const visible = surfaced(entries, lookup);
   const box = frame(theme, width, 1);
   const inner = box.inner;
   const running = entries.filter((entry) => entry.phase === "running").length;
@@ -212,6 +220,27 @@ export function layoutSidebar(
       ...Array.from<undefined>({ length: footer.length + 1 }),
     ],
   };
+}
+
+const PLAIN: Painter = { fg: (_color, text) => text, bold: (text) => text };
+
+/** Unframed, fully expanded feed rows for on-demand views such as OMP's. */
+export function feedLines(
+  entries: readonly FeedEntry[],
+  lookup: Lookup,
+  width: number,
+  now = Date.now(),
+): string[] {
+  const lines = surfaced(entries, lookup).flatMap(({ entry, findings }) => [
+    "",
+    ...entryLines(entry, findings, true, PLAIN, width, now),
+  ]);
+  return lines.length === 0
+    ? [
+        "Nothing to show yet.",
+        "Running reviews and decided findings appear here.",
+      ]
+    : lines.slice(1);
 }
 
 /** Renders the framed sidebar at an exact width, at most `height` rows. */
