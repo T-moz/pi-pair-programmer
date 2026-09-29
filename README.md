@@ -114,7 +114,7 @@ The default reviewer uses your current model and asks: _â€œDoes it add entropy?â
 Use `current` or a `provider/model` identifier. File patterns are relative to your working directory; exclusions take precedence. Add entries for more reviewers.
 
 > [!TIP]
-> Diagnostics stay in files, never the terminal: OMP uses its native logs; Pi uses `~/.pi/agent/logs/pair-programmer/` (or `$PI_CODING_AGENT_DIR/logs/pair-programmer/`). These logs hold only codes and numbers. Each filter decision (a reviewer entry that failed the quote check, attribution scores, dedup scores) is also saved as a `pair-programmer-stats` entry in the session, keyed by `jobId`; attribution and dedup entries carry the `findingId` used by queued findings.
+> Diagnostics stay in files, never the terminal: OMP uses its native logs; Pi uses `~/.pi/agent/logs/pair-programmer/` (or `$PI_CODING_AGENT_DIR/logs/pair-programmer/`).
 
 ---
 

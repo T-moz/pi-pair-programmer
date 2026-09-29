@@ -45,7 +45,6 @@ function hash(parts: readonly string[]): string {
     .slice(0, 16);
 }
 
-/** The id a proposed finding gets in `pair-programmer` add entries. */
 export function findingId(
   scope: FindingScope,
   proposed: ProposedFinding,

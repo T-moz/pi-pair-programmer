@@ -345,7 +345,6 @@ function linesContaining(lines: readonly string[], quote: string): number[] {
   return found;
 }
 
-/** Attribution judgment before runJob joins it to the finding id. */
 type Attribution = Omit<AttributionJudgment, "findingId">;
 
 interface AttributionRequest {
