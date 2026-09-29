@@ -84,6 +84,18 @@ it.each([
     "reviewers[0].model",
   ],
   [
+    '{"reviewers":[{"model":"current","prompt":"review","include":["*.ts"],"exclude":[],"tools":["bash"]}]}',
+    "reviewers[0].tools[0]",
+  ],
+  [
+    '{"reviewers":[{"model":"current","prompt":"review","include":["*.ts"],"exclude":[],"tools":"web_search"}]}',
+    "reviewers[0].tools",
+  ],
+  [
+    '{"reviewers":[{"model":"current","prompt":"review","include":["*.ts"],"exclude":[],"tools":["web_search","web_search"]}]}',
+    "reviewers[0].tools",
+  ],
+  [
     '{"reviewers":[{"model":"  ","prompt":"review","include":["*.ts"],"exclude":[]}]}',
     "reviewers[0].model",
   ],
@@ -274,4 +286,22 @@ it("uses semantic reviewer identity regardless of pattern order", () => {
   expect(key).not.toBe(reviewerKey({ ...first, model: "other/model" }));
   expect(key).not.toBe(reviewerKey({ ...first, include: ["src/**/*.ts"] }));
   expect(key).not.toBe(reviewerKey({ ...first, exclude: [] }));
+});
+
+it("loads configured reviewer tools and keys reviewers by them", async () => {
+  const directory = await temporaryDirectory();
+  const base: ReviewerConfig = {
+    model: "current",
+    prompt: "Check current library APIs",
+    include: ["**/*.ts"],
+    exclude: [],
+  };
+  const withTools: ReviewerConfig = { ...base, tools: ["web_search"] };
+  await writeFile(
+    path.join(directory, "pair-programmer.reviewers.json"),
+    JSON.stringify({ reviewers: [withTools] }),
+  );
+  expect(await loadReviewers(directory)).toEqual([withTools]);
+  expect(reviewerKey(withTools)).not.toBe(reviewerKey(base));
+  expect(reviewerKey({ ...base, tools: [] })).toBe(reviewerKey(base));
 });
