@@ -10,6 +10,7 @@ import { z } from "zod";
 import {
   buildChangeEvidence,
   captureBaseline,
+  lineChanges,
   type TaskBaseline,
 } from "./change-evidence.js";
 import { FindingAdmission, findingId } from "./finding-admission.js";
@@ -455,6 +456,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       prompt: job.reviewer.prompt,
       file: job.file,
       source: job.source,
+      changes: await lineChanges(baseline, job.file, job.source, signal),
       signal,
       onModelCall,
       onJudgment,
