@@ -974,31 +974,33 @@ it("marks trailing newline differences in the diff", async () => {
   );
 });
 
-it("reports a change whose edit distance exceeds the diff bound as unavailable", async () => {
-  const before = Array.from(
-    { length: 600 },
-    (_, index) => `old ${String(index)}`,
-  );
-  const after = Array.from(
-    { length: 600 },
-    (_, index) => `new ${String(index)}`,
-  );
-  const original = [quote, ...before].join("\n");
+it("reports edits around an unchanged block beyond the edit bound as approximate while keeping attribution evidence", async () => {
+  const block = legacy.trimEnd().split("\n");
+  const side = (label: string, part: string): string[] =>
+    Array.from(
+      { length: 300 },
+      (_, index) => `${label} ${part} ${String(index)}`,
+    );
+  const before = [...side("old", "head"), ...block, ...side("old", "tail")];
+  const after = [...side("new", "head"), ...block, ...side("new", "tail")];
+  const original = before.join("\n");
   await writeFile(path.join(root, "rewrite.ts"), original);
   const baseline = await capture();
+  const current = after.join("\n");
+  expect(await lineChanges(baseline, "rewrite.ts", current)).toEqual({
+    status: "approximate",
+    region: { start: 1, added: after.length, removed: before },
+  });
   expect(
-    await buildChangeEvidence(
-      baseline,
-      "rewrite.ts",
-      [quote, ...after].join("\n"),
-      1,
-      quote,
-    ),
-  ).toMatchObject({
-    status: "unavailable",
+    await buildChangeEvidence(baseline, "rewrite.ts", current, 304, quote),
+  ).toEqual({
+    status: "available",
     before: { file: "rewrite.ts", source: original },
+    after: { file: "rewrite.ts", source: current },
     diff: null,
-    reason: "Change exceeds the diff edit bound",
+    origins: [],
+    reason:
+      "The line diff was too large to compute; compare taskStartSource with currentSource directly",
   });
 });
 
@@ -1078,32 +1080,6 @@ it("marks every line of a file created after task start", async () => {
   expect(await lineChanges(baseline, "created.ts", legacy)).toEqual({
     status: "available",
     hunks: [{ start: 1, added: 6, removed: [] }],
-  });
-});
-
-it("marks a wholesale rewrite as one hunk when the edit distance is too large", async () => {
-  const before = Array.from(
-    { length: 600 },
-    (_, index) => `old ${String(index)}`,
-  );
-  const after = Array.from(
-    { length: 600 },
-    (_, index) => `new ${String(index)}`,
-  );
-  await writeFile(
-    path.join(root, "rewrite.ts"),
-    ["keep", ...before, "end"].join("\n"),
-  );
-  const baseline = await capture();
-  expect(
-    await lineChanges(
-      baseline,
-      "rewrite.ts",
-      ["keep", ...after, "end"].join("\n"),
-    ),
-  ).toEqual({
-    status: "available",
-    hunks: [{ start: 2, added: 600, removed: before }],
   });
 });
 

@@ -830,13 +830,12 @@ export async function buildChangeEvidence(
     return evidence;
   }
   const diff = sourceDiff(original, evidence.after);
-  if (diff === undefined) {
-    evidence.reason = "Change exceeds the diff edit bound";
-    return evidence;
-  }
-  evidence.diff = diff;
   evidence.status = "available";
-  evidence.reason = null;
+  evidence.diff = diff ?? null;
+  evidence.reason =
+    diff === undefined
+      ? "The line diff was too large to compute; compare taskStartSource with currentSource directly"
+      : null;
   return evidence;
 }
 
@@ -848,9 +847,10 @@ export interface LineHunk {
 
 export type LineChanges =
   | { status: "available"; hunks: readonly LineHunk[] }
+  | { status: "approximate"; region: LineHunk }
   | { status: "unavailable"; reason: string };
 
-function lineHunks(before: string, after: string): LineHunk[] {
+function compareLines(before: string, after: string): LineChanges {
   const oldLines = before.split("\n");
   const newLines = after.split("\n");
   let start = 0;
@@ -877,7 +877,10 @@ function lineHunks(before: string, after: string): LineHunk[] {
     maxEditLength: MAX_EDIT_DISTANCE,
   });
   if (changes === undefined)
-    return [{ start: start + 1, added: added.length, removed }];
+    return {
+      status: "approximate",
+      region: { start: start + 1, added: added.length, removed },
+    };
   const hunks: LineHunk[] = [];
   let line = start + 1;
   let hunk: { start: number; added: number; removed: string[] } | undefined;
@@ -898,7 +901,7 @@ function lineHunks(before: string, after: string): LineHunk[] {
       hunk.removed.push(...change.value);
     }
   }
-  return hunks;
+  return { status: "available", hunks };
 }
 
 export async function lineChanges(
@@ -932,11 +935,10 @@ export async function lineChanges(
       status: "unavailable",
       reason: "Task-start state of this file is unknown",
     };
-  return {
-    status: "available",
-    hunks:
-      before.state === "absent"
-        ? [{ start: 1, added: source.split("\n").length, removed: [] }]
-        : lineHunks(before.source, source),
-  };
+  return before.state === "absent"
+    ? {
+        status: "available",
+        hunks: [{ start: 1, added: source.split("\n").length, removed: [] }],
+      }
+    : compareLines(before.source, source);
 }

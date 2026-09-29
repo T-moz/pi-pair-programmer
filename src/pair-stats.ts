@@ -59,7 +59,6 @@ const Attribution = z.object({
   reason: z.enum([
     "judged",
     "evidence_unavailable",
-    "no_diff",
     "no_origin",
     "response_invalid",
     "request_failed",

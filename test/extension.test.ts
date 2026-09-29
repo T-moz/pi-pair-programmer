@@ -1918,6 +1918,60 @@ it("starts a new OMP baseline from metadata-only history and preserves it on rep
   await environment.emit("session_shutdown");
 });
 
+it("still asks Jev about a pre-existing block the reviewer saw only inside an approximate change region", async () => {
+  const side = (label: string): string[] =>
+    Array.from(
+      { length: 300 },
+      (_, index) => `const ${label}${String(index)} = ${String(index)};`,
+    );
+  const block = inheritedSource.trimEnd().split("\n");
+  const taskStart = [...side("oldHead"), ...block, ...side("oldTail")];
+  const current = [...side("newHead"), ...block, ...side("newTail")];
+  const environment = await setup("omp", false, true, async (cwd) => {
+    await fsPromises.writeFile(
+      path.join(cwd, "change.ts"),
+      `${taskStart.join("\n")}\n`,
+    );
+  });
+  await fsPromises.writeFile(
+    path.join(environment.cwd, "change.ts"),
+    `${current.join("\n")}\n`,
+  );
+  vi.mocked(reviewFile).mockImplementation(({ changes }) =>
+    Promise.resolve(
+      changes.status === "approximate"
+        ? [{ ...inheritedProposal, line: 302 }]
+        : [],
+    ),
+  );
+  const actual = await vi.importActual<{ isInherited: typeof isInherited }>(
+    "../src/review-runner.js",
+  );
+  vi.mocked(isInherited).mockImplementation(actual.isInherited);
+  systemOne.mockResolvedValue({
+    answers: {
+      category: {
+        choice: "inherited",
+        confidence: 0.95,
+        probabilities: { inherited: 0.95, introduced: 0.05, unknown: 0 },
+      },
+    },
+  });
+  await environment.emit("tool_result", {
+    toolName: "edit",
+    input: { path: "change.ts" },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(vi.mocked(isInherited).mock.settledResults[0]?.type).toBe(
+      "fulfilled",
+    );
+  });
+  expect(systemOne.mock.calls).toMatchObject([[{ state: { diff: null } }, {}]]);
+  expect(findings(environment.entries)).toEqual([]);
+  await environment.emit("session_shutdown");
+});
+
 it("does not let an older root resolution replace the active workspace", async () => {
   const environment = await setup("omp", false, true);
   const newerRoot = await fsPromises.mkdtemp(
