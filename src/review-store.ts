@@ -59,6 +59,22 @@ interface FindingState extends StoredFinding {
   discarded: boolean;
 }
 
+/** The single source of truth for a finding's lifecycle status. */
+function statusOf(state: FindingState): FindingStatus {
+  if (state.verdict === "accept") return "accepted";
+  if (state.verdict === "reject") return "rejected";
+  if (state.discarded) return "discarded";
+  return state.delivered ? "awaiting" : "queued";
+}
+
+const SUMMARY_KEY = {
+  queued: "pending",
+  awaiting: "outstanding",
+  accepted: "accepted",
+  rejected: "rejected",
+  discarded: "discarded",
+} as const satisfies Record<FindingStatus, string>;
+
 export class ReviewStore {
   private readonly findings = new Map<string, FindingState>();
   private readonly append: (data: unknown) => void;
@@ -95,13 +111,8 @@ export class ReviewStore {
       rejected: 0,
       discarded: 0,
     };
-    for (const state of this.findings.values()) {
-      if (state.verdict === "accept") counts.accepted += 1;
-      else if (state.verdict === "reject") counts.rejected += 1;
-      else if (state.discarded) counts.discarded += 1;
-      else if (state.delivered) counts.outstanding += 1;
-      else counts.pending += 1;
-    }
+    for (const state of this.findings.values())
+      counts[SUMMARY_KEY[statusOf(state)]] += 1;
     return counts;
   }
 
@@ -196,15 +207,10 @@ export class ReviewStore {
   lookup(id: string): FindingView | undefined {
     const state = this.findings.get(id);
     if (state === undefined) return undefined;
-    let status: FindingStatus = "queued";
-    if (state.verdict === "accept") status = "accepted";
-    else if (state.verdict === "reject") status = "rejected";
-    else if (state.discarded) status = "discarded";
-    else if (state.delivered) status = "awaiting";
     return {
       title: state.finding.title,
       line: state.finding.line,
-      status,
+      status: statusOf(state),
       ...(state.reason === undefined ? {} : { reason: state.reason }),
     };
   }
