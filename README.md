@@ -113,6 +113,20 @@ The default reviewer uses your current model and asks: _â€œDoes it add entropy?â
 
 Use `current` or a `provider/model` identifier. File patterns are relative to your working directory; exclusions take precedence. Add entries for more reviewers.
 
+Reviewers have no tools by default. To let a reviewer look things up, such as current library APIs, add an optional `tools` list. For now, the only supported tool is `web_search`:
+
+```json
+{
+  "model": "current",
+  "prompt": "Does this code use a deprecated or nonexistent library API?",
+  "include": ["**/*.ts"],
+  "exclude": [],
+  "tools": ["web_search"]
+}
+```
+
+OMP has `web_search` built in. Pi does not, so it needs an extension that registers a `web_search` tool, such as [pi-web-access](https://www.npmjs.com/package/pi-web-access). A reviewer with tools on Pi loads your installed extensions, but it can only use the tools you list. Reviews that search take longer and cost more.
+
 > [!TIP]
 > Diagnostics stay in files, never the terminal: OMP uses its native logs; Pi uses `~/.pi/agent/logs/pair-programmer/` (or `$PI_CODING_AGENT_DIR/logs/pair-programmer/`).
 
