@@ -190,6 +190,52 @@ it("drops prose, secrets, paths, objects, invalid numbers, and unknown event cod
   ]);
 });
 
+it("writes filter judgments as codes and scores while dropping their free text", async () => {
+  const directory = await temporaryDirectory();
+  const logger = await createPairLogger({}, { directory });
+  logger.log("finding.judged", {
+    jobId: "def456",
+    stage: "attribution",
+    outcome: "drop",
+    reasonCode: "judged",
+    confidence: 0.97,
+    probability: 0.98,
+    score: undefined,
+    title: "Private finding title",
+    quote: "privateSource()",
+    lineText: "const secret = privateSource();",
+  } as PairLogFields);
+  logger.log("finding.judged", {
+    stage: "dedup",
+    outcome: "keep",
+    reasonCode: "response_invalid",
+    score: 0.2,
+  });
+  await logger.close();
+  expect(await logRecords(directory)).toEqual([
+    {
+      level: 20,
+      time: expect.any(Number) as unknown,
+      msg: "pair-programmer.finding.judged",
+      jobId: "def456",
+      stage: "attribution",
+      outcome: "drop",
+      reasonCode: "judged",
+      confidence: 0.97,
+      probability: 0.98,
+    },
+    {
+      level: 40,
+      time: expect.any(Number) as unknown,
+      msg: "pair-programmer.finding.judged",
+      stage: "dedup",
+      outcome: "keep",
+      reasonCode: "response_invalid",
+      score: 0.2,
+    },
+  ]);
+});
+
 it("applies the same redaction before invoking the native logger", async () => {
   const warn = vi.fn();
   const logger = await createPairLogger({ logger: { info: vi.fn(), warn } });

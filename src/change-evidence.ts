@@ -13,11 +13,13 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { createTwoFilesPatch, diffArrays, FILE_HEADERS_ONLY } from "diff";
 import { z } from "zod";
 
 const execute = promisify(execFile);
 const NoMatchSchema = z.object({ code: z.literal(1), stderr: z.string() });
 const MAX_FILE_BYTES = 64_000;
+const MAX_EDIT_DISTANCE = 1000;
 const MAX_ENTRIES = 10_000;
 const MAX_LISTING_BYTES = 256_000_000;
 const CAPTURE_TIMEOUT_MS = 5000;
@@ -733,32 +735,30 @@ function matchingOrigins(
   return [...matches.values()];
 }
 
-function sourceDiff(before: SourceFile, after: SourceFile): string {
-  const oldLines = before.source.split("\n");
-  const newLines = after.source.split("\n");
-  let start = 0;
-  while (start < oldLines.length && oldLines.at(start) === newLines.at(start)) {
-    start += 1;
-  }
-  let oldEnd = oldLines.length;
-  let newEnd = newLines.length;
-  while (
-    oldEnd > start &&
-    newEnd > start &&
-    oldLines[oldEnd - 1] === newLines[newEnd - 1]
-  ) {
-    oldEnd -= 1;
-    newEnd -= 1;
-  }
-  const contextStart = Math.max(0, start - 3);
-  const contextEnd = Math.min(oldLines.length - oldEnd, 3);
-  const changes = [
-    ...oldLines.slice(contextStart, start).map((text) => ` ${text}`),
-    ...oldLines.slice(start, oldEnd).map((text) => `-${text}`),
-    ...newLines.slice(start, newEnd).map((text) => `+${text}`),
-    ...oldLines.slice(oldEnd, oldEnd + contextEnd).map((text) => ` ${text}`),
-  ];
-  return `--- ${before.file}\n+++ ${after.file}\n@@ -${String(contextStart + 1)},${String(oldEnd - contextStart + contextEnd)} +${String(contextStart + 1)},${String(newEnd - contextStart + contextEnd)} @@\n${changes.join("\n")}`;
+function sourceDiff(before: SourceFile, after: SourceFile): string | undefined {
+  return createTwoFilesPatch(
+    before.file,
+    after.file,
+    before.source,
+    after.source,
+    undefined,
+    undefined,
+    {
+      context: 3,
+      maxEditLength: MAX_EDIT_DISTANCE,
+      headerOptions: FILE_HEADERS_ONLY,
+    },
+  );
+}
+
+function baselineFile(
+  baseline: TaskBaseline | undefined,
+  file: string,
+): string | undefined {
+  return baseline === undefined
+    ? undefined
+    : (relativeFile(baseline.root, file) ??
+        relativeFile(baseline.requestedRoot, file));
 }
 
 export async function buildChangeEvidence(
@@ -769,11 +769,7 @@ export async function buildChangeEvidence(
   quote: string,
   signal?: AbortSignal,
 ): Promise<ChangeEvidence> {
-  const relative =
-    baseline === undefined
-      ? undefined
-      : (relativeFile(baseline.root, file) ??
-        relativeFile(baseline.requestedRoot, file));
+  const relative = baselineFile(baseline, file);
   const evidence: ChangeEvidence = {
     status: "unavailable",
     before: null,
@@ -833,8 +829,116 @@ export async function buildChangeEvidence(
       "No substantial matching baseline block or same-file source";
     return evidence;
   }
-  evidence.diff = sourceDiff(original, evidence.after);
+  const diff = sourceDiff(original, evidence.after);
   evidence.status = "available";
-  evidence.reason = null;
+  evidence.diff = diff ?? null;
+  evidence.reason =
+    diff === undefined
+      ? "The line diff was too large to compute; compare taskStartSource with currentSource directly"
+      : null;
   return evidence;
+}
+
+export interface LineHunk {
+  start: number;
+  added: number;
+  removed: readonly string[];
+}
+
+export type LineChanges =
+  | { status: "available"; hunks: readonly LineHunk[] }
+  | { status: "approximate"; region: LineHunk }
+  | { status: "unavailable"; reason: string };
+
+function compareLines(before: string, after: string): LineChanges {
+  const oldLines = before.split("\n");
+  const newLines = after.split("\n");
+  let start = 0;
+  while (
+    start < oldLines.length &&
+    start < newLines.length &&
+    oldLines.at(start) === newLines.at(start)
+  ) {
+    start += 1;
+  }
+  let oldEnd = oldLines.length;
+  let newEnd = newLines.length;
+  while (
+    oldEnd > start &&
+    newEnd > start &&
+    oldLines[oldEnd - 1] === newLines[newEnd - 1]
+  ) {
+    oldEnd -= 1;
+    newEnd -= 1;
+  }
+  const removed = oldLines.slice(start, oldEnd);
+  const added = newLines.slice(start, newEnd);
+  const changes = diffArrays(removed, added, {
+    maxEditLength: MAX_EDIT_DISTANCE,
+  });
+  if (changes === undefined)
+    return {
+      status: "approximate",
+      region: { start: start + 1, added: added.length, removed },
+    };
+  const hunks: LineHunk[] = [];
+  let line = start + 1;
+  let hunk: { start: number; added: number; removed: string[] } | undefined;
+  for (const change of changes) {
+    if (!change.added && !change.removed) {
+      hunk = undefined;
+      line += change.count;
+      continue;
+    }
+    if (hunk === undefined) {
+      hunk = { start: line, added: 0, removed: [] };
+      hunks.push(hunk);
+    }
+    if (change.added) {
+      hunk.added += change.count;
+      line += change.count;
+    } else {
+      hunk.removed.push(...change.value);
+    }
+  }
+  return { status: "available", hunks };
+}
+
+export async function lineChanges(
+  baseline: TaskBaseline | undefined,
+  file: string,
+  source: string,
+  signal?: AbortSignal,
+): Promise<LineChanges> {
+  if (baseline === undefined)
+    return { status: "unavailable", reason: "Task baseline is unavailable" };
+  const relative = baselineFile(baseline, file);
+  if (
+    relative === undefined ||
+    !eligible(relative) ||
+    baseline.unattributable(relative)
+  )
+    return {
+      status: "unavailable",
+      reason: "File is not covered by the task baseline",
+    };
+  if (Buffer.byteLength(source) > MAX_FILE_BYTES)
+    return { status: "unavailable", reason: "Current source is oversized" };
+  let before: BeforeState;
+  try {
+    before = await baseline.before(relative, signal);
+  } catch {
+    return { status: "unavailable", reason: "Task baseline could not be read" };
+  }
+  if (before.state === "unknown")
+    return {
+      status: "unavailable",
+      reason: "Task-start state of this file is unknown",
+    };
+  return before.state === "absent"
+    ? {
+        status: "available",
+        hunks: [{ start: 1, added: source.split("\n").length, removed: [] }],
+      }
+    : compareLines(before.source, source);
 }

@@ -1,19 +1,33 @@
 import { createHash } from "node:crypto";
 import { noul, TypeSafeClient } from "@typesafe-ai/sdk";
-import { observeJudgment, type ModelCallObserver } from "./model-usage.js";
+import { z } from "zod";
+import {
+  notify,
+  observeJudgment,
+  type ModelCallObserver,
+} from "./model-usage.js";
+import type { DedupJudgment, JudgmentObserver } from "./pair-stats.js";
 import type { ProposedFinding } from "./review-runner.js";
 import type { ReviewStore, Finding, StoredFinding } from "./review-store.js";
 
-interface AdmissionRequest {
+interface FindingScope {
   file: string;
   reviewer: string;
   revision: string;
+}
+
+interface AdmissionRequest extends FindingScope {
   findings: readonly ProposedFinding[];
   signal: AbortSignal;
   onModelCall?: ModelCallObserver;
+  onJudgment?: JudgmentObserver;
   isCurrent: () => Promise<boolean>;
 }
 
+type Observers = Pick<
+  AdmissionRequest,
+  "signal" | "onModelCall" | "onJudgment"
+>;
 type Candidate = Finding & { duplicateKey: string };
 
 export interface AdmissionResult {
@@ -21,6 +35,12 @@ export interface AdmissionResult {
   ids: readonly string[];
 }
 
+const DUPLICATE_THRESHOLD = 0.5;
+const dedupSchema = z.object({
+  answers: z.object({
+    duplicate: z.object({ noul: z.number().min(0).max(1) }),
+  }),
+});
 let jevClient: TypeSafeClient | undefined;
 
 function hash(parts: readonly string[]): string {
@@ -30,8 +50,15 @@ function hash(parts: readonly string[]): string {
     .slice(0, 16);
 }
 
+export function findingId(
+  scope: FindingScope,
+  proposed: ProposedFinding,
+): string {
+  return candidateOf(scope, proposed).id;
+}
+
 function candidateOf(
-  request: AdmissionRequest,
+  request: FindingScope,
   proposed: ProposedFinding,
 ): Candidate {
   const duplicateKey = hash([
@@ -57,27 +84,38 @@ function sameProblem(candidate: Candidate, finding: Finding): boolean {
   return candidate.duplicateKey === (finding.duplicateKey ?? finding.id);
 }
 
-async function isNovel(
+async function judgeNovelty(
   candidate: Candidate,
   history: readonly StoredFinding[],
   earlier: readonly Candidate[],
-  signal: AbortSignal,
-  onModelCall: ModelCallObserver | undefined,
-): Promise<boolean> {
-  const matches = (finding: Finding): boolean =>
-    sameProblem(candidate, finding);
-  const unchanged = (finding: Finding): boolean =>
-    matches(finding) && candidate.evidence === finding.evidence;
-  if (
-    history.some(({ finding }) => unchanged(finding)) ||
-    earlier.some(unchanged)
-  )
-    return false;
-  if (history.length === 0 && earlier.length === 0) return true;
+  { signal, onModelCall }: Observers,
+): Promise<DedupJudgment> {
+  const priors = [...history.map(({ finding }) => finding), ...earlier];
+  const matching = priors.filter((finding) => sameProblem(candidate, finding));
+  const judgment = (
+    decision: DedupJudgment["decision"],
+    reason: DedupJudgment["reason"],
+  ): DedupJudgment => ({
+    stage: "dedup",
+    decision,
+    reason,
+    findingId: candidate.id,
+    duplicateKey: candidate.duplicateKey,
+    line: candidate.line,
+    title: candidate.title,
+    history: history.map(({ finding }) => finding.id),
+    candidates: earlier.map(({ id }) => id),
+    sameKey: matching.map(({ id }) => id),
+  });
+  if (matching.some(({ evidence }) => evidence === candidate.evidence))
+    return judgment("drop", "unchanged");
+  if (priors.length === 0) return judgment("keep", "first");
+  const fallback = matching.length === 0 ? "keep" : "drop";
+  let response: unknown;
   try {
     jevClient ??= new TypeSafeClient({ logLevel: "off" });
     const client = jevClient;
-    const response = await observeJudgment("dedup", signal, onModelCall, () =>
+    response = await observeJudgment("dedup", signal, onModelCall, () =>
       client.systemOne(
         {
           model: "jev-latest",
@@ -104,28 +142,32 @@ async function isNovel(
         { signal, timeout: 30_000, retry: { maxRetries: 0 } },
       ),
     );
-    return response.answers.duplicate.noul < 0.5;
   } catch {
-    return (
-      history.every(({ finding }) => !matches(finding)) &&
-      earlier.every((finding) => !matches(finding))
-    );
+    return judgment(fallback, signal.aborted ? "cancelled" : "request_failed");
   }
+  const parsed = dedupSchema.safeParse(response);
+  if (!parsed.success) return judgment(fallback, "response_invalid");
+  const score = parsed.data.answers.duplicate.noul;
+  return {
+    ...judgment(score < DUPLICATE_THRESHOLD ? "keep" : "drop", "judged"),
+    score,
+    threshold: DUPLICATE_THRESHOLD,
+  };
 }
 
 async function novelFindings(
   candidates: readonly Candidate[],
   history: readonly StoredFinding[],
   compareCandidates: boolean,
-  signal: AbortSignal,
-  onModelCall: ModelCallObserver | undefined,
+  observers: Observers,
 ): Promise<Candidate[]> {
   const novel: Candidate[] = [];
   for (const [index, candidate] of candidates.entries()) {
-    if (signal.aborted) break;
+    if (observers.signal.aborted) break;
     const earlier = compareCandidates ? candidates.slice(0, index) : [];
-    if (await isNovel(candidate, history, earlier, signal, onModelCall))
-      novel.push(candidate);
+    const judgment = await judgeNovelty(candidate, history, earlier, observers);
+    notify(observers.onJudgment, judgment);
+    if (judgment.decision === "keep") novel.push(candidate);
   }
   return novel;
 }
@@ -145,8 +187,7 @@ export class FindingAdmission {
       request.findings.map((finding) => candidateOf(request, finding)),
       history,
       true,
-      signal,
-      request.onModelCall,
+      request,
     );
     for (;;) {
       if (!(await request.isCurrent()) || signal.aborted)
@@ -155,13 +196,7 @@ export class FindingAdmission {
       const added = latest.slice(history.length);
       if (novel.length === 0 || added.length === 0) break;
       history = latest;
-      novel = await novelFindings(
-        novel,
-        added,
-        false,
-        signal,
-        request.onModelCall,
-      );
+      novel = await novelFindings(novel, added, false, request);
     }
     const ids = novel
       .filter((finding) => this.store.add(finding))

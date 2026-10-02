@@ -20,6 +20,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import {
   buildChangeEvidence,
   captureBaseline,
+  lineChanges,
   type TaskBaseline,
 } from "../src/change-evidence.js";
 
@@ -869,28 +870,248 @@ it("bounds non-Git enumeration but freezes a Git repository of any size", async 
   ).toBe("available");
 });
 
-it("keeps before and after evidence for insertion and removal near file boundaries", async () => {
+it("diffs changes at file boundaries as unified hunks", async () => {
+  await writeFile(path.join(root, "original.ts"), legacy);
+  await writeFile(path.join(root, "empty.ts"), "");
+  const baseline = await capture();
+  const lines = legacy.split("\n");
+  const kept = (from: number, to: number): string[] =>
+    lines.slice(from, to).map((text) => ` ${text}`);
+  const diff = async (
+    file: string,
+    source: string,
+    line: number,
+  ): Promise<string | null> =>
+    (await buildChangeEvidence(baseline, file, source, line, quote)).diff;
+  expect(
+    await diff("original.ts", `const publicRoute = true;\n${legacy}`, 5),
+  ).toBe(
+    [
+      "--- original.ts",
+      "+++ original.ts",
+      "@@ -1,3 +1,4 @@",
+      "+const publicRoute = true;",
+      ...kept(0, 3),
+      "",
+    ].join("\n"),
+  );
+  expect(await diff("original.ts", lines.slice(1).join("\n"), 3)).toBe(
+    [
+      "--- original.ts",
+      "+++ original.ts",
+      "@@ -1,4 +1,3 @@",
+      ...lines.slice(0, 1).map((text) => `-${text}`),
+      ...kept(1, 4),
+      "",
+    ].join("\n"),
+  );
+  expect(await diff("original.ts", legacy.replace(/\}\n$/, "};\n"), 4)).toBe(
+    [
+      "--- original.ts",
+      "+++ original.ts",
+      "@@ -2,4 +2,4 @@",
+      ...kept(1, 4),
+      "-}",
+      "+};",
+      "",
+    ].join("\n"),
+  );
+  expect(await diff("empty.ts", legacy, 4)).toBe(
+    [
+      "--- empty.ts",
+      "+++ empty.ts",
+      "@@ -0,0 +1,5 @@",
+      ...lines.slice(0, 5).map((text) => `+${text}`),
+      "",
+    ].join("\n"),
+  );
+});
+
+it("marks trailing newline differences in the diff", async () => {
+  await writeFile(path.join(root, "original.ts"), legacy);
+  await writeFile(path.join(root, "unterminated.ts"), legacy.trimEnd());
+  const baseline = await capture();
+  const context = legacy
+    .split("\n")
+    .slice(1, 4)
+    .map((text) => ` ${text}`);
+  expect(
+    (
+      await buildChangeEvidence(
+        baseline,
+        "original.ts",
+        legacy.trimEnd(),
+        4,
+        quote,
+      )
+    ).diff,
+  ).toBe(
+    [
+      "--- original.ts",
+      "+++ original.ts",
+      "@@ -2,4 +2,4 @@",
+      ...context,
+      "-}",
+      "+}",
+      String.raw`\ No newline at end of file`,
+      "",
+    ].join("\n"),
+  );
+  expect(
+    (await buildChangeEvidence(baseline, "unterminated.ts", legacy, 4, quote))
+      .diff,
+  ).toBe(
+    [
+      "--- unterminated.ts",
+      "+++ unterminated.ts",
+      "@@ -2,4 +2,4 @@",
+      ...context,
+      "-}",
+      String.raw`\ No newline at end of file`,
+      "+}",
+      "",
+    ].join("\n"),
+  );
+});
+
+it("reports edits around an unchanged block beyond the edit bound as approximate while keeping attribution evidence", async () => {
+  const block = legacy.trimEnd().split("\n");
+  const side = (label: string, part: string): string[] =>
+    Array.from(
+      { length: 300 },
+      (_, index) => `${label} ${part} ${String(index)}`,
+    );
+  const before = [...side("old", "head"), ...block, ...side("old", "tail")];
+  const after = [...side("new", "head"), ...block, ...side("new", "tail")];
+  const original = before.join("\n");
+  await writeFile(path.join(root, "rewrite.ts"), original);
+  const baseline = await capture();
+  const current = after.join("\n");
+  expect(await lineChanges(baseline, "rewrite.ts", current)).toEqual({
+    status: "approximate",
+    region: { start: 1, added: after.length, removed: before },
+  });
+  expect(
+    await buildChangeEvidence(baseline, "rewrite.ts", current, 304, quote),
+  ).toEqual({
+    status: "available",
+    before: { file: "rewrite.ts", source: original },
+    after: { file: "rewrite.ts", source: current },
+    diff: null,
+    origins: [],
+    reason:
+      "The line diff was too large to compute; compare taskStartSource with currentSource directly",
+  });
+});
+
+it("marks only current lines that differ from the task-start file", async () => {
   await writeFile(path.join(root, "original.ts"), legacy);
   const baseline = await capture();
-  const insertion = `const publicRoute = true;\n${legacy}`;
-  const inserted = await buildChangeEvidence(
-    baseline,
-    "original.ts",
-    insertion,
-    5,
-    quote,
+  const current = [
+    "export function loadCustomer(customerId: string) {",
+    "  const cachedRecord = customerCache.get(customerId);",
+    "  if (cachedRecord === undefined) return null;",
+    "  return JSON.parse(cachedRecord.serializedValue);",
+    "}",
+    "",
+  ].join("\n");
+  expect(await lineChanges(baseline, "original.ts", current)).toEqual({
+    status: "available",
+    hunks: [
+      {
+        start: 2,
+        added: 2,
+        removed: [
+          "  const cacheKey = `customer-record:${customerId}`;",
+          "  const cachedRecord = customerCache.get(cacheKey);",
+        ],
+      },
+    ],
+  });
+  const lines = legacy.split("\n");
+  const appended = [
+    ...lines.slice(0, 4),
+    "  // unreachable",
+    ...lines.slice(4),
+  ];
+  expect(
+    await lineChanges(baseline, "original.ts", appended.join("\n")),
+  ).toEqual({
+    status: "available",
+    hunks: [{ start: 5, added: 1, removed: [] }],
+  });
+  const separated = [lines[0], lines[3], lines[4], lines[5]].join("\n");
+  expect(await lineChanges(baseline, "original.ts", separated)).toEqual({
+    status: "available",
+    hunks: [{ start: 2, added: 0, removed: [lines[1], lines[2]] }],
+  });
+  expect(await lineChanges(baseline, "original.ts", legacy)).toEqual({
+    status: "available",
+    hunks: [],
+  });
+});
+
+it("keeps unchanged lines between separate edits unmarked", async () => {
+  const before = Array.from(
+    { length: 12 },
+    (_, index) => `line ${String(index)}`,
   );
-  expect(inserted.diff).toContain("+const publicRoute = true;");
-  const removal = legacy.split("\n").slice(1).join("\n");
-  const removed = await buildChangeEvidence(
-    baseline,
-    "original.ts",
-    removal,
-    3,
-    quote,
+  await writeFile(path.join(root, "spread.ts"), before.join("\n"));
+  const baseline = await capture();
+  const after = before.flatMap((text, index) => {
+    if (index === 2) return ["inserted", text];
+    if (index === 6) return ["replaced"];
+    return index === 9 ? [] : [text];
+  });
+  expect(
+    await lineChanges(baseline, path.join(root, "spread.ts"), after.join("\n")),
+  ).toEqual({
+    status: "available",
+    hunks: [
+      { start: 3, added: 1, removed: [] },
+      { start: 8, added: 1, removed: ["line 6"] },
+      { start: 11, added: 0, removed: ["line 9"] },
+    ],
+  });
+});
+
+it("marks every line of a file created after task start", async () => {
+  const baseline = await capture();
+  expect(await lineChanges(baseline, "created.ts", legacy)).toEqual({
+    status: "available",
+    hunks: [{ start: 1, added: 6, removed: [] }],
+  });
+});
+
+it("reports why line changes are unavailable", async () => {
+  await initializeGit();
+  await writeFile(path.join(root, "huge.ts"), "x".repeat(64_001));
+  await writeFile(path.join(root, "original.ts"), legacy);
+  await commitFiles();
+  const baseline = await capture();
+  const reason = async (
+    file: string,
+    source = legacy,
+  ): Promise<string | undefined> => {
+    const changes = await lineChanges(baseline, file, source);
+    return changes.status === "unavailable" ? changes.reason : undefined;
+  };
+  expect(await lineChanges(undefined, "original.ts", legacy)).toEqual({
+    status: "unavailable",
+    reason: "Task baseline is unavailable",
+  });
+  expect(await reason("../outside.ts")).toBe(
+    "File is not covered by the task baseline",
   );
-  expect(removed.diff).toContain(
-    "-export function loadCustomer(customerId: string) {",
+  expect(await reason("node_modules/pkg/index.ts")).toBe(
+    "File is not covered by the task baseline",
   );
-  expect(removed.before?.source).toBe(legacy);
+  expect(await reason("huge.ts")).toBe(
+    "Task-start state of this file is unknown",
+  );
+  expect(await reason("original.ts", "x".repeat(64_001))).toBe(
+    "Current source is oversized",
+  );
+  vi.spyOn(baseline, "before").mockRejectedValueOnce(new Error("disposed"));
+  expect(await reason("original.ts")).toBe("Task baseline could not be read");
 });

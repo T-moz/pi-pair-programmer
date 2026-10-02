@@ -10,6 +10,7 @@ import { z } from "zod";
 import {
   buildChangeEvidence,
   captureBaseline,
+  lineChanges,
   type TaskBaseline,
 } from "./change-evidence.js";
 import {
@@ -17,12 +18,13 @@ import {
   renderAccepted,
   type CardDetails,
 } from "./finding-card.js";
-import { FindingAdmission } from "./finding-admission.js";
+import { FindingAdmission, findingId } from "./finding-admission.js";
 import { createPairLogger, type PairLogger } from "./logger.js";
 import type { ModelCallObserver } from "./model-usage.js";
 import {
   SessionAccounting,
   STATS_ENTRY,
+  type JudgmentObserver,
   type PairStats,
   type ReviewOutcome,
 } from "./pair-stats.js";
@@ -415,6 +417,22 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
         });
       }
     };
+    const onJudgment: JudgmentObserver = (judgment) => {
+      job.stats.judge(job.id, judgment);
+      logger?.log("finding.judged", {
+        ...fields,
+        stage: judgment.stage,
+        outcome: judgment.decision === "fail" ? "invalid" : judgment.decision,
+        reasonCode: judgment.reason,
+        confidence:
+          judgment.stage === "attribution" ? judgment.confidence : undefined,
+        probability:
+          judgment.stage === "attribution"
+            ? judgment.probabilities?.inherited
+            : undefined,
+        score: judgment.stage === "dedup" ? judgment.score : undefined,
+      });
+    };
     controllers.set(controller, job.key);
     cancelJobs.set(controller, () => {
       finish("cancelled", false);
@@ -433,7 +451,12 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     logger?.log("review.started", fields);
     void (async () => {
       try {
-        const result = await runJob(job, controller.signal, onModelCall);
+        const result = await runJob(
+          job,
+          controller.signal,
+          onModelCall,
+          onJudgment,
+        );
         const settledOutcome =
           reviewState.outcome === "success" ? result : reviewState.outcome;
         finish(controller.signal.aborted ? "cancelled" : settledOutcome);
@@ -477,6 +500,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     job: ReviewJob,
     signal: AbortSignal,
     onModelCall: ModelCallObserver,
+    onJudgment: JudgmentObserver,
   ): Promise<ReviewOutcome> {
     const proposed = await reviewFile({
       host: job.host,
@@ -485,8 +509,10 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       prompt: job.reviewer.prompt,
       file: job.file,
       source: job.source,
+      changes: await lineChanges(baseline, job.file, job.source, signal),
       signal,
       onModelCall,
+      onJudgment,
     });
     if (!(await current(job))) {
       logger?.log("review.skipped", {
@@ -501,6 +527,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       reviewed.set(`${job.key}:${reviewer}:${job.model}`, job.revision);
       return "success";
     }
+    const scope = { file: job.file, reviewer, revision: job.revision };
     const judged = await Promise.all(
       proposed.map(async (finding) => ({
         finding,
@@ -516,6 +543,12 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
           ),
           signal,
           onModelCall,
+          onJudgment: (attribution) => {
+            onJudgment({
+              ...attribution,
+              findingId: findingId(scope, finding),
+            });
+          },
         }),
       })),
     );
@@ -527,15 +560,14 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     });
     if (signal.aborted || !(await current(job))) return "obsolete";
     const result = await admission.admit({
-      file: job.file,
-      reviewer,
-      revision: job.revision,
+      ...scope,
       findings: judged.flatMap(({ finding, inherited }) =>
         inherited ? [] : [finding],
       ),
       signal,
       isCurrent: () => current(job),
       onModelCall,
+      onJudgment,
     });
     logger?.log("finding.admission", {
       sessionId: job.stats.sessionId,

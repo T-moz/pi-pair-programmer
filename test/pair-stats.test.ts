@@ -176,6 +176,64 @@ describe("PairStats", () => {
     expect(first.stats.snapshot().reviews.cancelled).toBe(1);
   });
 
+  it("restores entries written before judgments existed and keeps judgments out of review totals", () => {
+    const legacy = [
+      { action: "start", id: "job", sessionId: "s" },
+      {
+        action: "call",
+        id: "call-1",
+        sessionId: "s",
+        jobId: "job",
+        observation: call({ usage: { inputTokens: 7 } }),
+      },
+      {
+        action: "finish",
+        id: "job",
+        sessionId: "s",
+        outcome: "success",
+        durationMs: 20,
+        settled: true,
+      },
+    ].map((data) => ({ type: "custom", customType: STATS_ENTRY, data }));
+    const restored = ledger("s");
+    restored.stats.restore(legacy);
+    const before = restored.stats.snapshot();
+    expect(before.reviews.success).toBe(1);
+    expect(before.usage[0]?.inputTokens).toEqual({ value: 7, measured: 1 });
+
+    const judging = ledger("s");
+    judging.stats.judge("job", {
+      stage: "review",
+      decision: "fail",
+      reason: "envelope_invalid",
+      count: null,
+    });
+    const malformed = {
+      type: "custom",
+      customType: STATS_ENTRY,
+      data: {
+        action: "judgment",
+        id: "bad",
+        sessionId: "s",
+        jobId: "job",
+        judgment: { stage: "attribution", decision: "maybe" },
+      },
+    };
+    expect(judging.entries).toEqual([
+      {
+        type: "custom",
+        customType: STATS_ENTRY,
+        data: expect.objectContaining({
+          action: "judgment",
+          jobId: "job",
+        }) as unknown,
+      },
+    ]);
+    const mixed = ledger("s");
+    mixed.stats.restore([...legacy, ...judging.entries, malformed]);
+    expect(mixed.stats.snapshot()).toEqual(before);
+  });
+
   it("persists incomplete cancellation until deferred origin-owned records are flushed", () => {
     const entries: unknown[] = [];
     let ownsJournal = true;

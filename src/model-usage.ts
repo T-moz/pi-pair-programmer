@@ -69,9 +69,9 @@ function metadata(value: unknown, judge = false): Metadata {
   return result;
 }
 
-function notify(
-  observer: ModelCallObserver | undefined,
-  event: ModelCallObservation,
+export function notify<T>(
+  observer: ((event: T) => void) | undefined,
+  event: T,
 ): void {
   try {
     observer?.(event);

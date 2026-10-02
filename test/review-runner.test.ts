@@ -9,7 +9,7 @@ import {
   type Host,
   type ProposedFinding,
 } from "../src/review-runner.js";
-import type { ChangeEvidence } from "../src/change-evidence.js";
+import type { ChangeEvidence, LineChanges } from "../src/change-evidence.js";
 import type { ModelCallObservation } from "../src/model-usage.js";
 
 interface JudgmentRequest {
@@ -79,6 +79,7 @@ interface TestReviewRequest {
   prompt: string;
   file: string;
   source: string;
+  changes: LineChanges;
   signal: AbortSignal;
 }
 
@@ -93,6 +94,7 @@ function request(
     prompt: "Find concrete runtime errors",
     file: "src/example.ts",
     source,
+    changes: { status: "unavailable", reason: "Task baseline is unavailable" },
     signal: new AbortController().signal,
   };
 }
@@ -321,6 +323,103 @@ it("rejects non-JSON output and omits source beyond the excerpt limit", async ()
   child.stdout.write("not json");
   child.emit("close", 0);
   await expect(pending).rejects.toThrow();
+});
+
+it("marks changed lines in the gutter and still verifies quotes against source text", async () => {
+  const { child, input } = subprocess();
+  const pending = reviewFile({
+    ...request("omp", "const user = null;\nconsole.log(user.name);\n"),
+    changes: {
+      status: "available",
+      hunks: [
+        { start: 2, added: 1, removed: ["console.log(user?.name);"] },
+        { start: 3, added: 0, removed: ["export {};"] },
+      ],
+    },
+  });
+  const excerpt = input.join("").split("\n\n").at(-1);
+  expect(excerpt).toBe(
+    [
+      "1: const user = null;",
+      "-: console.log(user?.name);",
+      "2+: console.log(user.name);",
+      "-: export {};",
+      "3: ",
+    ].join("\n"),
+  );
+  finish(child, [
+    valid,
+    { ...valid, quote: "2+: console.log" },
+    { ...valid, quote: "user?.name" },
+  ]);
+  await expect(pending).resolves.toEqual([valid]);
+});
+
+it("renders unchanged files without markers and keeps markers inside a truncated excerpt", async () => {
+  const unchanged = subprocess();
+  const plain = reviewFile({
+    ...request(),
+    changes: { status: "available", hunks: [] },
+  });
+  expect(unchanged.input.join("").split("\n\n").at(-1)).toBe(
+    "1: const user = null;\n2: console.log(user.name);\n3: ",
+  );
+  finish(unchanged.child, []);
+  await expect(plain).resolves.toEqual([]);
+
+  const hidden = "removed-after-excerpt";
+  const { child, input } = subprocess();
+  const pending = reviewFile({
+    ...request("omp", `changed\n${"x".repeat(60_000)}\ntail`),
+    changes: {
+      status: "available",
+      hunks: [
+        { start: 1, added: 1, removed: ["previous"] },
+        { start: 3, added: 1, removed: [hidden] },
+      ],
+    },
+  });
+  const excerpt = input.join("").split("\n\n").at(-1);
+  expect(excerpt?.split("\n").map((row) => row.slice(0, 12))).toEqual([
+    "-: previous",
+    "1+: changed",
+    "2: xxxxxxxxx",
+  ]);
+  expect(input.join("")).not.toContain(hidden);
+  finish(child, []);
+  await expect(pending).resolves.toEqual([]);
+});
+
+it("presents an approximate change region as possibly unchanged rather than changed", async () => {
+  const { child, input } = subprocess();
+  const pending = reviewFile({
+    ...request("omp", "const user = null;\nconsole.log(user.name);\nexit();"),
+    changes: {
+      status: "approximate",
+      region: {
+        start: 2,
+        added: 2,
+        removed: ["console.log(user.name);", "quit();"],
+      },
+    },
+  });
+  const [instructions, excerpt] = input.join("").split("\n\n").slice(-2);
+  expect(excerpt).toBe(
+    [
+      "1: const user = null;",
+      "-: console.log(user.name);",
+      "-: quit();",
+      "2~: console.log(user.name);",
+      "3~: exit();",
+    ].join("\n"),
+  );
+  expect(excerpt).not.toContain("+:");
+  expect(instructions).toContain(
+    'a line is not changed merely because it is marked "N~:"',
+  );
+  expect(instructions).not.toContain('"N+:"');
+  finish(child, [valid]);
+  await expect(pending).resolves.toEqual([valid]);
 });
 
 it("bounds unframed stdout, drains late data, and terminates a noisy reviewer", async () => {
@@ -560,7 +659,6 @@ it.each([
     status: "unavailable" as const,
     reason: "ambiguous context",
   },
-  { ...changeEvidence, diff: null },
   { ...changeEvidence, before: null, origins: [] },
 ])(
   "does not suppress without complete actual origin evidence: %j",
@@ -585,6 +683,36 @@ it("judges a cross-file origin without requiring an old destination file", async
       signal: new AbortController().signal,
     }),
   ).resolves.toBe(true);
+});
+
+it("still judges attribution from full sources when the line diff exceeded its bound", async () => {
+  const reason =
+    "The line diff was too large to compute; compare taskStartSource with currentSource directly";
+  const evidence = { ...changeEvidence, diff: null, reason };
+  const onJudgment = vi.fn();
+  systemOne.mockResolvedValueOnce({ answers: { category: inheritedAnswer } });
+  await expect(
+    isInherited({
+      finding: valid,
+      evidence,
+      signal: new AbortController().signal,
+      onJudgment,
+    }),
+  ).resolves.toBe(true);
+  expect(systemOne.mock.lastCall?.[0].state).toMatchObject({
+    taskStartSource: changeEvidence.before,
+    currentSource: changeEvidence.after,
+    diff: null,
+    reason,
+  });
+  expect(onJudgment).toHaveBeenCalledWith(
+    expect.objectContaining({
+      decision: "drop",
+      reason: "judged",
+      evidenceStatus: "available",
+      evidenceReason: reason,
+    }),
+  );
 });
 
 it("keeps findings when attribution is unavailable or cancelled", async () => {
@@ -616,6 +744,247 @@ it("keeps findings when attribution is unavailable or cancelled", async () => {
   controller.abort();
   await expect(pending).resolves.toBe(false);
 });
+
+const attributionBase = {
+  stage: "attribution",
+  line: valid.line,
+  title: valid.title,
+  quote: valid.quote,
+};
+
+it.each([
+  [
+    { answers: { category: inheritedAnswer } },
+    true,
+    {
+      decision: "drop",
+      reason: "judged",
+      choice: "inherited",
+      confidence: 1,
+      probabilities: { inherited: 1, introduced: 0, unknown: 0 },
+    },
+  ],
+  [
+    {
+      answers: {
+        category: {
+          choice: "inherited",
+          confidence: 0.94,
+          probabilities: { inherited: 0.96, introduced: 0.04, unknown: 0 },
+        },
+      },
+    },
+    false,
+    {
+      decision: "keep",
+      reason: "judged",
+      choice: "inherited",
+      confidence: 0.94,
+      probabilities: { inherited: 0.96, introduced: 0.04, unknown: 0 },
+    },
+  ],
+] as const)(
+  "records the Jev attribution scores and thresholds behind each decision",
+  async (response, inherited, recorded) => {
+    systemOne.mockResolvedValueOnce(response);
+    const onJudgment = vi.fn();
+    await expect(
+      isInherited({
+        finding: valid,
+        evidence: changeEvidence,
+        signal: new AbortController().signal,
+        onJudgment,
+      }),
+    ).resolves.toBe(inherited);
+    expect(onJudgment).toHaveBeenCalledExactlyOnceWith({
+      ...attributionBase,
+      ...recorded,
+      evidenceStatus: "available",
+      evidenceReason: null,
+      thresholds: { confidence: 0.95, inherited: 0.95 },
+    });
+  },
+);
+
+it.each([
+  [
+    { ...changeEvidence, status: "unavailable" as const, reason: "ambiguous" },
+    "evidence_unavailable",
+  ],
+  [{ ...changeEvidence, before: null, origins: [] }, "no_origin"],
+] as const)(
+  "records a skipped attribution without calling Jev: %#",
+  async (evidence, reason) => {
+    const onJudgment = vi.fn();
+    await expect(
+      isInherited({
+        finding: valid,
+        evidence,
+        signal: new AbortController().signal,
+        onJudgment,
+      }),
+    ).resolves.toBe(false);
+    expect(systemOne).not.toHaveBeenCalled();
+    expect(onJudgment).toHaveBeenCalledExactlyOnceWith({
+      ...attributionBase,
+      decision: "keep",
+      reason,
+      evidenceStatus: evidence.status,
+      evidenceReason: evidence.reason,
+    });
+  },
+);
+
+it("records kept findings when the Jev response is malformed, fails, or is cancelled", async () => {
+  const onJudgment = vi.fn();
+  const input = {
+    finding: valid,
+    evidence: changeEvidence,
+    signal: new AbortController().signal,
+    onJudgment,
+  };
+  systemOne.mockResolvedValueOnce({
+    answers: {
+      category: {
+        ...inheritedAnswer,
+        probabilities: { inherited: 1, introduced: 1, unknown: 0 },
+      },
+    },
+  });
+  await expect(isInherited(input)).resolves.toBe(false);
+  systemOne.mockRejectedValueOnce(new Error("Jev unavailable"));
+  await expect(isInherited(input)).resolves.toBe(false);
+  const controller = new AbortController();
+  controller.abort();
+  systemOne.mockRejectedValueOnce(new Error("aborted"));
+  await expect(
+    isInherited({ ...input, signal: controller.signal }),
+  ).resolves.toBe(false);
+  const common = {
+    ...attributionBase,
+    decision: "keep",
+    evidenceStatus: "available",
+    evidenceReason: null,
+  };
+  expect(onJudgment.mock.calls).toEqual([
+    [
+      {
+        ...common,
+        reason: "response_invalid",
+        issues: ["answers.category.probabilities"],
+      },
+    ],
+    [{ ...common, reason: "request_failed" }],
+    [{ ...common, reason: "cancelled" }],
+  ]);
+});
+
+it("records each reviewer entry dropped by the local check with the cited line", async () => {
+  const onJudgment = vi.fn();
+  const drop = { stage: "review", decision: "drop", invalidFields: [] };
+  const { child } = subprocess();
+  const pending = reviewFile({ ...request(), onJudgment });
+  finish(child, [
+    { ...valid, line: 1 },
+    { ...valid, evidence: " " },
+    "not an object",
+    { ...valid, title: "t".repeat(600), quote: " " },
+    valid,
+  ]);
+  await expect(pending).resolves.toEqual([valid]);
+  expect(onJudgment.mock.calls).toEqual([
+    [
+      {
+        ...drop,
+        reason: "quote_mismatch",
+        line: 1,
+        title: valid.title,
+        quote: valid.quote,
+        lineText: "const user = null;",
+        quoteLines: [2],
+      },
+    ],
+    [
+      {
+        ...drop,
+        reason: "entry_invalid",
+        line: 2,
+        title: valid.title,
+        quote: valid.quote,
+        lineText: "console.log(user.name);",
+        quoteLines: [2],
+        invalidFields: ["evidence"],
+      },
+    ],
+    [
+      {
+        ...drop,
+        reason: "entry_invalid",
+        line: null,
+        title: null,
+        quote: null,
+        lineText: null,
+        quoteLines: [],
+        invalidFields: ["entry"],
+      },
+    ],
+    [
+      {
+        ...drop,
+        reason: "entry_invalid",
+        line: 2,
+        title: "t".repeat(500),
+        quote: " ",
+        lineText: "console.log(user.name);",
+        quoteLines: [],
+        invalidFields: ["title", "quote"],
+      },
+    ],
+  ]);
+});
+
+it("bounds the recorded lines where a misplaced quote occurs", async () => {
+  const onJudgment = vi.fn();
+  const { child } = subprocess();
+  const pending = reviewFile({
+    ...request("omp", "a\n".repeat(7)),
+    onJudgment,
+  });
+  finish(child, [{ ...valid, line: 99, quote: "a" }]);
+  await expect(pending).resolves.toEqual([]);
+  expect(onJudgment).toHaveBeenCalledExactlyOnceWith({
+    stage: "review",
+    decision: "drop",
+    reason: "line_out_of_range",
+    line: 99,
+    title: valid.title,
+    quote: "a",
+    lineText: null,
+    quoteLines: [1, 2, 3, 4, 5],
+    invalidFields: [],
+  });
+});
+
+it.each([
+  ["not json", "output_not_json", null],
+  ['{"findings":null}', "envelope_invalid", null],
+  ['{"findings":[{},{},{},{},{},{}]}', "too_many_findings", 6],
+] as const)(
+  "records why reviewer output %s failed before rejecting it",
+  async (output, reason, count) => {
+    const onJudgment = vi.fn();
+    const { child } = subprocess();
+    const pending = reviewFile({ ...request(), onJudgment });
+    finishText(child, output);
+    await expect(pending).rejects.toThrow();
+    expect(onJudgment).toHaveBeenCalledExactlyOnceWith({
+      stage: "review",
+      decision: "fail",
+      reason,
+      count,
+    });
+  },
+);
 
 it.each(["pi", "omp"] as const)(
   "returns %s findings alongside one redacted usage observation",
@@ -797,7 +1166,10 @@ it("keeps attribution decisions while accounting real SDK usage and ignoring una
     usage: { inputTokens: 81, outputTokens: 3 },
   });
   await expect(
-    isInherited({ ...input, evidence: { ...changeEvidence, diff: null } }),
+    isInherited({
+      ...input,
+      evidence: { ...changeEvidence, status: "unavailable" },
+    }),
   ).resolves.toBe(false);
   expect(onModelCall).toHaveBeenCalledOnce();
 });
