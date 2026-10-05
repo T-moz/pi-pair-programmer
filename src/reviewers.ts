@@ -5,6 +5,8 @@ import { minimatch } from "minimatch";
 import { z } from "zod";
 
 export interface ReviewerConfig {
+  /** Short display label; not part of the reviewer's identity. */
+  name?: string | undefined;
   model: string;
   prompt: string;
   include: readonly string[];
@@ -13,6 +15,7 @@ export interface ReviewerConfig {
 
 export const DEFAULT_REVIEWERS: readonly ReviewerConfig[] = [
   {
+    name: "entropy",
     model: "current",
     prompt: "Does it add entropy ?",
     include: ["**/*"],
@@ -70,6 +73,17 @@ const PatternSchema = z.string().refine(validPattern, {
     "must be a nonempty project-relative POSIX glob with balanced syntax",
 });
 const ReviewerSchema = z.strictObject({
+  name: z
+    .string()
+    .refine(
+      (value) =>
+        value.trim() === value &&
+        value.length > 0 &&
+        value.length <= 24 &&
+        !/\p{Cc}/u.test(value),
+      { message: "must be 1-24 characters without surrounding spaces" },
+    )
+    .optional(),
   model: z.string().refine((value) => value.trim().length > 0),
   prompt: z.string().refine((value) => value.trim().length > 0),
   include: z.array(PatternSchema).min(1),
@@ -149,6 +163,11 @@ export function matchingReviewers(
             (pattern) => !minimatch(normalized, pattern, matchOptions),
           ),
       );
+}
+
+/** The reviewer's name, or the short model name when unnamed. */
+export function reviewerLabel(reviewer: ReviewerConfig, model: string): string {
+  return reviewer.name ?? model.slice(model.lastIndexOf("/") + 1);
 }
 
 export function reviewerKey(reviewer: ReviewerConfig): string {

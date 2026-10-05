@@ -6,6 +6,7 @@ import type {
   LineChanges,
   LineHunk,
 } from "./change-evidence.js";
+import type { Host } from "./host.js";
 import {
   notify,
   observeJudgment,
@@ -68,7 +69,7 @@ function jev(): TypeSafeClient {
   return jevClient;
 }
 
-export type Host = "pi" | "omp";
+export type { Host } from "./host.js";
 
 export class ReviewTimeoutError extends Error {
   override name = "ReviewTimeoutError";
@@ -321,7 +322,8 @@ function validFindings(
     output = JSON.parse(fenced?.[1] ?? answer);
   } catch (error) {
     fail("output_not_json", null);
-    throw error;
+    // The job records a failed review; name the cause instead of a bare SyntaxError.
+    throw new Error("Reviewer returned malformed JSON", { cause: error });
   }
   const envelope = reviewResultSchema.safeParse(output);
   if (!envelope.success) {

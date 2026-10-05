@@ -44,10 +44,36 @@ export interface StoredFinding {
   reason?: string;
 }
 
+export type FindingStatus =
+  "queued" | "awaiting" | "accepted" | "rejected" | "discarded";
+
+export interface FindingView {
+  title: string;
+  line: number;
+  status: FindingStatus;
+  reason?: string;
+}
+
 interface FindingState extends StoredFinding {
   delivered: boolean;
   discarded: boolean;
 }
+
+/** The single source of truth for a finding's lifecycle status. */
+function statusOf(state: FindingState): FindingStatus {
+  if (state.verdict === "accept") return "accepted";
+  if (state.verdict === "reject") return "rejected";
+  if (state.discarded) return "discarded";
+  return state.delivered ? "awaiting" : "queued";
+}
+
+const SUMMARY_KEY = {
+  queued: "pending",
+  awaiting: "outstanding",
+  accepted: "accepted",
+  rejected: "rejected",
+  discarded: "discarded",
+} as const satisfies Record<FindingStatus, string>;
 
 export class ReviewStore {
   private readonly findings = new Map<string, FindingState>();
@@ -85,13 +111,8 @@ export class ReviewStore {
       rejected: 0,
       discarded: 0,
     };
-    for (const state of this.findings.values()) {
-      if (state.verdict === "accept") counts.accepted += 1;
-      else if (state.verdict === "reject") counts.rejected += 1;
-      else if (state.discarded) counts.discarded += 1;
-      else if (state.delivered) counts.outstanding += 1;
-      else counts.pending += 1;
-    }
+    for (const state of this.findings.values())
+      counts[SUMMARY_KEY[statusOf(state)]] += 1;
     return counts;
   }
 
@@ -161,6 +182,37 @@ export class ReviewStore {
       }
     }
     return result;
+  }
+
+  /** Decided findings per file, most accepted first (selected branch). */
+  hotspots(): { file: string; accepted: number; rejected: number }[] {
+    const files = new Map<string, { accepted: number; rejected: number }>();
+    for (const { finding, verdict } of this.findings.values()) {
+      if (verdict === undefined) continue;
+      const counts = files.get(finding.file) ?? { accepted: 0, rejected: 0 };
+      if (verdict === "accept") counts.accepted += 1;
+      else counts.rejected += 1;
+      files.set(finding.file, counts);
+    }
+    return [...files]
+      .map(([file, counts]) => ({ file, ...counts }))
+      .toSorted(
+        (left, right) =>
+          right.accepted - left.accepted ||
+          right.rejected - left.rejected ||
+          left.file.localeCompare(right.file),
+      );
+  }
+
+  lookup(id: string): FindingView | undefined {
+    const state = this.findings.get(id);
+    if (state === undefined) return undefined;
+    return {
+      title: state.finding.title,
+      line: state.finding.line,
+      status: statusOf(state),
+      ...(state.reason === undefined ? {} : { reason: state.reason }),
+    };
   }
 
   deliveredFinding(id: string): Finding | undefined {
