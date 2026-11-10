@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, expect, it } from "vitest";
 import {
+  CONFIG_FILE,
   DEFAULT_REVIEWERS,
   loadReviewers,
   matchingReviewers,
@@ -28,11 +29,91 @@ afterEach(async () => {
   );
 });
 
+async function configured(
+  directory: string,
+): Promise<readonly ReviewerConfig[]> {
+  const setup = await loadReviewers(directory);
+  expect(setup.kind).toBe("configured");
+  return setup.reviewers;
+}
+
 it("uses one current-model reviewer when the optional config does not exist", async () => {
   const directory = await temporaryDirectory();
-  const reviewers = await loadReviewers(directory);
-  expect(reviewers).toHaveLength(1);
-  expect(reviewers[0]?.model).toBe("current");
+  const setup = await loadReviewers(directory);
+  expect(setup).toEqual({
+    kind: "default",
+    root: directory,
+    searchedUpTo: directory,
+    reviewers: DEFAULT_REVIEWERS,
+  });
+  expect(setup.reviewers).toHaveLength(1);
+  expect(setup.reviewers[0]?.model).toBe("current");
+});
+
+it("finds the config in a parent folder up to the git root and roots globs there", async () => {
+  const repository = await temporaryDirectory();
+  const app = path.join(repository, "app", "src");
+  await mkdir(path.join(repository, ".git"));
+  await mkdir(app, { recursive: true });
+  const reviewer: ReviewerConfig = {
+    model: "current",
+    prompt: "Review the app",
+    include: ["app/src/**/*.ts"],
+    exclude: [],
+  };
+  await writeFile(
+    path.join(repository, CONFIG_FILE),
+    JSON.stringify({ reviewers: [reviewer] }),
+  );
+  expect(await loadReviewers(app)).toEqual({
+    kind: "configured",
+    root: repository,
+    reviewers: [reviewer],
+  });
+
+  const nearest: ReviewerConfig = { ...reviewer, include: ["src/**/*.ts"] };
+  await writeFile(
+    path.join(repository, "app", CONFIG_FILE),
+    JSON.stringify({ reviewers: [nearest] }),
+  );
+  expect(await loadReviewers(app)).toEqual({
+    kind: "configured",
+    root: path.join(repository, "app"),
+    reviewers: [nearest],
+  });
+});
+
+it("stops at the git root and ignores configs above it", async () => {
+  const parent = await temporaryDirectory();
+  const repository = path.join(parent, "repository");
+  const app = path.join(repository, "app");
+  await mkdir(app, { recursive: true });
+  await writeFile(path.join(repository, ".git"), "gitdir: elsewhere\n");
+  await writeFile(
+    path.join(parent, CONFIG_FILE),
+    JSON.stringify({ reviewers: [] }),
+  );
+  expect(await loadReviewers(app)).toEqual({
+    kind: "default",
+    root: app,
+    searchedUpTo: repository,
+    reviewers: DEFAULT_REVIEWERS,
+  });
+});
+
+it("only reads the working directory outside a git repository", async () => {
+  const parent = await temporaryDirectory();
+  const child = path.join(parent, "child");
+  await mkdir(child);
+  await writeFile(
+    path.join(parent, CONFIG_FILE),
+    JSON.stringify({ reviewers: [] }),
+  );
+  expect(await loadReviewers(child)).toMatchObject({
+    kind: "default",
+    root: child,
+    searchedUpTo: child,
+  });
 });
 
 it("reports a non-missing unreadable config instead of falling back", async () => {
@@ -46,18 +127,18 @@ it("loads exactly the configured reviewers and honors an explicitly empty list",
   const directory = await temporaryDirectory();
   const file = path.join(directory, "pair-programmer.reviewers.json");
   await writeFile(file, JSON.stringify({ reviewers: [] }));
-  expect(await loadReviewers(directory)).toEqual([]);
+  expect(await configured(directory)).toEqual([]);
 
-  const configured: ReviewerConfig = {
+  const reviewer: ReviewerConfig = {
     model: "provider/model",
     prompt: "Find material errors with file and line evidence",
     include: ["src/**/*.ts"],
     exclude: ["**/*.test.ts"],
   };
-  await writeFile(file, JSON.stringify({ reviewers: [configured] }));
-  expect(await loadReviewers(directory)).toEqual([configured]);
-  const firstLoad = await loadReviewers(directory);
-  const secondLoad = await loadReviewers(directory);
+  await writeFile(file, JSON.stringify({ reviewers: [reviewer] }));
+  expect(await configured(directory)).toEqual([reviewer]);
+  const firstLoad = await configured(directory);
+  const secondLoad = await configured(directory);
   expect(firstLoad.map(reviewerKey)).toEqual(secondLoad.map(reviewerKey));
 });
 
@@ -225,7 +306,7 @@ it("matches normalized root and nested files, applying exclusions after inclusio
 
 it("matches valid brace globs and hidden files without letting exclusions escape", async () => {
   const directory = await temporaryDirectory();
-  const configured: ReviewerConfig = {
+  const reviewer: ReviewerConfig = {
     model: "current",
     prompt: "Check changes",
     include: ["src/**/*.{ts,tsx}", "src/@(README|CONTRIBUTING).md"],
@@ -233,13 +314,13 @@ it("matches valid brace globs and hidden files without letting exclusions escape
   };
   await writeFile(
     path.join(directory, "pair-programmer.reviewers.json"),
-    JSON.stringify({ reviewers: [configured] }),
+    JSON.stringify({ reviewers: [reviewer] }),
   );
-  const reviewers = await loadReviewers(directory);
+  const reviewers = await configured(directory);
   expect(matchingReviewers("src/.hidden/file.tsx", reviewers)).toEqual([
-    configured,
+    reviewer,
   ]);
-  expect(matchingReviewers("src/README.md", reviewers)).toEqual([configured]);
+  expect(matchingReviewers("src/README.md", reviewers)).toEqual([reviewer]);
   expect(matchingReviewers("src/OTHER.md", reviewers)).toEqual([]);
   expect(matchingReviewers("src/generated/file.ts", reviewers)).toEqual([]);
   expect(matchingReviewers("src/.hidden/generated/file.ts", reviewers)).toEqual(

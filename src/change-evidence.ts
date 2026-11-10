@@ -350,6 +350,56 @@ async function pinGit(root: string, signal: AbortSignal): Promise<PinnedGit> {
   return { head: { toplevel, files, tree }, dirty, excluded };
 }
 
+export class WorkspaceChanges {
+  readonly root: string;
+  private readonly commit: string | undefined;
+
+  private constructor(root: string, commit: string | undefined) {
+    this.root = root;
+    this.commit = commit;
+  }
+
+  static async open(
+    root: string,
+    signal: AbortSignal,
+  ): Promise<WorkspaceChanges | undefined> {
+    return (await isWorkTree(root, signal))
+      ? new WorkspaceChanges(
+          root,
+          await optionalRevision(root, "HEAD^{commit}", signal),
+        )
+      : undefined;
+  }
+
+  async files(signal: AbortSignal): Promise<string[]> {
+    const tracked =
+      this.commit === undefined
+        ? ["ls-files", "-z", "--cached"]
+        : [
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            "--ignore-submodules=all",
+            "--relative",
+            this.commit,
+            "--",
+          ];
+    const [changed, untracked] = await Promise.all([
+      git(this.root, tracked, signal),
+      git(
+        this.root,
+        ["ls-files", "-z", "--others", "--exclude-standard"],
+        signal,
+      ),
+    ]);
+    return safeFiles(
+      this.root,
+      new Set([...nulSeparated(changed), ...nulSeparated(untracked)]),
+    );
+  }
+}
+
 async function captureFile(
   root: string,
   file: string,

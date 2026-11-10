@@ -6,6 +6,8 @@ import { pino } from "pino";
 
 export type PairLogEvent =
   | "session.start"
+  | "session.configured"
+  | "session.subagents"
   | "session.stop"
   | "extension.shutdown"
   | "extension.toggle"
@@ -20,7 +22,9 @@ export type PairLogEvent =
   | "finding.admission"
   | "finding.verdict"
   | "delivery.sent"
-  | "delivery.wake";
+  | "delivery.wake"
+  | "delivery.settle"
+  | "workspace.changed";
 
 export interface PairLogFields {
   sessionId?: string;
@@ -50,6 +54,8 @@ export interface PairLogger {
 
 const events: Record<PairLogEvent, true> = {
   "session.start": true,
+  "session.configured": true,
+  "session.subagents": true,
   "session.stop": true,
   "extension.shutdown": true,
   "extension.toggle": true,
@@ -65,6 +71,8 @@ const events: Record<PairLogEvent, true> = {
   "finding.verdict": true,
   "delivery.sent": true,
   "delivery.wake": true,
+  "delivery.settle": true,
+  "workspace.changed": true,
 };
 const numericFields: Record<string, true> = {
   count: true,
@@ -146,6 +154,17 @@ const reasonCodes = {
   request_failed: true,
   cancelled: true,
   first: true,
+  configured: true,
+  default_configuration: true,
+  no_matching_reviewer: true,
+  registered: true,
+  conflict: true,
+  unsupported: true,
+  settle_timeout: true,
+  external_change: true,
+  bulk_change: true,
+  scan_failed: true,
+  decision_tool_unavailable: true,
 };
 const maxFileBytes = 1024 * 1024;
 const maxBufferedBytes = 64 * 1024;
@@ -187,6 +206,13 @@ const warningReasons: Record<string, true> = {
   baseline_unavailable: true,
   ui_unavailable: true,
   response_invalid: true,
+  default_configuration: true,
+  conflict: true,
+  unsupported: true,
+  settle_timeout: true,
+  bulk_change: true,
+  scan_failed: true,
+  decision_tool_unavailable: true,
 };
 
 function severity(

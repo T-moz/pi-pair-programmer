@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import path from "node:path";
 import { minimatch } from "minimatch";
 import { z } from "zod";
@@ -15,6 +15,17 @@ export interface ReviewerConfig {
   exclude: readonly string[];
   tools?: readonly ReviewerTool[] | undefined;
 }
+
+export type ReviewerSetup =
+  | { kind: "configured"; root: string; reviewers: readonly ReviewerConfig[] }
+  | {
+      kind: "default";
+      root: string;
+      searchedUpTo: string;
+      reviewers: readonly ReviewerConfig[];
+    };
+
+export const CONFIG_FILE = "pair-programmer.reviewers.json";
 
 export const DEFAULT_REVIEWERS: readonly ReviewerConfig[] = [
   {
@@ -89,21 +100,40 @@ const ReviewerSchema = z.strictObject({
 const ConfigSchema = z.strictObject({ reviewers: z.array(ReviewerSchema) });
 const MissingConfigErrorSchema = z.object({ code: z.literal("ENOENT") });
 
-export async function loadReviewers(
-  cwd: string,
-): Promise<readonly ReviewerConfig[]> {
-  const file = path.join(cwd, "pair-programmer.reviewers.json");
-  let contents: string;
+async function exists(file: string): Promise<boolean> {
   try {
-    contents = await readFile(file, "utf8");
+    await access(file);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function gitRoot(start: string): Promise<string | undefined> {
+  let directory = start;
+  while (!(await exists(path.join(directory, ".git")))) {
+    const parent = path.dirname(directory);
+    if (parent === directory) return undefined;
+    directory = parent;
+  }
+  return directory;
+}
+
+async function readConfig(file: string): Promise<string | undefined> {
+  try {
+    return await readFile(file, "utf8");
   } catch (error) {
-    if (MissingConfigErrorSchema.safeParse(error).success) {
-      return DEFAULT_REVIEWERS;
-    }
+    if (MissingConfigErrorSchema.safeParse(error).success) return undefined;
     throw new Error(`${file}: could not read reviewer configuration`, {
       cause: error,
     });
   }
+}
+
+function parseConfig(
+  file: string,
+  contents: string,
+): readonly ReviewerConfig[] {
   let parsed: unknown;
   try {
     parsed = JSON.parse(contents) as unknown;
@@ -131,6 +161,30 @@ export async function loadReviewers(
     throw new Error(`${file}: ${descriptions.join("; ")}`);
   }
   return result.data.reviewers;
+}
+
+export async function loadReviewers(cwd: string): Promise<ReviewerSetup> {
+  const start = path.resolve(cwd);
+  const top = (await gitRoot(start)) ?? start;
+  for (let directory = start; ; directory = path.dirname(directory)) {
+    const file = path.join(directory, CONFIG_FILE);
+    const contents = await readConfig(file);
+    if (contents !== undefined) {
+      return {
+        kind: "configured",
+        root: directory,
+        reviewers: parseConfig(file, contents),
+      };
+    }
+    if (directory === top) {
+      return {
+        kind: "default",
+        root: start,
+        searchedUpTo: top,
+        reviewers: DEFAULT_REVIEWERS,
+      };
+    }
+  }
 }
 
 export function matchingReviewers(
