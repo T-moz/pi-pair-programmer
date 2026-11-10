@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -11,8 +12,10 @@ import {
   buildChangeEvidence,
   captureBaseline,
   lineChanges,
+  WorkspaceChanges,
   type TaskBaseline,
 } from "./change-evidence.js";
+import { requireInChildSessions } from "./child-extensions.js";
 import { FindingAdmission, findingId } from "./finding-admission.js";
 import { createPairLogger, type PairLogger } from "./logger.js";
 import type { ModelCallObserver } from "./model-usage.js";
@@ -32,16 +35,24 @@ import {
 } from "./review-runner.js";
 import { ReviewStore, type Finding } from "./review-store.js";
 import {
+  CONFIG_FILE,
   DEFAULT_REVIEWERS,
   loadReviewers,
   matchingReviewers,
   reviewerKey,
   type ReviewerConfig,
+  type ReviewerSetup,
 } from "./reviewers.js";
 
 const MAX_DELIVERY = 4;
 const DECISION_TOOL = "pair_programmer_decide";
 const WAKE_COALESCE_MS = 250;
+const SETTLE_TIMEOUT_MS = 180_000;
+const SETTLE_POLL_MS = 100;
+const MAX_EXTERNAL_CHANGES = 20;
+const MAX_SCANNED_BYTES = 1_000_000;
+const EXTENSION_PATH = fileURLToPath(import.meta.url);
+const REVIEWED_KEY = Symbol.for("pi-pair-programmer.reviewed-revisions.v1");
 
 const ToolPathSchema = z.string();
 const ContinuingRunSchema = z.object({ willContinue: z.literal(true) });
@@ -136,6 +147,42 @@ function acceptedReview(finding: Finding, reason: string): string {
   return `### Accepted review: ${finding.title}\n\n**${finding.file}:${String(finding.line)}**\n\n${finding.evidence}\n\n**Reason:** ${reason}`;
 }
 
+type SessionSetup =
+  | ReviewerSetup
+  | {
+      kind: "failed";
+      root: string;
+      error: string;
+      reviewers: readonly ReviewerConfig[];
+    };
+
+async function loadSetup(cwd: string): Promise<SessionSetup> {
+  try {
+    return await loadReviewers(cwd);
+  } catch (error) {
+    return {
+      kind: "failed",
+      root: path.resolve(cwd),
+      error: String(error),
+      reviewers: [],
+    };
+  }
+}
+
+function reviewedInProcess(): Map<string, string> {
+  const existing: unknown = Reflect.get(globalThis, REVIEWED_KEY);
+  if (existing instanceof Map) return existing as Map<string, string>;
+  const created = new Map<string, string>();
+  Reflect.set(globalThis, REVIEWED_KEY, created);
+  return created;
+}
+
+function sleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
+}
+
 export default function pairProgrammer(pi: ExtensionAPI): void {
   // Reviewers granted tools on Pi load extensions, including this one.
   if (process.env["PI_PAIR_PROGRAMMER_REVIEWER"] === "1") return;
@@ -153,11 +200,17 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   let store = new ReviewStore(appendReviewEntry);
   let admission = new FindingAdmission(store);
   let reviewers: readonly ReviewerConfig[] = DEFAULT_REVIEWERS;
+  let requestedRoot = process.cwd();
   let root = process.cwd();
+  let workspace: WorkspaceChanges | undefined;
+  const observed = new Map<string, string>();
+  let scanning = Promise.resolve();
+  let releaseChildren: (() => void) | undefined;
   let baseline: TaskBaseline | undefined;
   let baselineSession: string | undefined;
   let generation = 0;
   let unresolved = 0;
+  let preparing = 0;
   let nextVersion = 0;
   const versions = new Map<string, number>();
   const reviewed = new Map<string, string>();
@@ -223,6 +276,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     accounting.retain(accounting.stats);
     generation += 1;
     unresolved = 0;
+    preparing = 0;
     versions.clear();
     reviewed.clear();
     for (const timer of timers.values()) clearTimeout(timer);
@@ -294,26 +348,65 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       });
       return;
     }
+    const { reasonCode, batch } = nextBatch();
+    logger?.log("delivery.wake", {
+      sessionId: accounting.stats.sessionId,
+      reasonCode,
+    });
+    if (batch.length > 0) send(batch, hostOf(ctx));
+  }
+
+  function nextBatch(): {
+    reasonCode:
+      "ready" | "no_findings_ready" | "outstanding" | "already_presented";
+    batch: readonly Finding[];
+  } {
     const outstanding = store.outstanding();
     if (outstanding.length === 0) {
       const batch = deliverable();
-      logger?.log("delivery.wake", {
-        sessionId: accounting.stats.sessionId,
+      return {
         reasonCode: batch.length > 0 ? "ready" : "no_findings_ready",
-      });
-      if (batch.length > 0) send(batch, hostOf(ctx));
-    } else if (outstanding.some((finding) => !presented.has(finding.id))) {
-      logger?.log("delivery.wake", {
-        sessionId: accounting.stats.sessionId,
-        reasonCode: "outstanding",
-      });
-      send(outstanding, hostOf(ctx));
-    } else {
-      logger?.log("delivery.wake", {
-        sessionId: accounting.stats.sessionId,
-        reasonCode: "already_presented",
-      });
+        batch,
+      };
     }
+    return outstanding.some((finding) => !presented.has(finding.id))
+      ? { reasonCode: "outstanding", batch: outstanding }
+      : { reasonCode: "already_presented", batch: [] };
+  }
+
+  function reviewing(): boolean {
+    return (
+      unresolved > 0 || timers.size > 0 || preparing > 0 || cancelJobs.size > 0
+    );
+  }
+
+  async function settle(ctx: ExtensionContext): Promise<readonly Finding[]> {
+    const session = generation;
+    const deadline = Date.now() + SETTLE_TIMEOUT_MS;
+    await scanning;
+    while (
+      session === generation &&
+      reviewing() &&
+      Date.now() < deadline &&
+      ctx.signal?.aborted !== true
+    )
+      await sleep(SETTLE_POLL_MS);
+    if (
+      session !== generation ||
+      !store.enabled ||
+      ctx.signal?.aborted === true
+    )
+      return [];
+    const { reasonCode, batch } = nextBatch();
+    logger?.log("delivery.settle", {
+      sessionId: accounting.stats.sessionId,
+      reasonCode: reviewing() ? "settle_timeout" : reasonCode,
+      count: batch.length,
+    });
+    const ids = batch.map((finding) => finding.id);
+    store.deliver(ids);
+    for (const id of ids) presented.add(id);
+    return batch;
   }
 
   function scheduleWake(ctx: ExtensionContext): void {
@@ -536,7 +629,14 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   ): void {
     const jobs: ReviewJob[] = [];
     const keys = new Set<string>();
-    for (const reviewer of matchingReviewers(base.file, reviewers)) {
+    const matching = matchingReviewers(base.file, reviewers);
+    if (matching.length === 0) {
+      logger?.log("review.skipped", {
+        sessionId: accounting.stats.sessionId,
+        reasonCode: "no_matching_reviewer",
+      });
+    }
+    for (const reviewer of matching) {
       let model = reviewer.model;
       if (model === "current") {
         if (ctx.model === undefined) {
@@ -597,6 +697,8 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       )
         return;
       const revision = revisionOf(source);
+      observed.set(file, revision);
+      reviewedInProcess().set(fullPath, revision);
       store.discardStale(file, revision);
       const host = hostOf(ctx);
       startReviews(
@@ -632,7 +734,10 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     session: number,
   ): Promise<void> {
     const requested = path.resolve(ctx.cwd, filePath);
-    const lexical = path.relative(ctx.cwd, requested).split(path.sep).join("/");
+    const lexical = path
+      .relative(requestedRoot, requested)
+      .split(path.sep)
+      .join("/");
     if (
       !lexical ||
       lexical.startsWith("../") ||
@@ -672,7 +777,10 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
         file,
         setTimeout(() => {
           timers.delete(file);
-          void prepare(fullPath, file, ctx, version, session);
+          preparing += 1;
+          void prepare(fullPath, file, ctx, version, session).finally(() => {
+            if (session === generation) preparing -= 1;
+          });
         }, 120),
       );
     } catch {
@@ -726,9 +834,13 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     accounting.suspend();
     stop("session_change");
     const session = generation;
-    const resolvedRoot = await realpath(ctx.cwd);
+    const setup = await loadSetup(ctx.cwd);
     if (session !== generation) return;
+    const resolvedRoot = await realpath(setup.root);
+    if (session !== generation) return;
+    requestedRoot = setup.root;
     root = resolvedRoot;
+    reviewers = setup.reviewers;
     const manager = ctx.sessionManager as Partial<
       ExtensionContext["sessionManager"]
     >;
@@ -749,20 +861,182 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     await logging;
     if (session !== generation) return;
     logger?.log("session.start", { sessionId: accounting.stats.sessionId });
+    reportSetup(setup, ctx);
+    if (!activateDecisions(ctx) && store.enabled) {
+      store.setEnabled(false);
+      showState(ctx);
+      logger?.log("extension.toggle", {
+        sessionId: accounting.stats.sessionId,
+        outcome: "off",
+        reasonCode: "decision_tool_unavailable",
+      });
+      ctx.ui.notify(
+        `Pair Programmer is off: the tools allowed in this session leave out ${DECISION_TOOL}.`,
+        "warning",
+      );
+    }
+    requireInChildren(ctx);
     await assessBaseline(event, ctx, session);
     if (session !== generation) return;
-    try {
-      const loaded = await loadReviewers(ctx.cwd);
-      if (session === generation) reviewers = loaded;
-    } catch (error) {
-      if (session !== generation) return;
-      reviewers = [];
+    await watchWorkspace(session);
+  }
+
+  function reportSetup(setup: SessionSetup, ctx: ExtensionContext): void {
+    const sessionId = accounting.stats.sessionId;
+    if (setup.kind === "failed") {
       logger?.log("review.skipped", {
-        sessionId: accounting.stats.sessionId,
+        sessionId,
         reasonCode: "configuration_failed",
       });
-      ctx.ui.notify(String(error), "warning");
+      ctx.ui.notify(setup.error, "warning");
+      return;
     }
+    logger?.log("session.configured", {
+      sessionId,
+      reasonCode:
+        setup.kind === "default" ? "default_configuration" : "configured",
+      count: setup.reviewers.length,
+    });
+    if (setup.kind === "default") {
+      ctx.ui.notify(
+        `Pair Programmer found no ${CONFIG_FILE} from ${setup.root} up to ${setup.searchedUpTo}, so the default reviewer reviews every file.`,
+        "warning",
+      );
+    }
+  }
+
+  function activateDecisions(ctx: ExtensionContext): boolean {
+    if (hostOf(ctx) !== "pi") return true;
+    const active = pi.getActiveTools();
+    if (active.includes(DECISION_TOOL)) return true;
+    pi.setActiveTools([...active, DECISION_TOOL]);
+    return pi.getActiveTools().includes(DECISION_TOOL);
+  }
+
+  function requireInChildren(ctx: ExtensionContext): void {
+    releaseChildren?.();
+    releaseChildren = undefined;
+    const manager = ctx.sessionManager as Partial<
+      ExtensionContext["sessionManager"]
+    >;
+    const sessionId = manager.getSessionId?.();
+    if (sessionId === undefined) return;
+    const registration = requireInChildSessions(sessionId, EXTENSION_PATH);
+    logger?.log("session.subagents", {
+      sessionId: accounting.stats.sessionId,
+      reasonCode: registration.status,
+    });
+    if (registration.status === "registered") {
+      releaseChildren = registration.dispose;
+      return;
+    }
+    ctx.ui.notify(
+      registration.status === "conflict"
+        ? "Pair Programmer does not load in subagents: another extension already requires child extensions for this session."
+        : "Pair Programmer does not load in subagents: the pi-subagents registry has an unknown format.",
+      "warning",
+    );
+  }
+
+  async function workspaceRevisions(
+    changes: WorkspaceChanges,
+    signal: AbortSignal,
+  ): Promise<Map<string, string>> {
+    const revisions = new Map<string, string>();
+    for (const file of await changes.files(signal)) {
+      const fullPath = path.join(changes.root, file);
+      try {
+        const info = await stat(fullPath);
+        if (info.isFile() && info.size <= MAX_SCANNED_BYTES)
+          revisions.set(file, revisionOf(await readFile(fullPath, "utf8")));
+      } catch {
+        continue;
+      }
+    }
+    return revisions;
+  }
+
+  async function watchWorkspace(session: number): Promise<void> {
+    workspace = undefined;
+    observed.clear();
+    const controller = new AbortController();
+    controllers.set(controller, "");
+    try {
+      const changes = await WorkspaceChanges.open(root, controller.signal);
+      if (changes === undefined) return;
+      const revisions = await workspaceRevisions(changes, controller.signal);
+      if (session !== generation) return;
+      workspace = changes;
+      for (const [file, revision] of revisions) observed.set(file, revision);
+    } catch {
+      if (session === generation) {
+        logger?.log("workspace.changed", {
+          sessionId: accounting.stats.sessionId,
+          reasonCode: "scan_failed",
+        });
+      }
+    } finally {
+      controllers.delete(controller);
+    }
+  }
+
+  async function scanWorkspace(
+    ctx: ExtensionContext,
+    session: number,
+  ): Promise<void> {
+    const changes = workspace;
+    if (changes === undefined || session !== generation) return;
+    const controller = new AbortController();
+    controllers.set(controller, "");
+    try {
+      const revisions = await workspaceRevisions(changes, controller.signal);
+      if (session !== generation) return;
+      const reviewed = reviewedInProcess();
+      const changed = [...revisions].filter(([file, revision]) => {
+        const unseen = observed.get(file) !== revision;
+        observed.set(file, revision);
+        return (
+          unseen && reviewed.get(path.join(changes.root, file)) !== revision
+        );
+      });
+      if (changed.length === 0) return;
+      const bulk = changed.length > MAX_EXTERNAL_CHANGES;
+      logger?.log("workspace.changed", {
+        sessionId: accounting.stats.sessionId,
+        reasonCode: bulk ? "bulk_change" : "external_change",
+        count: changed.length,
+      });
+      if (bulk) {
+        ctx.ui.notify(
+          `Pair Programmer skipped ${String(changed.length)} files changed outside write and edit: it reviews at most ${String(MAX_EXTERNAL_CHANGES)} at once.`,
+          "warning",
+        );
+        return;
+      }
+      for (const [file] of changed) track(path.join(requestedRoot, file), ctx);
+    } catch {
+      if (session === generation) {
+        logger?.log("workspace.changed", {
+          sessionId: accounting.stats.sessionId,
+          reasonCode: "scan_failed",
+        });
+      }
+    } finally {
+      controllers.delete(controller);
+    }
+  }
+
+  function track(filePath: string, ctx: ExtensionContext): void {
+    const version = ++nextVersion;
+    const session = generation;
+    unresolved += 1;
+    void schedule(filePath, ctx, version, session)
+      .finally(() => {
+        if (session === generation) unresolved -= 1;
+      })
+      .catch(() => {
+        return;
+      });
   }
 
   pi.on("session_start", startSession);
@@ -800,6 +1074,8 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     accounting.suspend();
     replaceBaseline(undefined);
     baselineSession = undefined;
+    releaseChildren?.();
+    releaseChildren = undefined;
     const sessionId = accounting.stats.sessionId;
 
     void (async () => {
@@ -818,17 +1094,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     )
       return;
     const filePath = ToolPathSchema.safeParse(event.input["path"]);
-    if (!filePath.success) return;
-    const version = ++nextVersion;
-    const session = generation;
-    unresolved += 1;
-    void schedule(filePath.data, ctx, version, session)
-      .finally(() => {
-        if (session === generation) unresolved -= 1;
-      })
-      .catch(() => {
-        return;
-      });
+    if (filePath.success) track(filePath.data, ctx);
   });
 
   pi.on("context", (event) => {
@@ -862,8 +1128,32 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     };
   });
 
-  pi.on("turn_end", () => {
+  pi.on("turn_end", (_event, ctx) => {
     deliver();
+    const session = generation;
+    const previous = scanning;
+    scanning = (async () => {
+      await previous;
+      await scanWorkspace(ctx, session);
+    })();
+  });
+
+  pi.on("agent_before_settle", async (event, ctx) => {
+    if (ctx.hasUI || !store.enabled) return;
+    const batch = await settle(ctx);
+    if (batch.length === 0) return;
+    return {
+      entries: [
+        ...event.entries,
+        {
+          type: "custom_message",
+          customType: "pair-programmer-findings",
+          content: describe(batch),
+          display: false,
+        },
+      ],
+      continue: true,
+    };
   });
 
   pi.on("before_agent_start", () => {

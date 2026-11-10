@@ -68,6 +68,7 @@ export default defineConfig(
     files: [
       "src/index.ts",
       "src/change-evidence.ts",
+      "src/child-extensions.ts",
       "src/logger.ts",
       "src/reviewers.ts",
       "test/change-evidence.test.ts",

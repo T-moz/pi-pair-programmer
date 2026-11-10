@@ -82,7 +82,12 @@ export TYPESAFE_API_KEY="your-api-key"
 
 ## 🧭 Use
 
-Reviews are on by default. After each successful `write` or `edit`, reviewers run in the background. The coding agent must accept or reject each finding with a reason before continuing with other tools. Only accepted findings appear in your transcript.
+Reviews are on by default. After each successful `write` or `edit`, reviewers run in the background. At the end of each turn, files changed another way, such as `sed -i` in `bash`, are reviewed too (in git repositories, up to 20 files per turn). The coding agent must accept or reject each finding with a reason before continuing with other tools. Only accepted findings appear in your transcript.
+
+Pi subagents started with [pi-subagents](https://github.com/nicobailon/pi-subagents) load the extension too, whatever their working directory. Sessions without a UI, such as subagents and `pi -p`, wait for running reviews before they finish, so findings are always decided.
+
+> [!IMPORTANT]
+> A session whose tool allowlist leaves out `pair_programmer_decide` turns reviews off with a warning. Built-in pi-subagents agents such as `worker` have an allowlist, so add the tool through `subagents.agentOverrides.<agent>.tools`. Otherwise the parent session reviews the subagent's changes at the end of its turn.
 
 | Command            | Action                                                                                              |
 | ------------------ | --------------------------------------------------------------------------------------------------- |
@@ -90,7 +95,7 @@ Reviews are on by default. After each successful `write` or `edit`, reviewers ru
 | `/pair-clear`      | Cancel reviews and clear all findings.                                                              |
 | `/pair-stats`      | View review activity, findings, tokens, and estimated costs on demand; missing usage stays unknown. |
 
-The default reviewer uses your current model and asks: _“Does it add entropy?”_ To change the prompt, model, or files reviewed, create `pair-programmer.reviewers.json` in your working directory:
+The default reviewer uses your current model and asks: _“Does it add entropy?”_ Pi warns when it applies. To change the prompt, model, or files reviewed, create `pair-programmer.reviewers.json` in your working directory or any folder above it, up to the git root:
 
 ```json
 {
@@ -111,7 +116,7 @@ The default reviewer uses your current model and asks: _“Does it add entropy?�
 }
 ```
 
-Use `current` or a `provider/model` identifier. File patterns are relative to your working directory; exclusions take precedence. Add entries for more reviewers.
+Use `current` or a `provider/model` identifier. File patterns are relative to the folder that holds the configuration; exclusions take precedence. Add entries for more reviewers.
 
 Reviewers have no tools by default. To let a reviewer look things up, such as current library APIs, add an optional `tools` list. For now, the only supported tool is `web_search`:
 

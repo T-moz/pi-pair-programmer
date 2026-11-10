@@ -21,6 +21,7 @@ import {
   buildChangeEvidence,
   captureBaseline,
   lineChanges,
+  WorkspaceChanges,
   type TaskBaseline,
 } from "../src/change-evidence.js";
 
@@ -179,6 +180,57 @@ it("finds committed main code after its original file has been deleted", async (
     reason: null,
   });
   expect(evidence.diff).toContain("--- original.ts\n+++ moved.ts");
+});
+
+async function changedFiles(directory = root): Promise<string[] | undefined> {
+  const signal = new AbortController().signal;
+  const changes = await WorkspaceChanges.open(directory, signal);
+  return changes === undefined
+    ? undefined
+    : (await changes.files(signal)).toSorted((left, right) =>
+        left.localeCompare(right),
+      );
+}
+
+it("watches no workspace outside git", async () => {
+  expect(await changedFiles()).toBeUndefined();
+});
+
+it("lists eligible files changed since the opening commit, even after they are committed", async () => {
+  await initializeGit();
+  await mkdir(path.join(root, "app"));
+  await writeFile(path.join(root, "tracked.ts"), "export const tracked = 1;\n");
+  await writeFile(path.join(root, "app/feature.ts"), "export const app = 1;\n");
+  await writeFile(path.join(root, "same.ts"), "export const same = 1;\n");
+  await writeFile(path.join(root, ".gitignore"), "ignored.ts\n");
+  await commitFiles();
+  const signal = new AbortController().signal;
+  const changes = await WorkspaceChanges.open(root, signal);
+  const app = await WorkspaceChanges.open(path.join(root, "app"), signal);
+  expect(changes?.root).toBe(root);
+  await writeFile(path.join(root, "tracked.ts"), "export const tracked = 2;\n");
+  await writeFile(path.join(root, "app/feature.ts"), "export const app = 2;\n");
+  await writeFile(path.join(root, "created.ts"), "export const created = 1;\n");
+  await writeFile(path.join(root, "ignored.ts"), "export const ignored = 1;\n");
+  await writeFile(path.join(root, "package-lock.json"), "{}\n");
+  await mkdir(path.join(root, "node_modules"));
+  await writeFile(path.join(root, "node_modules/vendored.ts"), legacy);
+  await commitFiles();
+  await writeFile(path.join(root, "untracked.ts"), "export const later = 1;\n");
+  expect(
+    (await changes?.files(signal))?.toSorted((left, right) =>
+      left.localeCompare(right),
+    ),
+  ).toEqual(["app/feature.ts", "created.ts", "tracked.ts", "untracked.ts"]);
+  expect(await app?.files(signal)).toEqual(["feature.ts"]);
+});
+
+it("lists every eligible file of a repository without commits", async () => {
+  await initializeGit();
+  await writeFile(path.join(root, "staged.ts"), "export const staged = 1;\n");
+  await execute("git", ["add", "staged.ts"], { cwd: root });
+  await writeFile(path.join(root, "untracked.ts"), "export const later = 1;\n");
+  expect(await changedFiles()).toEqual(["staged.ts", "untracked.ts"]);
 });
 
 it("attributes against a repository whose eligible sources exceed four megabytes", async () => {
