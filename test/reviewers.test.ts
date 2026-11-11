@@ -382,7 +382,7 @@ it("loads configured reviewer tools and keys reviewers by them", async () => {
     path.join(directory, "pair-programmer.reviewers.json"),
     JSON.stringify({ reviewers: [withTools] }),
   );
-  expect(await loadReviewers(directory)).toEqual([withTools]);
+  expect((await loadReviewers(directory)).reviewers).toEqual([withTools]);
   expect(reviewerKey(withTools)).not.toBe(reviewerKey(base));
   expect(reviewerKey({ ...base, tools: [] })).toBe(reviewerKey(base));
 });
