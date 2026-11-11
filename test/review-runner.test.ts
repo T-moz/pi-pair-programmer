@@ -167,7 +167,7 @@ it.each(["pi", "omp"] as const)(
       expect(args).not.toContain(
         host === "pi" ? "--no-rules" : "--no-context-files",
       );
-      expect(args?.[0]).toBe(host === "pi" ? script : "--no-session");
+      expect(args?.[0]).toBe(script);
       expect(args).toContain("--print");
       expect(args?.join(" ")).not.toContain(secret);
       expect(args?.join(" ")).not.toContain("console.log");
@@ -182,6 +182,26 @@ it.each(["pi", "omp"] as const)(
       expect(input.join("")).toContain(`1: const key = '${secret}';`);
       finish(child, [valid]);
       await expect(pending).resolves.toEqual([valid]);
+    } finally {
+      process.argv.splice(0, process.argv.length, ...original);
+    }
+  },
+);
+
+it.each(["/$bunfs/root/omp", "B:/~BUN/root/omp.exe", "", undefined])(
+  "runs a compiled OMP binary without an entry script for %s",
+  async (script) => {
+    const original = [...process.argv];
+    if (script === undefined) process.argv.length = 1;
+    else process.argv[1] = script;
+    try {
+      const { child } = subprocess();
+      const pending = reviewFile(request("omp"));
+      const [command, args] = vi.mocked(spawn).mock.calls[0] ?? [];
+      expect(command).toBe(process.execPath);
+      expect(args?.[0]).toBe("--no-session");
+      finish(child, []);
+      await expect(pending).resolves.toEqual([]);
     } finally {
       process.argv.splice(0, process.argv.length, ...original);
     }

@@ -227,6 +227,9 @@ function invoke(
   return promise;
 }
 
+/** Bun serves a compiled binary's entry script from a virtual filesystem. */
+const COMPILED_ENTRY = /\$bunfs|~BUN|%7EBUN/u;
+
 function toolArgs(host: Host, tools: readonly string[]): string[] {
   if (tools.length === 0) return ["--no-tools", "--no-extensions"];
   const allowlist = ["--tools", tools.join(",")];
@@ -260,11 +263,12 @@ async function complete(
     "json",
     "--print",
   ];
+  const script = process.argv[1] ?? "";
   if (host === "pi") {
-    const script = process.argv[1];
-    if (script === undefined || script.length === 0) {
-      throw new Error("Pi executable is unavailable");
-    }
+    if (script.length === 0) throw new Error("Pi executable is unavailable");
+    args.unshift(script);
+  } else if (script.length > 0 && !COMPILED_ENTRY.test(script)) {
+    // OMP installed as a package runs as a Bun script; compiled OMP embeds it.
     args.unshift(script);
   }
 
