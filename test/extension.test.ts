@@ -2198,7 +2198,10 @@ it.each(["pi", "omp"] as const)(
       }),
     ).toBeUndefined();
     expect(
-      await environment.emit("tool_call", { toolName: "edit" }),
+      await environment.emit("tool_call", {
+        toolName: "edit",
+        input: { path: file },
+      }),
     ).toBeUndefined();
     await advanceReviews(() => {
       expect(reviewFile).toHaveBeenCalledTimes(2);
@@ -2216,7 +2219,10 @@ it.each(["pi", "omp"] as const)(
     });
     await environment.emit("turn_end");
     expect(environment.sendMessage).toHaveBeenCalledOnce();
-    const blocked = await environment.emit("tool_call", { toolName: "edit" });
+    const blocked = await environment.emit("tool_call", {
+      toolName: "edit",
+      input: { path: file },
+    });
     if (
       typeof blocked !== "object" ||
       blocked === null ||
@@ -4002,10 +4008,11 @@ it("stops a pending debounce immediately when review is turned off", async () =>
   await environment.emit("session_shutdown");
 });
 
-it("rejects absolute paths returned by cross-volume relative resolution", async () => {
+it("never takes an absolute path from cross-volume relative resolution for a file", async () => {
   const environment = await setup();
   const file = path.join(environment.cwd, "change.ts");
   await fsPromises.writeFile(file, "export const value = true;\n");
+  vi.mocked(reviewFile).mockResolvedValue([]);
   const actualRelative = path.relative.bind(path);
   const relative = vi.spyOn(path, "relative");
   relative.mockImplementationOnce(() => `${path.sep}other-volume.ts`);
@@ -4014,7 +4021,16 @@ it("rejects absolute paths returned by cross-volume relative resolution", async 
     input: { path: file },
     isError: false,
   });
+  await advanceReviews(() => {
+    expect(reviewFile).toHaveBeenCalledTimes(2);
+  });
+  expect(
+    vi
+      .mocked(reviewFile)
+      .mock.calls.every(([request]) => request.file === "change.ts"),
+  ).toBe(true);
   relative.mockRestore();
+  await fsPromises.writeFile(file, "export const value = false;\n");
   const canonicalRelative = vi.spyOn(path, "relative");
   canonicalRelative
     .mockImplementationOnce((from, to) => actualRelative(from, to))
@@ -4029,7 +4045,7 @@ it("rejects absolute paths returned by cross-volume relative resolution", async 
   });
   canonicalRelative.mockRestore();
   await vi.advanceTimersByTimeAsync(150);
-  expect(reviewFile).not.toHaveBeenCalled();
+  expect(reviewFile).toHaveBeenCalledTimes(2);
   await environment.emit("session_shutdown");
 });
 
@@ -4630,6 +4646,235 @@ it("finds the config above a subfolder working directory and matches globs from 
     expect.objectContaining({ count: 1 }),
   ]);
   await environment.emit("session_shutdown");
+});
+
+const otherReviewers = JSON.stringify({
+  reviewers: [
+    {
+      model: "current",
+      prompt: "Review the other checkout",
+      include: ["app/src/**/*.ts"],
+      exclude: [],
+    },
+  ],
+});
+
+async function otherCheckout(config: string): Promise<string> {
+  const directory = await fsPromises.mkdtemp(
+    path.join(tmpdir(), "pair-programmer-other-"),
+  );
+  directories.push(directory);
+  await fsPromises.mkdir(path.join(directory, "app", "src"), {
+    recursive: true,
+  });
+  await fsPromises.writeFile(
+    path.join(directory, "pair-programmer.reviewers.json"),
+    config,
+  );
+  await fsPromises.writeFile(
+    path.join(directory, "app", "src", "feature.ts"),
+    "export const feature = 1;\n",
+  );
+  await commitRepository(directory);
+  return directory;
+}
+
+async function sessionPath(cwd: string, file: string): Promise<string> {
+  return path
+    .relative(
+      await fsPromises.realpath(cwd),
+      path.join(
+        await fsPromises.realpath(path.dirname(file)),
+        path.basename(file),
+      ),
+    )
+    .split(path.sep)
+    .join("/");
+}
+
+async function editOutside(
+  environment: { emit: (name: string, event?: unknown) => Promise<unknown> },
+  file: string,
+  source: string,
+): Promise<void> {
+  await environment.emit("tool_call", {
+    toolName: "edit",
+    input: { path: file },
+  });
+  await fsPromises.mkdir(path.dirname(file), { recursive: true });
+  await fsPromises.writeFile(file, source);
+  await environment.emit("tool_result", {
+    toolName: "edit",
+    input: { path: file },
+    isError: false,
+  });
+}
+
+it("reviews a file in another checkout with that checkout's reviewers, against its state before the first edit", async () => {
+  const environment = await setup();
+  const other = await otherCheckout(otherReviewers);
+  const file = path.join(other, "app", "src", "feature.ts");
+  const capture = vi.spyOn(changeEvidence, "captureBaseline");
+  const dispose = vi.spyOn(changeEvidence.TaskBaseline.prototype, "dispose");
+  vi.mocked(reviewFile).mockResolvedValue([
+    {
+      line: 2,
+      title: "Other finding",
+      quote: "second",
+      evidence: "From the other checkout",
+    },
+  ]);
+  await editOutside(
+    environment,
+    file,
+    "export const feature = 1;\nexport const second = 2;\n",
+  );
+  await editOutside(
+    environment,
+    path.join(other, "notes.ts"),
+    "export const notes = true;\n",
+  );
+  await advanceReviews(() => {
+    expect(findings(environment.entries)).toHaveLength(1);
+    expect(loggedWith("review.skipped", "no_matching_reviewer")).toHaveLength(
+      1,
+    );
+  });
+  const identity = await sessionPath(environment.cwd, file);
+  expect(identity).toMatch(/^\.\.\/pair-programmer-other-/u);
+  expect(capture).toHaveBeenCalledOnce();
+  expect(reviewFile).toHaveBeenCalledOnce();
+  expect(vi.mocked(reviewFile).mock.calls[0]?.[0]).toMatchObject({
+    file: identity,
+    prompt: "Review the other checkout",
+    changes: {
+      status: "available",
+      hunks: [{ start: 2, added: 1, removed: [] }],
+    },
+  });
+  expect(findings(environment.entries)[0]).toMatchObject({
+    file: identity,
+    title: "Other finding",
+  });
+  await environment.emit("session_shutdown");
+  const otherRoot = await fsPromises.realpath(other);
+  await vi.waitFor(() => {
+    expect(
+      dispose.mock.contexts.flatMap((baseline) =>
+        baseline instanceof changeEvidence.TaskBaseline ? [baseline.root] : [],
+      ),
+    ).toContain(otherRoot);
+  });
+  capture.mockRestore();
+  dispose.mockRestore();
+});
+
+it("records another checkout before a write creates a folder in it, so the new file is all change", async () => {
+  const environment = await setup();
+  const other = await otherCheckout(otherReviewers);
+  const file = path.join(other, "app", "src", "new", "deep", "added.ts");
+  vi.mocked(reviewFile).mockResolvedValue([]);
+  await editOutside(
+    environment,
+    file,
+    "export const added = 1;\nexport const more = 2;\n",
+  );
+  await advanceReviews(() => {
+    expect(reviewFile).toHaveBeenCalledOnce();
+  });
+  expect(vi.mocked(reviewFile).mock.calls[0]?.[0]).toMatchObject({
+    file: await sessionPath(environment.cwd, file),
+    changes: {
+      status: "available",
+      hunks: [{ start: 1, added: 3, removed: [] }],
+    },
+  });
+  await environment.emit("session_shutdown");
+});
+
+it.each(["unannounced", "uncaptured"] as const)(
+  "reviews the whole file of another checkout whose state before the edit is %s",
+  async (moment) => {
+    const environment = await setup();
+    const other = await otherCheckout(otherReviewers);
+    const file = path.join(other, "app", "src", "feature.ts");
+    const capture = vi
+      .spyOn(changeEvidence, "captureBaseline")
+      .mockResolvedValueOnce({ status: "unavailable", reason: "timeout" });
+    vi.mocked(reviewFile).mockResolvedValue([]);
+    if (moment === "uncaptured")
+      await environment.emit("tool_call", {
+        toolName: "write",
+        input: { path: file },
+      });
+    await fsPromises.writeFile(file, "export const feature = 2;\n");
+    await environment.emit("tool_result", {
+      toolName: "write",
+      input: { path: file },
+      isError: false,
+    });
+    await advanceReviews(() => {
+      expect(reviewFile).toHaveBeenCalledOnce();
+    });
+    expect(vi.mocked(reviewFile).mock.calls[0]?.[0].changes).toEqual({
+      status: "unavailable",
+      reason: "Task baseline is unavailable",
+    });
+    expect(capture).toHaveBeenCalledTimes(moment === "uncaptured" ? 1 : 0);
+    await environment.emit("session_shutdown");
+    capture.mockRestore();
+  },
+);
+
+it("leaves files outside the session unreviewed without a valid config there, and warns once per invalid config", async () => {
+  const environment = await setup();
+  environment.notify.mockClear();
+  const broken = await otherCheckout("{");
+  await editOutside(
+    environment,
+    path.join(broken, "app", "src", "feature.ts"),
+    "export const feature = 2;\n",
+  );
+  await editOutside(
+    environment,
+    path.join(broken, "notes.ts"),
+    "export const notes = true;\n",
+  );
+  await environment.emit("tool_result", {
+    toolName: "write",
+    input: { path: path.join(broken, "missing", "change.ts") },
+    isError: false,
+  });
+  expect(
+    await environment.emit("tool_call", { toolName: "write", input: {} }),
+  ).toBeUndefined();
+  await vi.advanceTimersByTimeAsync(150);
+  expect(reviewFile).not.toHaveBeenCalled();
+  expect(environment.notify).toHaveBeenCalledExactlyOnceWith(
+    expect.stringContaining("invalid JSON"),
+    "warning",
+  );
+  expect(loggedWith("review.skipped", "configuration_failed")).toHaveLength(1);
+  await environment.emit("session_shutdown");
+});
+
+it("reviews a write through the canonical path of an aliased working directory as a session file", async () => {
+  const environment = await setup("pi", true);
+  const file = path.join(path.dirname(environment.cwd), "sub", "change.ts");
+  const capture = vi.spyOn(changeEvidence, "captureBaseline");
+  vi.mocked(reviewFile).mockResolvedValue([]);
+  await editOutside(environment, file, "export const value = 1;\n");
+  await advanceReviews(() => {
+    expect(reviewFile).toHaveBeenCalledTimes(2);
+  });
+  expect(
+    vi
+      .mocked(reviewFile)
+      .mock.calls.every(([request]) => request.file === "sub/change.ts"),
+  ).toBe(true);
+  expect(capture).not.toHaveBeenCalled();
+  await environment.emit("session_shutdown");
+  capture.mockRestore();
 });
 
 it.each([

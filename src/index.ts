@@ -64,11 +64,23 @@ const DecisionParameters = Type.Object({
   reason: Type.String({ minLength: 1 }),
 });
 
-interface ReviewJob {
-  id: string;
-  stats: PairStats;
+interface Checkout {
+  root: string;
+  reviewers: readonly ReviewerConfig[];
+  baseline?: Promise<TaskBaseline | undefined>;
+  capture: AbortController;
+}
+
+interface ReviewTarget {
   file: string;
   fullPath: string;
+  checkout: Checkout | undefined;
+  checkoutFile: string;
+}
+
+interface ReviewJob extends ReviewTarget {
+  id: string;
+  stats: PairStats;
   revision: string;
   source: string;
   model: string;
@@ -133,6 +145,30 @@ function idle(ctx: ExtensionContext): boolean {
     return ctx.isIdle();
   } catch {
     return false;
+  }
+}
+
+function posixRelative(folder: string, target: string): string {
+  return path.relative(folder, target).split(path.sep).join("/");
+}
+
+function within(folder: string, target: string): string | undefined {
+  const relative = posixRelative(folder, target);
+  return !relative ||
+    relative.startsWith("../") ||
+    relative === ".." ||
+    path.isAbsolute(relative)
+    ? undefined
+    : relative;
+}
+
+async function existingFolder(file: string): Promise<string> {
+  for (let folder = path.dirname(file); ; folder = path.dirname(folder)) {
+    try {
+      return await realpath(folder);
+    } catch {
+      continue;
+    }
   }
 }
 
@@ -221,6 +257,8 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   let releaseChildren: (() => void) | undefined;
   let baseline: TaskBaseline | undefined;
   let baselineSession: string | undefined;
+  const checkouts = new Map<string, Checkout>();
+  const reportedConfigErrors = new Set<string>();
   let generation = 0;
   let unresolved = 0;
   let preparing = 0;
@@ -577,6 +615,10 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     }
   }
 
+  async function baselineOf(job: ReviewJob): Promise<TaskBaseline | undefined> {
+    return job.checkout === undefined ? baseline : await job.checkout.baseline;
+  }
+
   async function runJob(
     job: ReviewJob,
     signal: AbortSignal,
@@ -590,7 +632,12 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       prompt: job.reviewer.prompt,
       file: job.file,
       source: job.source,
-      changes: await lineChanges(baseline, job.file, job.source, signal),
+      changes: await lineChanges(
+        await baselineOf(job),
+        job.checkoutFile,
+        job.source,
+        signal,
+      ),
       signal,
       tools: job.reviewer.tools ?? [],
       onModelCall,
@@ -616,8 +663,8 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
         inherited: await isInherited({
           finding,
           evidence: await buildChangeEvidence(
-            baseline,
-            job.file,
+            await baselineOf(job),
+            job.checkoutFile,
             job.source,
             finding.line,
             finding.quote,
@@ -668,7 +715,10 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   ): void {
     const jobs: ReviewJob[] = [];
     const keys = new Set<string>();
-    const matching = matchingReviewers(base.file, reviewers);
+    const matching = matchingReviewers(
+      base.checkoutFile,
+      base.checkout?.reviewers ?? reviewers,
+    );
     if (matching.length === 0) {
       logger?.log("review.skipped", {
         sessionId: accounting.stats.sessionId,
@@ -707,12 +757,12 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   }
 
   async function prepare(
-    fullPath: string,
-    file: string,
+    target: ReviewTarget,
     ctx: ExtensionContext,
     version: number,
     session: number,
   ): Promise<void> {
+    const { file, fullPath } = target;
     checkReset?.();
     try {
       if (
@@ -742,8 +792,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       const host = hostOf(ctx);
       startReviews(
         {
-          file,
-          fullPath,
+          ...target,
           revision,
           source,
           session,
@@ -766,6 +815,115 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     }
   }
 
+  async function checkoutOf(
+    folder: string,
+    ctx: ExtensionContext,
+  ): Promise<Checkout | undefined> {
+    const setup = await loadSetup(folder);
+    if (setup.kind === "default") return undefined;
+    if (setup.kind === "failed") {
+      if (!reportedConfigErrors.has(setup.error)) {
+        reportedConfigErrors.add(setup.error);
+        logger?.log("review.skipped", {
+          sessionId: accounting.stats.sessionId,
+          reasonCode: "configuration_failed",
+        });
+        ctx.ui.notify(setup.error, "warning");
+      }
+      return undefined;
+    }
+    let checkout = checkouts.get(setup.root);
+    if (checkout === undefined) {
+      checkout = {
+        root: setup.root,
+        reviewers: setup.reviewers,
+        capture: new AbortController(),
+      };
+      checkouts.set(setup.root, checkout);
+    }
+    return checkout;
+  }
+
+  function inSession(folder: string): boolean {
+    return folder === root || within(root, folder) !== undefined;
+  }
+
+  async function ownTarget(
+    requested: string,
+  ): Promise<ReviewTarget | undefined> {
+    const fullPath = await realpath(requested);
+    const file = within(root, fullPath);
+    return file === undefined
+      ? undefined
+      : { file, fullPath, checkout: undefined, checkoutFile: file };
+  }
+
+  async function foreignTarget(
+    requested: string,
+    ctx: ExtensionContext,
+  ): Promise<ReviewTarget | undefined> {
+    const folder = await realpath(path.dirname(requested));
+    const fullPath = path.join(folder, path.basename(requested));
+    if (inSession(folder)) return await ownTarget(fullPath);
+    const checkout = await checkoutOf(folder, ctx);
+    return checkout === undefined
+      ? undefined
+      : {
+          file: posixRelative(root, fullPath),
+          fullPath,
+          checkout,
+          checkoutFile: posixRelative(checkout.root, fullPath),
+        };
+  }
+
+  async function captureCheckout(
+    checkout: Checkout,
+  ): Promise<TaskBaseline | undefined> {
+    const capture = await captureBaseline(
+      checkout.root,
+      checkout.capture.signal,
+    );
+    return capture.status === "available" ? capture.baseline : undefined;
+  }
+
+  async function captureBefore(
+    requested: string,
+    ctx: ExtensionContext,
+  ): Promise<undefined> {
+    const folder = await existingFolder(requested);
+    if (inSession(folder)) return undefined;
+    const checkout = await checkoutOf(folder, ctx);
+    if (checkout === undefined) return undefined;
+    checkout.baseline ??= captureCheckout(checkout);
+    await checkout.baseline;
+    return undefined;
+  }
+
+  function prepareCheckout(
+    event: { toolName: string; input: Record<string, unknown> },
+    ctx: ExtensionContext,
+  ): Promise<undefined> | undefined {
+    if (event.toolName !== "write" && event.toolName !== "edit") return;
+    const filePath = ToolPathSchema.safeParse(event.input["path"]);
+    if (!filePath.success) return;
+    const requested = path.resolve(ctx.cwd, filePath.data);
+    return within(requestedRoot, requested) === undefined
+      ? captureBefore(requested, ctx)
+      : undefined;
+  }
+
+  function disposeCheckouts(): void {
+    for (const checkout of checkouts.values()) {
+      checkout.capture.abort();
+      const captured = checkout.baseline;
+      void (async () => {
+        await (await captured)?.dispose();
+      })();
+    }
+    checkouts.clear();
+    reportedConfigErrors.clear();
+  }
+
   async function schedule(
     filePath: string,
     ctx: ExtensionContext,
@@ -773,59 +931,49 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     session: number,
   ): Promise<void> {
     const requested = path.resolve(ctx.cwd, filePath);
-    const lexical = path
-      .relative(requestedRoot, requested)
-      .split(path.sep)
-      .join("/");
+    const lexical = within(requestedRoot, requested);
+    let target: ReviewTarget | undefined;
+    try {
+      target =
+        lexical === undefined
+          ? await foreignTarget(requested, ctx)
+          : await ownTarget(requested);
+    } catch {
+      target = undefined;
+    }
+    if (target === undefined) {
+      if (lexical !== undefined && store.enabled && session === generation)
+        store.discardStale(lexical, "missing");
+      return;
+    }
+    const { file } = target;
     if (
-      !lexical ||
-      lexical.startsWith("../") ||
-      lexical === ".." ||
-      path.isAbsolute(lexical)
+      !store.enabled ||
+      session !== generation ||
+      version < (versions.get(file) ?? 0)
     )
       return;
-    try {
-      const fullPath = await realpath(requested);
-      const file = path.relative(root, fullPath).split(path.sep).join("/");
-      if (
-        !file ||
-        file.startsWith("../") ||
-        file === ".." ||
-        path.isAbsolute(file)
-      ) {
-        if (store.enabled && session === generation)
-          store.discardStale(lexical, "missing");
-        return;
+    if (lexical !== undefined && lexical !== file)
+      store.discardStale(lexical, "missing");
+    versions.set(file, version);
+    for (const [controller, activeFile] of controllers) {
+      if (activeFile === file) {
+        cancelJobs.get(controller)?.();
+        controller.abort();
       }
-      if (
-        !store.enabled ||
-        session !== generation ||
-        version < (versions.get(file) ?? 0)
-      )
-        return;
-      if (lexical !== file) store.discardStale(lexical, "missing");
-      versions.set(file, version);
-      for (const [controller, activeFile] of controllers) {
-        if (activeFile === file) {
-          cancelJobs.get(controller)?.();
-          controller.abort();
-        }
-      }
-      clearTimeout(timers.get(file));
-      timers.set(
-        file,
-        setTimeout(() => {
-          timers.delete(file);
-          preparing += 1;
-          void prepare(fullPath, file, ctx, version, session).finally(() => {
-            if (session === generation) preparing -= 1;
-          });
-        }, 120),
-      );
-    } catch {
-      if (store.enabled && session === generation)
-        store.discardStale(lexical, "missing");
     }
+    clearTimeout(timers.get(file));
+    const prepared = target;
+    timers.set(
+      file,
+      setTimeout(() => {
+        timers.delete(file);
+        preparing += 1;
+        void prepare(prepared, ctx, version, session).finally(() => {
+          if (session === generation) preparing -= 1;
+        });
+      }, 120),
+    );
   }
 
   function replaceBaseline(next: TaskBaseline | undefined): void {
@@ -848,6 +996,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       const header = manager.getHeader?.();
       if (event.reason === "fork" || header?.id !== baselineSession) {
         replaceBaseline(undefined);
+        disposeCheckouts();
         baselineSession = header?.id;
         if (isFreshSession(event.reason, header, manager.getEntries?.())) {
           const capture = await captureBaseline(root, controller.signal);
@@ -1113,6 +1262,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     activeContext = undefined;
     accounting.suspend();
     replaceBaseline(undefined);
+    disposeCheckouts();
     baselineSession = undefined;
     releaseChildren?.();
     releaseChildren = undefined;
@@ -1213,13 +1363,13 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
       wake(ctx, true);
   });
 
-  pi.on("tool_call", (event) => {
+  pi.on("tool_call", (event, ctx) => {
     checkReset?.();
     if (!store.enabled || decisionInteraction(event.toolName, event.input))
       return;
     deliver();
     const outstanding = store.outstanding();
-    if (outstanding.length === 0) return;
+    if (outstanding.length === 0) return prepareCheckout(event, ctx);
     for (const finding of outstanding) presented.add(finding.id);
     return { block: true, reason: describe(outstanding) };
   });

@@ -120,6 +120,8 @@ The default reviewer uses your current model and asks: _â€œDoes it add entropy?â
 
 Use `current` or a `provider/model` identifier. File patterns are relative to the folder that holds the configuration; exclusions take precedence. Add entries for more reviewers.
 
+A `write` or `edit` outside your working directory, such as in another git worktree, is reviewed with the `pair-programmer.reviewers.json` found from that file's folder up to its git root, and its patterns match from that configuration's folder. The default reviewer never applies there: without a configuration, such files stay unreviewed. Pi Pair Programmer records that folder's state before the first `write` or `edit` into it, so reviewers see only the changes made since. Findings name such files by their path from your working directory, such as `../app.feature/src/main.ts`.
+
 Reviewers have no tools by default. To let a reviewer look things up, such as current library APIs, add an optional `tools` list. For now, the only supported tool is `web_search`:
 
 ```json
