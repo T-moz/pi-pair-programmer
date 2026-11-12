@@ -96,7 +96,6 @@ export class StatsView {
     if (!ctx.hasUI) throw new Error(unavailable);
 
     const mode = (ctx as Partial<ExtensionContext>).mode;
-    // RPC clients such as T3 Code cannot mount terminal views but show notifications.
     if (mode === "rpc") {
       ctx.ui.notify(lines.join("\n"), "info");
       return;

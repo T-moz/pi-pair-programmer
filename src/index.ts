@@ -120,7 +120,6 @@ function decisionInteraction(
   );
 }
 
-// RPC clients such as T3 Code show notifications and status, not custom messages.
 function rpc(ctx: ExtensionContext | undefined): ctx is ExtensionContext {
   return (ctx as Partial<ExtensionContext> | undefined)?.mode === "rpc";
 }
@@ -259,7 +258,6 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     ctx.ui.setStatus("pair-programmer", shownState);
   }
 
-  // Without a footer to redraw, RPC clients only see review progress as status updates.
   function followState(ctx: ExtensionContext): void {
     if (!rpc(ctx)) return;
     stateTimer = setInterval(() => {
