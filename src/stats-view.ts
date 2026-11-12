@@ -30,7 +30,7 @@ export function statsLines(
   const findings = store.summary();
   const lines = [
     `Pair Programmer statistics - ${store.enabled ? "on" : "off"}`,
-    "Snapshot on open; close and run /pair-stats again to refresh.",
+    "Snapshot on open; run /pair-stats again to refresh.",
     "",
     "Review activity: incurred in this session, across all branches",
     `Running ${String(review.running)} | completed ${String(review.success)} | failed ${String(review.failed)}`,
@@ -96,6 +96,11 @@ export class StatsView {
     if (!ctx.hasUI) throw new Error(unavailable);
 
     const mode = (ctx as Partial<ExtensionContext>).mode;
+    // RPC clients such as T3 Code cannot mount terminal views but show notifications.
+    if (mode === "rpc") {
+      ctx.ui.notify(lines.join("\n"), "info");
+      return;
+    }
     if (mode !== undefined && mode !== "tui") {
       ctx.ui.notify(unavailable, "warning");
       return;

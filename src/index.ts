@@ -50,6 +50,7 @@ const WAKE_COALESCE_MS = 250;
 const SETTLE_TIMEOUT_MS = 180_000;
 const SETTLE_POLL_MS = 100;
 const MAX_EXTERNAL_CHANGES = 20;
+const STATUS_POLL_MS = 250;
 const MAX_SCANNED_BYTES = 1_000_000;
 const EXTENSION_PATH = fileURLToPath(import.meta.url);
 const REVIEWED_KEY = Symbol.for("pi-pair-programmer.reviewed-revisions.v1");
@@ -119,6 +120,11 @@ function decisionInteraction(
   );
 }
 
+// RPC clients such as T3 Code show notifications and status, not custom messages.
+function rpc(ctx: ExtensionContext | undefined): ctx is ExtensionContext {
+  return (ctx as Partial<ExtensionContext> | undefined)?.mode === "rpc";
+}
+
 function hostOf(ctx: ExtensionContext): Host {
   return typeof ctx.modelRegistry.streamSimple === "function" ? "pi" : "omp";
 }
@@ -145,6 +151,14 @@ function describe(findings: readonly Finding[]): string {
 
 function acceptedReview(finding: Finding, reason: string): string {
   return `### Accepted review: ${finding.title}\n\n**${finding.file}:${String(finding.line)}**\n\n${finding.evidence}\n\n**Reason:** ${reason}`;
+}
+
+function located(finding: Finding): string {
+  return `${finding.title} (${finding.file}:${String(finding.line)})`;
+}
+
+function acceptedNotice(finding: Finding, reason: string): string {
+  return `Pair Programmer accepted: ${located(finding)}\n${finding.evidence}\nReason: ${reason}`;
 }
 
 type SessionSetup =
@@ -221,18 +235,45 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   const controllers = new Map<AbortController, string>();
   let resetTimer: NodeJS.Timeout | undefined;
   let checkReset: (() => void) | undefined;
+  let stateTimer: NodeJS.Timeout | undefined;
+  let shownState: string | undefined;
 
-  function showState(ctx: ExtensionContext): void {
-    ctx.ui.setStatus(
-      "pair-programmer",
-      `Pair Programmer: ${store.enabled ? "on" : "off"}`,
-    );
+  function stateText(ctx: ExtensionContext): string {
+    const state = `Pair Programmer: ${store.enabled ? "on" : "off"}`;
+    if (!store.enabled || !rpc(ctx)) return state;
+    const { pending, outstanding } = store.summary();
+    const undecided = pending + outstanding;
+    return [
+      state,
+      ...(reviewing() ? ["reviewing"] : []),
+      ...(undecided === 0
+        ? []
+        : [
+            `${String(undecided)} ${undecided === 1 ? "finding" : "findings"} to decide`,
+          ]),
+    ].join(" · ");
   }
 
-  function stopWatchingResets(): void {
+  function showState(ctx: ExtensionContext): void {
+    shownState = stateText(ctx);
+    ctx.ui.setStatus("pair-programmer", shownState);
+  }
+
+  // Without a footer to redraw, RPC clients only see review progress as status updates.
+  function followState(ctx: ExtensionContext): void {
+    if (!rpc(ctx)) return;
+    stateTimer = setInterval(() => {
+      if (stateText(ctx) !== shownState) showState(ctx);
+    }, STATUS_POLL_MS);
+    stateTimer.unref();
+  }
+
+  function stopWatching(): void {
     clearInterval(resetTimer);
     resetTimer = undefined;
     checkReset = undefined;
+    clearInterval(stateTimer);
+    stateTimer = undefined;
   }
 
   function watchResets(ctx: ExtensionContext): void {
@@ -829,7 +870,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     event: { reason?: string },
     ctx: ExtensionContext,
   ): Promise<void> {
-    stopWatchingResets();
+    stopWatching();
     activeContext = ctx;
     accounting.suspend();
     stop("session_change");
@@ -858,6 +899,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
     admission = new FindingAdmission(store);
     showState(ctx);
     watchResets(ctx);
+    followState(ctx);
     await logging;
     if (session !== generation) return;
     logger?.log("session.start", { sessionId: accounting.stats.sessionId });
@@ -1041,7 +1083,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
 
   pi.on("session_start", startSession);
   const beforeSessionChange = (): void => {
-    stopWatchingResets();
+    stopWatching();
     stop("session_change");
   };
   pi.on("session_before_switch", beforeSessionChange);
@@ -1067,7 +1109,7 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
   pi.on("session_tree", (_event, ctx) => startSession({ reason: "tree" }, ctx));
 
   pi.on("session_shutdown", () => {
-    stopWatchingResets();
+    stopWatching();
     stop("shutdown");
     activeContext?.ui.setStatus("pair-programmer", undefined);
     activeContext = undefined;
@@ -1198,10 +1240,11 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
           details: { saved: false },
         });
       }
-      const finding =
-        params.decision === "accept"
-          ? store.deliveredFinding(params.findingId)
-          : undefined;
+      const finding = store.deliveredFinding(params.findingId);
+      const subject =
+        finding === undefined || !rpc(activeContext)
+          ? params.findingId
+          : `${params.findingId}: ${located(finding)}`;
       const saved = store.decide(
         params.findingId,
         params.decision,
@@ -1220,13 +1263,18 @@ export default function pairProgrammer(pi: ExtensionAPI): void {
           },
           { triggerTurn: false },
         );
+        if (rpc(activeContext))
+          activeContext.ui.notify(
+            acceptedNotice(finding, params.reason),
+            "info",
+          );
       }
       return Promise.resolve({
         content: [
           {
             type: "text" as const,
             text: saved
-              ? `Recorded ${params.decision} for ${params.findingId}.`
+              ? `Recorded ${params.decision} for ${subject}.`
               : "Unknown, already decided, or invalid finding. Decide each delivered finding with a reason.",
           },
         ],

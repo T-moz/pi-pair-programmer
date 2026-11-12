@@ -95,6 +95,8 @@ Pi subagents started with [pi-subagents](https://github.com/nicobailon/pi-subage
 | `/pair-clear`      | Cancel reviews and clear all findings.                                                              |
 | `/pair-stats`      | View review activity, findings, tokens, and estimated costs on demand; missing usage stays unknown. |
 
+In RPC clients such as [T3 Code](https://github.com/pingdotgg/t3code), which hide extension messages, Pi Pair Programmer reports through notifications and status instead: accepted findings appear as notifications, the status shows running reviews and findings left to decide, decision results name the finding and its location, and `/pair-stats` prints as a notification.
+
 The default reviewer uses your current model and asks: _“Does it add entropy?”_ Pi warns when it applies. To change the prompt, model, or files reviewed, create `pair-programmer.reviewers.json` in your working directory or any folder above it, up to the git root:
 
 ```json
