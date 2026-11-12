@@ -123,7 +123,10 @@ interface DecisionTool {
       decision: "accept" | "reject";
       reason: string;
     },
-  ) => Promise<{ details: { saved: boolean } }>;
+  ) => Promise<{
+    content: { type: "text"; text: string }[];
+    details: { saved: boolean };
+  }>;
 }
 
 interface JournalEntry {
@@ -370,6 +373,13 @@ async function setup(
     },
     entryAttempts: () => entryAttempts,
   };
+}
+
+function rpcSetup(): ReturnType<typeof setup> {
+  return setup("pi", false, false, (_cwd, ctx) => {
+    Object.assign(ctx, { mode: "rpc" });
+    return Promise.resolve();
+  });
 }
 
 function resettableSession(ctx: ExtensionContext): (type: string) => void {
@@ -3062,6 +3072,112 @@ it("restores delivered decisions after session start and removes decided finding
     await environment.emit("tool_call", { toolName: "write", input: {} }),
   ).toBeUndefined();
   await environment.emit("session_shutdown");
+});
+
+it("names decided findings and notifies accepted ones in RPC clients such as T3 Code", async () => {
+  const environment = await rpcSetup();
+  const file = path.join(environment.cwd, "change.ts");
+  await fsPromises.writeFile(file, "export const broken = true;\n");
+  vi.mocked(reviewFile).mockResolvedValue([
+    { line: 1, title: "Broken flag", quote: "broken", evidence: "Always on" },
+  ]);
+  await environment.emit("tool_result", {
+    toolName: "write",
+    input: { path: file },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(findings(environment.entries)).toHaveLength(2);
+  });
+  await environment.emit("turn_end");
+  const [first, second] = findings(environment.entries);
+  if (!first || !second) throw new Error("Missing findings");
+  environment.notify.mockClear();
+  const accepted = await environment.decide("decision", {
+    findingId: first.id,
+    decision: "accept",
+    reason: "Confirmed by caller",
+  });
+  expect(accepted.content[0]?.text).toBe(
+    `Recorded accept for ${first.id}: Broken flag (change.ts:1).`,
+  );
+  expect(environment.notify).toHaveBeenCalledExactlyOnceWith(
+    "Pair Programmer accepted: Broken flag (change.ts:1)\nbroken — Always on\nReason: Confirmed by caller",
+    "info",
+  );
+  expect(environment.sendMessage).toHaveBeenCalledWith(
+    expect.objectContaining({ customType: "pair-programmer-accepted" }),
+    expect.anything(),
+  );
+  const rejected = await environment.decide("decision", {
+    findingId: second.id,
+    decision: "reject",
+    reason: "Same issue",
+  });
+  expect(rejected.content[0]?.text).toBe(
+    `Recorded reject for ${second.id}: Broken flag (change.ts:1).`,
+  );
+  const unknown = await environment.decide("decision", {
+    findingId: "missing",
+    decision: "accept",
+    reason: "Nothing to accept",
+  });
+  expect(unknown.details.saved).toBe(false);
+  expect(environment.notify).toHaveBeenCalledOnce();
+  await environment.emit("session_shutdown");
+});
+
+it("shows RPC clients review progress and undecided findings in the status", async () => {
+  const environment = await rpcSetup();
+  const lastStatus = (): unknown => environment.setStatus.mock.lastCall?.[1];
+  expect(lastStatus()).toBe("Pair Programmer: on");
+  const file = path.join(environment.cwd, "change.ts");
+  await fsPromises.writeFile(file, "export const broken = true;\n");
+  const review = Promise.withResolvers<ProposedFinding[]>();
+  vi.mocked(reviewFile).mockReturnValue(review.promise);
+  await environment.emit("tool_result", {
+    toolName: "write",
+    input: { path: file },
+    isError: false,
+  });
+  await advanceReviews(() => {
+    expect(lastStatus()).toBe("Pair Programmer: on · reviewing");
+  });
+  review.resolve([
+    { line: 1, title: "Broken flag", quote: "broken", evidence: "Always on" },
+  ]);
+  await advanceReviews(() => {
+    expect(lastStatus()).toBe("Pair Programmer: on · 2 findings to decide");
+  });
+  const updates = environment.setStatus.mock.calls.length;
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(environment.setStatus).toHaveBeenCalledTimes(updates);
+  await environment.emit("turn_end");
+  const [first, second] = findings(environment.entries);
+  if (!first || !second) throw new Error("Missing findings");
+  await environment.decide("decision", {
+    findingId: first.id,
+    decision: "reject",
+    reason: "Intended",
+  });
+  await advanceReviews(() => {
+    expect(lastStatus()).toBe("Pair Programmer: on · 1 finding to decide");
+  });
+  await environment.decide("decision", {
+    findingId: second.id,
+    decision: "reject",
+    reason: "Intended",
+  });
+  await advanceReviews(() => {
+    expect(lastStatus()).toBe("Pair Programmer: on");
+  });
+  await environment.command("pair-programmer");
+  expect(lastStatus()).toBe("Pair Programmer: off");
+  await environment.emit("session_shutdown");
+  expect(lastStatus()).toBeUndefined();
+  const final = environment.setStatus.mock.calls.length;
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(environment.setStatus).toHaveBeenCalledTimes(final);
 });
 
 it("reviews every written file at once and sends the next finding batch only after decisions", async () => {

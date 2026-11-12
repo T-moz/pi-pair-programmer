@@ -221,7 +221,7 @@ describe("StatsView", () => {
     await current;
   });
 
-  it("rejects headless commands and uses explicit supported RPC notifications instead of mounting a terminal view", async () => {
+  it("rejects headless commands and warns other non-terminal UIs instead of mounting a terminal view", async () => {
     const host = ui();
     const view = new StatsView();
     host.ctx.hasUI = false;
@@ -229,12 +229,24 @@ describe("StatsView", () => {
       "interactive terminal",
     );
     host.ctx.hasUI = true;
-    host.ctx.mode = "rpc";
+    host.ctx.mode = "json";
     await view.open(host.ctx, []);
     expect(host.notify).toHaveBeenCalledWith(
       expect.stringContaining("interactive terminal"),
       "warning",
     );
+  });
+
+  it("shows the statistics as one RPC notification for clients such as T3 Code", async () => {
+    const host = ui();
+    const view = new StatsView();
+    host.ctx.mode = "rpc";
+    await view.open(host.ctx, ["Pair Programmer statistics - on", "Row 1"]);
+    expect(host.notify).toHaveBeenCalledExactlyOnceWith(
+      "Pair Programmer statistics - on\nRow 1",
+      "info",
+    );
+    expect(() => host.component()).toThrow("view not mounted");
   });
 
   it("detects unsupported OMP custom views without confusing hasUI with terminal support", async () => {
